@@ -5,7 +5,7 @@
 | ------------------------ | ---------------------- | ------------------------------- |
 | Structured labs & vitals | **BEHRTLabEncoder**    | 24 h time‑series → \[CLS] token |
 | Free‑text notes          | **BioClinBERTEncoder** | concatenated admission notes    |
-| Chest X‑ray image        | **ImageCXREncoder??**    | --     |
+| Chest X‑ray image        | **??**    | --     |
 
 The model creates **7 interaction routes** (3 × uni, 3 × bi, 1 × tri) and fuses
 them with a deterministic, performance‑based router.
@@ -21,7 +21,7 @@ your‑repo/
 ├── routing.py            
 │
 ├── models/
-│   ├── encoders.py        # BEHRTLabEncoder, BioClinBERTEncoder, ImageCXREncoder(If needs to be changed, Zhongjie)
+│   ├── encoders.py        # BEHRTLabEncoder, BioClinBERTEncoder, ImageEncoderModel(Zhongjie)
 │   └── routes.py          # tiny MLP heads per interaction route
 │
 ├── data/
