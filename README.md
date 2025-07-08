@@ -5,7 +5,7 @@
 | ------------------------ | ---------------------- | ------------------------------- |
 | Structured labs & vitals | **BEHRTLabEncoder**    | 24 h time‑series → \[CLS] token |
 | Free‑text notes          | **BioClinBERTEncoder** | concatenated admission notes    |
-| Chest X‑ray image        | **ImageCXREncoder**    | 1 × posterior‑anterior CXR      |
+| Chest X‑ray image        | **ImageCXREncoder??**    | 1 × posterior‑anterior CXR      |
 
 The model creates **7 interaction routes** (3 × uni, 3 × bi, 1 × tri) and fuses
 them with a deterministic, performance‑based router.
