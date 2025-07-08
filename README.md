@@ -16,7 +16,7 @@ them with a deterministic, performance‑based router.
 ## Repository layout
 
 ```
-your‑repo/
+MultimodalRouting/
 ├── train_fame.py         
 ├── routing.py            
 │
