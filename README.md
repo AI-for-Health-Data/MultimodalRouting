@@ -1,5 +1,3 @@
-# FAME++ – Multimodal Routing for Fair ICU Outcome Prediction
-
 
 | Modality                 | Encoder                | Notes                           |
 | ------------------------ | ---------------------- | ------------------------------- |
