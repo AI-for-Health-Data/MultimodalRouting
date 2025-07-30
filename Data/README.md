@@ -1,15 +1,5 @@
 # INSPECT Dataset: Cohort Construction, EHR Filtering, and Label Merging
 
-1. **Cohort Construction & Label Integration**
-2. **Structured EHR Transformation**
-3. **Radiology Impressions Merging**
-
-The end result includes:
-
-* A clean, labeled cohort with study metadata and outcome labels.
-* A structured EHR table (long format) with demographics and medical events.
-* A merged table combining radiology impression texts with patient-level labels.
-
 ---
 
 ## 1. Cohort Construction
