@@ -13,11 +13,8 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
 
 from routing import MMRouting
-from models.encoders import (
-    BEHRTLabEncoder,
-    BioClinBERTEncoder,
-    ImageCXREncoder,
-)
+from models.encoders import BEHRTLabEncoder, BioClinicalBERTEncoder, ImageCXREncoder
+from pathlib import Path
 from models.routes import RouteMLP
 from data.icustay_dataset import ICUStayDataset
 from utils.fairness import compute_eddi  
@@ -42,7 +39,15 @@ class FAMEPlusPlus(nn.Module):
     def __init__(self, hidden: int, alpha: float, seq_len: int) -> None:
         super().__init__()
         self.enc_L = BEHRTLabEncoder(seq_len=seq_len, out_dim=hidden)
-        self.enc_N = BioClinBERTEncoder(out_dim=hidden)
+        self.enc_N = BioClinicalBERTEncoder(
+            model_name=DEFAULTS.get("model_name", "emilyalsentzer/Bio_ClinicalBERT"),
+            cache_dir=Path(CACHE_DIR),
+        )
+        self.proj_N = nn.Linear(
+            self.enc_N.bert.config.hidden_size,
+            hidden,
+            bias=True
+        )
         self.enc_I = ImageCXREncoder(out_dim=hidden)
         self.heads = nn.ModuleDict({
             r: RouteMLP(in_dim=hidden * len(r), out_dim=len(self.TASKS))
@@ -53,6 +58,7 @@ class FAMEPlusPlus(nn.Module):
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         L = self.enc_L(batch["lab_feats"], batch["demo"])
         N = self.enc_N(batch["note_ids"], batch["note_attn"])
+        N = self.proj_N(self.enc_N(batch["note_ids"], batch["note_attn"]))
         I = self.enc_I(batch["image"])
         Z = {
             "L": L,
