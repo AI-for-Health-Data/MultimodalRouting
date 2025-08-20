@@ -18,7 +18,7 @@ def _mlp(in_dim: int, out_dim: int, hidden: int = 256, p: float = 0.10) -> nn.Se
     )
 
 # Trainable multimodal router (per-instance gating) with sMRO-style fusion
-class MMRouting(nn.Module)
+class MMRouting(nn.Module):
 
     ROUTE_LABELS: List[str] = ["L", "N", "I", "LN", "LI", "NI", "LNI"]
     BLOCKS: Dict[str, Tuple[int, ...]] = {"uni": (0, 1, 2), "bi": (3, 4, 5), "tri": (6,)}
