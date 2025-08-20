@@ -178,82 +178,101 @@ class MMRouting(nn.Module):
 
 #  Post-hoc interaction attribution 
 class InteractionAttributor:
-
     def __init__(self, f: Callable[..., torch.Tensor], *, n_mc: int = 20, device=None):
         self.f = f
         self.n_mc = n_mc
         self.device = device or torch.device("cpu")
 
     @staticmethod
-    def _permute_except(x: torch.Tensor, keep_idx: torch.Tensor) -> torch.Tensor:
-        idx = torch.arange(x.size(0), device=x.device)
-        perm = idx[~keep_idx].clone()
-        perm = perm[torch.randperm(perm.numel(), device=x.device)]
-        idx[~keep_idx] = perm
+    def _permute(x: torch.Tensor) -> torch.Tensor:
+        idx = torch.randperm(x.size(0), device=x.device)
         return x[idx]
 
-    def _expectation(self, L: torch.Tensor, N: torch.Tensor, I: torch.Tensor, hold: str) -> torch.Tensor:
-        B = L.size(0)
+    def _E_all(self, L, N, I):
+        # E_{t,v,a} f(t,v,a)
         acc = 0
         for _ in range(self.n_mc):
-            if hold == "L":
-                N_s = N[torch.randperm(B, device=N.device)]
-                I_s = I[torch.randperm(B, device=I.device)]
-                acc += self.f(L, N_s, I_s)
-            elif hold == "N":
-                L_s = L[torch.randperm(B, device=L.device)]
-                I_s = I[torch.randperm(B, device=I.device)]
-                acc += self.f(L_s, N, I_s)
-            elif hold == "I":
-                L_s = L[torch.randperm(B, device=L.device)]
-                N_s = N[torch.randperm(B, device=N.device)]
-                acc += self.f(L_s, N_s, I)
-            else:
-                raise ValueError(hold)
+            acc += self.f(self._permute(L), self._permute(N), self._permute(I))
         return acc / self.n_mc
 
-    def compute_uc_bi_ti(
-        self,
-        L: torch.Tensor,
-        N: torch.Tensor,
-        I: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        
-        #   UC = E_{v,a} f(L,v,a) + E_{t,a} f(t,N,a) + E_{t,v} f(t,v,I) - 2 E_{t,v,a} f(t,v,a)
-        f_Lva = self._expectation(L, N, I, hold="L")
-        f_tNa = self._expectation(L, N, I, hold="N")
-        f_tvI = self._expectation(L, N, I, hold="I")
-
-        # Full expectation over 
-        B = L.size(0)
-        acc_full = 0
+    def _E_hold_L(self, L, N, I):
+        # E_{v,a} f(L, v, a)
+        acc = 0
         for _ in range(self.n_mc):
-            L_s = L[torch.randperm(B, device=L.device)]
-            N_s = N[torch.randperm(B, device=N.device)]
-            I_s = I[torch.randperm(B, device=I.device)]
-            acc_full += self.f(L_s, N_s, I_s)
-        f_tva = acc_full / self.n_mc
+            acc += self.f(L, self._permute(N), self._permute(I))
+        return acc / self.n_mc
 
-        UC = f_Lva + f_tNa + f_tvI - 2 * f_tva
+    def _E_hold_N(self, L, N, I):
+        # E_{t,a} f(t, N, a)
+        acc = 0
+        for _ in range(self.n_mc):
+            acc += self.f(self._permute(L), N, self._permute(I))
+        return acc / self.n_mc
 
-        # BI: average over holding one modality fixed, removing UC
-        def bi_term(_keep: str):
-            logits = self.f(L, N, I)
-            uc_logits = (
-                self._expectation(L, N, I, hold="L")
-                + self._expectation(L, N, I, hold="N")
-                + self._expectation(L, N, I, hold="I")
-                - 2 * f_tva
-            )
-            return logits - uc_logits
+    def _E_hold_I(self, L, N, I):
+        # E_{t,v} f(t, v, I)
+        acc = 0
+        for _ in range(self.n_mc):
+            acc += self.f(self._permute(L), self._permute(N), I)
+        return acc / self.n_mc
 
-        BI = (bi_term("L") + bi_term("N") + bi_term("I")) / 3.0
-        TI = self.f(L, N, I) - UC - BI
+    def _E_keep_LN(self, L, N, I):
+        # E_{a} f(L, N, a)  (permute only I)
+        acc = 0
+        for _ in range(self.n_mc):
+            acc += self.f(L, N, self._permute(I))
+        return acc / self.n_mc
+
+    def _E_keep_LI(self, L, N, I):
+        # E_{v} f(L, v, I)  (permute only N)
+        acc = 0
+        for _ in range(self.n_mc):
+            acc += self.f(L, self._permute(N), I)
+        return acc / self.n_mc
+
+    def _E_keep_NI(self, L, N, I):
+        # E_{t} f(t, N, I)  (permute only L)
+        acc = 0
+        for _ in range(self.n_mc):
+            acc += self.f(self._permute(L), N, I)
+        return acc / self.n_mc
+
+    @torch.no_grad()
+    def compute_uc_bi_ti(self, L: torch.Tensor, N: torch.Tensor, I: torch.Tensor
+                         ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        # 1. Grand mean
+        G = self._E_all(L, N, I)                         
+
+        # 2. Main effects
+        EL_va = self._E_hold_L(L, N, I)                  
+        EN_ta = self._E_hold_N(L, N, I)                  
+        EI_tv = self._E_hold_I(L, N, I)                  
+
+        u_L = EL_va - G
+        u_N = EN_ta - G
+        u_I = EI_tv - G
+        UC  = u_L + u_N + u_I
+
+        # 3. Pairwise interactions
+        ELN_a = self._E_keep_LN(L, N, I)                 
+        ELI_v = self._E_keep_LI(L, N, I)                 
+        ENI_t = self._E_keep_NI(L, N, I)                 
+
+        p_LN = ELN_a - G - u_L - u_N
+        p_LI = ELI_v - G - u_L - u_I
+        p_NI = ENI_t - G - u_N - u_I
+        BI   = p_LN + p_LI + p_NI
+
+        # 4. Trimodal (residual)
+        f_obs = self.f(L, N, I)
+        TI    = f_obs - (G + UC + BI)
+
         return UC, BI, TI
 
     def from_batch(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, ...]:
-  
         L = batch["lab_feats"].to(self.device)
         N = batch["note_feats"].to(self.device)
         I = batch["image_feats"].to(self.device)
         return self.compute_uc_bi_ti(L, N, I)
+
