@@ -167,17 +167,21 @@ def embeddings_from_batch(xL, notes_list, imgs):
     return {"L": zL, "N": zN, "I": zI}
 
 def all_route_logits(z):
-    # Use concatenation for (LN, LI, NI, LNI) — heads were constructed for 2d/3d inputs.
-    concat = {
-        "L":   z["L"],
-        "N":   z["N"],
-        "I":   z["I"],
-        "LN":  torch.cat([z["L"], z["N"]], dim=-1),
-        "LI":  torch.cat([z["L"], z["I"]], dim=-1),
-        "NI":  torch.cat([z["N"], z["I"]], dim=-1),
-        "LNI": torch.cat([z["L"], z["N"], z["I"]], dim=-1),
+    # Use fusion modules for multi-modal routes; each route head expects d-dim input.
+    out = {
+        "L": route_heads["L"](z["L"]),
+        "N": route_heads["N"](z["N"]),
+        "I": route_heads["I"](z["I"]),
     }
-    return {r: route_heads[r](concat[r]) for r in ROUTES}
+    zLN = fusion["LN"](z["L"], z["N"])
+    zLI = fusion["LI"](z["L"], z["I"])
+    zNI = fusion["NI"](z["N"], z["I"])
+    zLNI = fusion["LNI"](z["L"], z["N"], z["I"])
+    out["LN"] = route_heads["LN"](zLN)
+    out["LI"] = route_heads["LI"](zLI)
+    out["NI"] = route_heads["NI"](zNI)
+    out["LNI"] = route_heads["LNI"](zLNI)
+    return out
 
 route_index = {r: i for i, r in enumerate(ROUTES)}
 block_names = ["uni", "bi", "tri"]
