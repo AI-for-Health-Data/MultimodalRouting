@@ -4,9 +4,9 @@
 
 ## It also defines the route/block taxonomy and a few helper utilities used across other notebooks.
 
-## **Routing backends:**
-### - `"ema_logits"` — 7 route **logit** heads + task-wise EMA loss→weight routing (two-stage: route→block).
-### - `"capsule_features"` — 7 route **feature** heads + **capsule** dynamic routing from route features to task concepts (per-sample couplings).
+## **Routing backend (current implementation):**
+### - `"learned_gate"` — 7 route heads + learned per-task route/block weights (gating over [L, N, I] embeddings).
+# (Legacy/experimental ideas: "ema_logits", "capsule_features" — not active in this code path.)
 
 import os, sys, math, json, random
 from dataclasses import dataclass, field
@@ -54,12 +54,12 @@ class Config:
     structured_seq_len: int = 24
     structured_n_feats: int = 128             
     # Image
-    image_model_name: str = "resnet50"         
+    image_model_name: str = "resnet34"        
     # Fairness
     sensitive_keys: List[str] = field(default_factory=lambda: ["age_group","race","ethnicity","insurance"])
     lambda_fair: float = 0.0                   
     # Routing backend
-    routing_backend: str = "ema_logits"       
+    routing_backend: str = "learned_gate"       
     # Paths (edit to your data locations)
     data_root: str = "./data"
     ckpt_root: str = "./checkpoints"
