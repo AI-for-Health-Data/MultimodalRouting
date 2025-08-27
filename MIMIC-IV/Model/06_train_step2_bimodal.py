@@ -101,11 +101,15 @@ set_requires_grad(route_heads["I"], False)
 behrt.eval(); bbert.eval(); imgenc.eval()
 
 # Optimizer: only the bimodal heads 
-params_bi = list(route_heads["LN"].parameters()) \
-          + list(route_heads["LI"].parameters()) \
-          + list(route_heads["NI"].parameters())
-
+params_bi = []
+params_bi += list(fusion["LN"].parameters())
+params_bi += list(fusion["LI"].parameters())
+params_bi += list(fusion["NI"].parameters())
+params_bi += list(route_heads["LN"].parameters())
+params_bi += list(route_heads["LI"].parameters())
+params_bi += list(route_heads["NI"].parameters())
 opt = torch.optim.AdamW(params_bi, lr=CFG.lr, weight_decay=1e-2)
+
 scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE == "cuda"))
 
 best_val = float("inf")
