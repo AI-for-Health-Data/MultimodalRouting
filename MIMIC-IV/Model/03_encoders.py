@@ -128,20 +128,23 @@ class BioClinBERTEncoder(nn.Module):
         self.note_agg = note_agg
         self.max_notes_concat = max_notes_concat
 
+        # Try to load HF assets; fall back to random features if unavailable.
         try:
             from transformers import AutoTokenizer, AutoModel  # type: ignore
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
             self.bert = AutoModel.from_pretrained(model_name)
+            self.bert.eval()  # important for deterministic behavior (disable dropout)
             self.hf_available = True
         except Exception:
             self.tokenizer = None
             self.bert = None
             self.hf_available = False
 
-        # BioClinicalBERT hidden size = 768
+        # BioClinicalBERT hidden size = 768 → project to d
         self.proj = nn.Sequential(nn.LayerNorm(768), nn.Linear(768, d))
         self.drop = nn.Dropout(dropout)
 
+        # Optional attention over note embeddings
         if note_agg == "attention":
             self.attn = nn.Sequential(
                 nn.LayerNorm(d),
@@ -152,11 +155,14 @@ class BioClinBERTEncoder(nn.Module):
         else:
             self.attn = None
 
+        # Optional explicit device override
         self.device_override = device
 
     def _encode_chunks(self, texts: List[str]) -> torch.Tensor:
+        """Encode a list of ≤512-token chunks → [N, 768] CLS embeddings."""
         device = self.device_override or next(self.parameters()).device
         if not self.hf_available:
+            # Fallback for offline / missing transformers
             return torch.randn(len(texts), 768, device=device)
 
         batch = self.tokenizer(
@@ -166,8 +172,9 @@ class BioClinBERTEncoder(nn.Module):
             max_length=self.max_len,
             return_tensors="pt",
         ).to(device)
+
         with torch.no_grad():
-            out = self.bert(**batch).last_hidden_state[:, 0] 
+            out = self.bert(**batch).last_hidden_state[:, 0]  # CLS per chunk
         return out  # [N, 768]
 
     def _chunk_note(self, text: str) -> List[str]:
@@ -191,51 +198,66 @@ class BioClinBERTEncoder(nn.Module):
         device = self.device_override or next(self.parameters()).device
         if len(note_vecs) == 0:
             return torch.zeros(self.d, device=device)
-        H = torch.stack(note_vecs, dim=0)  
+
+        H = torch.stack(note_vecs, dim=0)  # [K, d]
+
         if self.note_agg == "mean":
             return H.mean(dim=0)
+
         elif self.note_agg == "attention":
-            scores = self.attn(H)  
-            w = torch.softmax(scores.squeeze(-1), dim=0)  
-            return (w.unsqueeze(0) @ H).squeeze(0)  
-        else:  
+            # scores: [K,1] → softmax → weighted sum
+            scores = self.attn(H)  # type: ignore[arg-type]
+            w = torch.softmax(scores.squeeze(-1), dim=0)
+            return (w.unsqueeze(0) @ H).squeeze(0)
+
+        else:  # "concat"
             K = min(self.max_notes_concat, H.size(0))
-            Hk = H[-K:]
-            concat = Hk.reshape(-1)  
+            Hk = H[-K:]                 # take last K notes
+            concat = Hk.reshape(-1)     # [K*d]
             proj_in = concat.numel()
             key = f"concat_proj_{proj_in}"
             if not hasattr(self, key):
+                # Cache a projection layer sized for this K
                 setattr(self, key, nn.Linear(proj_in, self.d).to(device))
             layer: nn.Linear = getattr(self, key)
             return layer(concat)
 
     @staticmethod
-    def _normalize_input(batch_notes: Union[Sequence[str], Sequence[Sequence[str]]]) -> List[List[str]]:
-        """Accept List[str] (one text per patient) OR List[List[str]] (notes per patient) and normalize to List[List[str]]."""
+    def _normalize_input(
+        batch_notes: Union[Sequence[str], Sequence[Sequence[str]]]
+    ) -> List[List[str]]:
+        """Normalize to List[List[str]] (notes per patient)."""
         if len(batch_notes) == 0:
             return []
-        if isinstance(batch_notes[0], str):  
-            return [[t] for t in batch_notes]  
+        if isinstance(batch_notes[0], str):
+            return [[t] for t in batch_notes]  # one merged text per patient
         return [list(notes) for notes in batch_notes]
 
     def forward(self, batch_notes: Union[List[str], List[List[str]]]) -> torch.Tensor:
+        """Encode a batch of patients’ notes into z_N ∈ R^{B×d}."""
         device = self.device_override or next(self.parameters()).device
         patients = self._normalize_input(batch_notes)
         Z: List[torch.Tensor] = []
+
         for notes in patients:
-            # Per NOTE: chunk -> encode chunks -> average chunk CLS -> note embedding in R^d
+            # Per NOTE: chunk → encode → mean over chunks → project 768→d → dropout
             note_embs: List[torch.Tensor] = []
             for note_text in notes:
                 chunks = self._chunk_note(note_text)
-                cls_vecs = self._encode_chunks(chunks)  
-                cls_mean = cls_vecs.mean(dim=0, keepdim=True)  
-                z_note = self.drop(self.proj(cls_mean)).squeeze(0)  
+                cls_vecs = self._encode_chunks(chunks)              # [Nc, 768]
+                cls_mean = cls_vecs.mean(dim=0, keepdim=True)       # [1, 768]
+                z_note = self.drop(self.proj(cls_mean)).squeeze(0)  # [d]
                 note_embs.append(z_note)
-            z_patient = self._pool_notes(note_embs)  
+
+            # Aggregate notes for this patient → [d]
+            z_patient = self._pool_notes(note_embs)
             Z.append(z_patient.to(device))
+
         if len(Z) == 0:
             return torch.zeros(0, self.d, device=device)
-        return torch.stack(Z, dim=0)  
+
+        return torch.stack(Z, dim=0)  # [B, d]
+  
 
 
 # Image encoder (ResNet-34 backbone)
@@ -451,46 +473,20 @@ def build_fusions(cfg: FusionConfig) -> Dict[str, nn.Module]:
 
 def make_route_inputs(
     z: Dict[str, torch.Tensor],
-    fusion: Dict[str, nn.Module] | None = None,
+    fusion: Dict[str, nn.Module],
 ) -> Dict[str, torch.Tensor]:
-    """Given unimodal embeddings z and (optional) fusion modules, produce inputs for all 7 routes.
-
-    Args:
-        z: dict {"L":[B,d], "N":[B,d], "I":[B,d]}
-        fusion: dict with keys "LN","LI","NI","LNI" mapping to fusion modules; if None, fall back to concat.
-
-    Returns:
-        dict mapping each route to a [B, d] tensor (if fusion provided) or to its concatenation (fallback).
-        NOTE: If you rely on concatenation fallback, your route heads must be sized accordingly.
-    """
-    assert {"L", "N", "I"}.issubset(set(z.keys())), "z must contain L, N, I"
-
-    if fusion is None:
-        # Fallback: return concatenations 
-        return {
-            "L": z["L"],
-            "N": z["N"],
-            "I": z["I"],
-            "LN": torch.cat([z["L"], z["N"]], dim=-1),
-            "LI": torch.cat([z["L"], z["I"]], dim=-1),
-            "NI": torch.cat([z["N"], z["I"]], dim=-1),
-            "LNI": torch.cat([z["L"], z["N"], z["I"]], dim=-1),
-        }
-
-    # Preferred: real fusion outputs with dimension d for *every* route
-    zLN = fusion["LN"](z["L"], z["N"])
-    zLI = fusion["LI"](z["L"], z["I"])
-    zNI = fusion["NI"](z["N"], z["I"])
-    zLNI = fusion["LNI"](z["L"], z["N"], z["I"])
+    """Produce d-dim inputs for all 7 routes using fusion modules."""
+    assert {"L", "N", "I"}.issubset(z), "z must contain L, N, I"
+    assert {"LN", "LI", "NI", "LNI"}.issubset(fusion), "Missing fusion blocks"
 
     return {
         "L":   z["L"],
         "N":   z["N"],
         "I":   z["I"],
-        "LN":  zLN,
-        "LI":  zLI,
-        "NI":  zNI,
-        "LNI": zLNI,
+        "LN":  fusion["LN"](z["L"], z["N"]),
+        "LI":  fusion["LI"](z["L"], z["I"]),
+        "NI":  fusion["NI"](z["N"], z["I"]),
+        "LNI": fusion["LNI"](z["L"], z["N"], z["I"]),
     }
 
 
