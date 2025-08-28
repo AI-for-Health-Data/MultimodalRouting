@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Dict, List, Tuple
+from env_config import CFG, ROUTES, BLOCKS, DEVICE
 
 # Fusion layers (produce d-dim embeddings for LN / LI / NI / LNI)
 class PairwiseFusion(nn.Module):
