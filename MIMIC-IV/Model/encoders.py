@@ -427,9 +427,10 @@ def build_encoders(
     cfg: EncoderConfig,
     device: Optional[Union[str, torch.device]] = None,
 ) -> Tuple[BEHRTLabEncoder, BioClinBERTEncoder, ImageEncoder]:
-    # Resolve device (accepts "cuda", "cpu", torch.device, etc.)
+    # Use the same DEVICE as the rest of the project
+    from env_config import DEVICE as GLOBAL_DEVICE
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device(GLOBAL_DEVICE) 
     else:
         device = torch.device(device)
 
@@ -450,8 +451,13 @@ def build_encoders(
         dropout=cfg.dropout,
         note_agg=cfg.note_agg,
         max_notes_concat=cfg.max_notes_concat,
-        device=device,  # pass through so HF tensors land on the right device
+        device=device,
     ).to(device)
+
+    # ensure HF model (if present) is on device
+    if getattr(bbert, "hf_available", False) and bbert.bert is not None:
+        bbert.bert.to(device)                
+        bbert.bert.eval()
 
     imgenc = ImageEncoder(
         d=cfg.d,
@@ -461,26 +467,22 @@ def build_encoders(
 
     return behrt, bbert, imgenc
 
-
 @dataclass
 class FusionConfig:
     d: int = 256
     dropout: float = 0.1
     hidden: int = 4 * 256
 
-def build_fusions(d: int, p_drop: float, hidden: int = 4 * 256) -> Dict[str, nn.Module]:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    LN  = PairwiseFusion(d=d, hidden=hidden, dropout=p_drop).to(device)
-    LI  = PairwiseFusion(d=d, hidden=hidden, dropout=p_drop).to(device)
-    NI  = PairwiseFusion(d=d, hidden=hidden, dropout=p_drop).to(device)
-    LNI = TrimodalFusion(d=d, hidden=hidden, dropout=p_drop).to(device)
+def build_fusions_enc(d: int, p_drop: float, hidden: int = 4 * 256) -> Dict[str, nn.Module]:
+    dev = torch.device(DEVICE)  # <<< also unify device here if you keep it
+    LN  = PairwiseFusion(d=d, hidden=hidden, dropout=p_drop).to(dev)
+    LI  = PairwiseFusion(d=d, hidden=hidden, dropout=p_drop).to(dev)
+    NI  = PairwiseFusion(d=d, hidden=hidden, dropout=p_drop).to(dev)
+    LNI = TrimodalFusion(d=d, hidden=hidden, dropout=p_drop).to(dev)
     return {"LN": LN, "LI": LI, "NI": NI, "LNI": LNI}
 
-# Optional convenience if you still want config-style:
 def build_fusions_from_cfg(cfg: FusionConfig) -> Dict[str, nn.Module]:
-    return build_fusions(d=cfg.d, p_drop=cfg.dropout, hidden=cfg.hidden)
-
-
+    return build_fusions_enc(d=cfg.d, p_drop=cfg.dropout, hidden=cfg.hidden)
 
 def make_route_inputs(
     z: Dict[str, torch.Tensor],
@@ -500,7 +502,6 @@ def make_route_inputs(
         "LNI": fusion["LNI"](z["L"], z["N"], z["I"]),
     }
 
-
 __all__ = [
     "BEHRTLabEncoder",
     "BioClinBERTEncoder",
@@ -510,6 +511,7 @@ __all__ = [
     "EncoderConfig",
     "FusionConfig",
     "build_encoders",
-    "build_fusions",
+    "build_fusions_enc",
+    "build_fusions_from_cfg",
     "make_route_inputs",
 ]
