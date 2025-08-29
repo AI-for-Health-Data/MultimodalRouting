@@ -27,11 +27,11 @@ print("Device:", DEVICE)
 
 ROUTES = ["L", "N", "I", "LN", "LI", "NI", "LNI"]
 BLOCKS = {"uni": ["L", "N", "I"], "bi": ["LN", "LI", "NI"], "tri": ["LNI"]}
-TASKS  = ["mort", "pe", "ph"]  
+TASKS  = ["mort", "pe", "ph"]
 
 @dataclass
 class Config:
-    # Model / training
+
     d: int = 256
     alpha: float = 4.0
     dropout: float = 0.1
@@ -44,34 +44,32 @@ class Config:
     ema_decay: float = 0.98
     steps_per_epoch_hint: int = 500
 
-    # Text
     text_model_name: str = "emilyalsentzer/Bio_ClinicalBERT"
     max_text_len: int = 512
 
-    # Structured seq
     structured_seq_len: int = 24
     structured_n_feats: int = 128
 
-    # Image
     image_model_name: str = "resnet34"
 
-    # Fairness
     sensitive_keys: List[str] = field(
         default_factory=lambda: ["age_group", "race", "ethnicity", "insurance"]
     )
-    lambda_fair: float = 0.0  
+    lambda_fair: float = 0.0
 
-    # Routing backend
-    routing_backend: str = "learned_gate"
+    routing_backend: str = "concept_routing"
 
-    # Paths (edit to your data locations)
+    d_concept: int = 256                 
+    routing_temperature: float = 0.07    
+    routing_entropy_weight: float = 1e-3 
+
     data_root: str = "./data"
     ckpt_root: str = "./checkpoints"
 
+    # Selected task for single-task steps/eval
     task_name: str = "mort"
 
     use_cudnn_benchmark: bool = True
-
     precision_amp: str = "auto"
 
 
@@ -79,7 +77,7 @@ CFG = Config()
 print(CFG)
 
 TASK2IDX: Dict[str, int] = {name: i for i, name in enumerate(TASKS)}
-SELECTED_TASK_IDX: int = TASK2IDX.get(CFG.task_name, 0)  
+SELECTED_TASK_IDX: int = TASK2IDX.get(CFG.task_name, 0)
 
 if DEVICE == "cuda":
     torch.backends.cudnn.benchmark = bool(CFG.use_cudnn_benchmark)
