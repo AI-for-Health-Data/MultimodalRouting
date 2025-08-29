@@ -1,69 +1,114 @@
 import torch
 import torch.nn as nn
-from typing import Dict, List, Tuple
+import torch.nn.functional as F
+from typing import Dict, List, Tuple, Sequence, Optional
 from env_config import CFG, ROUTES, BLOCKS, DEVICE
 
-# Fusion layers (produce d-dim embeddings for LN / LI / NI / LNI)
-class PairwiseFusion(nn.Module):
-    def __init__(self, d: int, hidden: int = None, p_drop: float = 0.1):
+
+class _MLP(nn.Module):
+    """Generic MLP: [in] -> hidden... -> out, with LayerNorm + GELU + Dropout between layers."""
+    def __init__(self, in_dim: int, out_dim: int, hidden: Optional[Sequence[int]] = None, p_drop: float = 0.1):
         super().__init__()
-        hidden = hidden or (2 * d)
-        self.net = nn.Sequential(
-            nn.LayerNorm(2 * d),
-            nn.Linear(2 * d, hidden),
-            nn.GELU(),
-            nn.Dropout(p_drop),
-            nn.Linear(hidden, d),
-        )
-        self.gate = nn.Sequential(
-            nn.LayerNorm(d),
-            nn.Linear(d, d),
-            nn.Sigmoid(),
-        )
+        hidden = list(hidden) if hidden is not None else [4 * out_dim, 2 * out_dim]
+        dims = [in_dim] + hidden + [out_dim]
+        layers: List[nn.Module] = []
+        for i in range(len(dims) - 2):
+            layers += [
+                nn.LayerNorm(dims[i]),
+                nn.Linear(dims[i], dims[i + 1]),
+                nn.GELU(),
+                nn.Dropout(p_drop),
+            ]
+        layers += [
+            nn.LayerNorm(dims[-2]),
+            nn.Linear(dims[-2], dims[-1]),
+        ]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class PairwiseFusion(nn.Module):
+    """
+    Multimodal MLP for bimodal fusion.
+      - feature_mode='concat': x = [zA, zB]           -> MLP(in=2d, out=d)
+      - feature_mode='rich':   x = [zA,zB,zA*zB,|Δ|]  -> MLP(in=4d, out=d)
+    """
+    def __init__(self, d: int, hidden: Optional[Sequence[int]] = None, p_drop: float = 0.1,
+                 feature_mode: str = "rich"):
+        super().__init__()
+        assert feature_mode in {"concat", "rich"}
+        self.d = d
+        self.feature_mode = feature_mode
+        in_dim = 2 * d if feature_mode == "concat" else 4 * d
+        self.mlp = _MLP(in_dim, d, hidden=hidden, p_drop=p_drop)
+        # small residual to help stability
+        self.res_scale = nn.Parameter(torch.tensor(0.5))
 
     def forward(self, za: torch.Tensor, zb: torch.Tensor) -> torch.Tensor:
-        h = torch.cat([za, zb], dim=-1)   
-        f = self.net(h)                   
-        base = (za + zb) / 2.0            
-        g = self.gate(base)               
-        return g * f + (1.0 - g) * base
+        if self.feature_mode == "concat":
+            x = torch.cat([za, zb], dim=-1)
+        else:  # 'rich'
+            had = za * zb
+            diff = (za - zb).abs()
+            x = torch.cat([za, zb, had, diff], dim=-1)
+        h = self.mlp(x)
+        base = 0.5 * (za + zb)
+        return h + self.res_scale * base
+
 
 class TrimodalFusion(nn.Module):
-    def __init__(self, d: int, hidden: int = None, p_drop: float = 0.1):
+
+    def __init__(self, d: int, hidden: Optional[Sequence[int]] = None, p_drop: float = 0.1,
+                 feature_mode: str = "rich"):
         super().__init__()
-        hidden = hidden or (3 * d)
-        self.net = nn.Sequential(
-            nn.LayerNorm(3 * d),
-            nn.Linear(3 * d, hidden),
-            nn.GELU(),
-            nn.Dropout(p_drop),
-            nn.Linear(hidden, d),
-        )
-        self.gate = nn.Sequential(
-            nn.LayerNorm(d),
-            nn.Linear(d, d),
-            nn.Sigmoid(),
-        )
+        assert feature_mode in {"concat", "rich"}
+        self.d = d
+        self.feature_mode = feature_mode
+        in_dim = 3 * d if feature_mode == "concat" else 7 * d
+        self.mlp = _MLP(in_dim, d, hidden=hidden, p_drop=p_drop)
+        self.res_scale = nn.Parameter(torch.tensor(0.5))
 
     def forward(self, zL: torch.Tensor, zN: torch.Tensor, zI: torch.Tensor) -> torch.Tensor:
-        h = torch.cat([zL, zN, zI], dim=-1)  
-        f = self.net(h)                      
-        base = (zL + zN + zI) / 3.0          
-        g = self.gate(base)                  
-        return g * f + (1.0 - g) * base
+        if self.feature_mode == "concat":
+            x = torch.cat([zL, zN, zI], dim=-1)
+        else:  # 'rich'
+            zLN = zL * zN
+            zLI = zL * zI
+            zNI = zN * zI
+            zLNI = zL * zN * zI
+            x = torch.cat([zL, zN, zI, zLN, zLI, zNI, zLNI], dim=-1)
+        h = self.mlp(x)
+        base = (zL + zN + zI) / 3.0
+        return h + self.res_scale * base
 
-def build_fusions(d: int, p_drop: float = 0.1) -> Dict[str, nn.Module]:
-    """Return fusion modules for LN, LI, NI, LNI (each output ∈ R^d)."""
+
+def build_fusions(d: int,
+                  p_drop: float = 0.1,
+                  feature_mode: str = "rich",
+                  hidden: Optional[Sequence[int]] = None) -> Dict[str, nn.Module]:
+    """
+    Build all fusion modules (bimodal + trimodal) using Multimodal-MLP blocks.
+
+    Args:
+      d: shared embedding size
+      p_drop: dropout prob inside MLPs
+      feature_mode: 'rich' (default) or 'concat'
+      hidden: list of hidden sizes for MLPs, defaults to [4*d, 2*d]
+    """
     return {
-        "LN":  PairwiseFusion(d=d, p_drop=p_drop).to(DEVICE),
-        "LI":  PairwiseFusion(d=d, p_drop=p_drop).to(DEVICE),
-        "NI":  PairwiseFusion(d=d, p_drop=p_drop).to(DEVICE),
-        "LNI": TrimodalFusion(d=d, p_drop=p_drop).to(DEVICE),
+        "LN":  PairwiseFusion(d=d, hidden=hidden, p_drop=p_drop, feature_mode=feature_mode).to(DEVICE),
+        "LI":  PairwiseFusion(d=d, hidden=hidden, p_drop=p_drop, feature_mode=feature_mode).to(DEVICE),
+        "NI":  PairwiseFusion(d=d, hidden=hidden, p_drop=p_drop, feature_mode=feature_mode).to(DEVICE),
+        "LNI": TrimodalFusion(d=d, hidden=hidden, p_drop=p_drop, feature_mode=feature_mode).to(DEVICE),
     }
+
 
 @torch.no_grad()
 def _safe_clone(x: torch.Tensor) -> torch.Tensor:
     return x.clone() if x.requires_grad is False else x
+
 
 def make_route_inputs(
     z: Dict[str, torch.Tensor],
@@ -85,7 +130,6 @@ def make_route_inputs(
     }
 
 
-# Route Head (2-layer MLP) — now EVERY route head takes d-dim input
 class RouteHead(nn.Module):
     """
     Small MLP mapping a route-specific d-dim embedding to task logits.
@@ -102,17 +146,17 @@ class RouteHead(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)  
+        return self.net(x)
 
 
-def build_route_heads(d: int, n_tasks: int = 1, p_drop: float = 0.1) -> Dict[str, RouteHead]:
+def build_route_heads(d: int, n_tasks: int = 1, p_drop: float = 0.1) -> Dict[str, 'RouteHead']:
     """Helper to construct all 7 route heads with consistent n_tasks."""
     return {
         r: RouteHead(d_in=d, n_tasks=n_tasks, p_drop=p_drop).to(DEVICE)
         for r in ROUTES
     }
-    
-# Learned gate over (L, N, I) → per-task route/block weights
+
+
 class LearnedGateRouter(nn.Module):
     """
     Gating network over routes/blocks.
@@ -131,7 +175,7 @@ class LearnedGateRouter(nn.Module):
         routes: List[str],
         blocks: Dict[str, List[str]],
         d: int,
-        n_tasks: int = 1,           
+        n_tasks: int = 1,
         hidden: int = 1024,
         p_drop: float = 0.1,
         use_masks: bool = True,
@@ -152,28 +196,28 @@ class LearnedGateRouter(nn.Module):
             nn.Linear(gate_in, hidden),
             nn.GELU(),
             nn.Dropout(p_drop),
-            nn.Linear(hidden, n_tasks * (7 + 3)),  
+            nn.Linear(hidden, n_tasks * (7 + 3)),
         )
 
     @staticmethod
     def _masked_softmax(logits: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Tensor:
         mask = mask.to(dtype=logits.dtype)
         keep = (mask.sum(dim=dim, keepdim=True) > 0).to(logits.dtype)
-        safe_mask = mask * keep + (1.0 - keep)              
+        safe_mask = mask * keep + (1.0 - keep)
         logits = logits + torch.log(safe_mask + 1e-12)
         return torch.softmax(logits, dim=dim)
 
     def _stack_gate_input(self, z_dict: Dict[str, torch.Tensor], masks: Dict[str, torch.Tensor] | None) -> torch.Tensor:
-        zL, zN, zI = z_dict["L"], z_dict["N"], z_dict["I"]  
+        zL, zN, zI = z_dict["L"], z_dict["N"], z_dict["I"]
         pieces = [zL, zN, zI]
         if self.use_masks:
             if masks is None:
                 B = zL.size(0)
                 m = torch.ones(B, 3, device=zL.device)
             else:
-                m = torch.cat([masks["L"], masks["N"], masks["I"]], dim=1)  
+                m = torch.cat([masks["L"], masks["N"], masks["I"]], dim=1)
             pieces.append(m)
-        return torch.cat(pieces, dim=1)  
+        return torch.cat(pieces, dim=1)
 
     def _route_availability_mask(self, masks: Dict[str, torch.Tensor] | None, B: int, device) -> torch.Tensor:
         if not self.use_masks:
@@ -191,7 +235,7 @@ class LearnedGateRouter(nn.Module):
             "NI":  mN * mI,
             "LNI": mL * mN * mI,
         }
-        return torch.cat([req[r] for r in self.routes], dim=1).clamp(0, 1) 
+        return torch.cat([req[r] for r in self.routes], dim=1).clamp(0, 1)
 
     def _block_availability_mask(self, route_mask: torch.Tensor) -> torch.Tensor:
         device = route_mask.device
@@ -214,38 +258,40 @@ class LearnedGateRouter(nn.Module):
         device = z_dict["L"].device
 
         # Gate outputs
-        g_in = self._stack_gate_input(z_dict, masks)                                  
-        raw = self.gate(g_in).view(B, C, 7 + 3) / max(self.temperature, 1e-6)         
-        route_logits_gate = raw[:, :, :7]                                             
-        block_logits_gate = raw[:, :, 7:]                                             
+        g_in = self._stack_gate_input(z_dict, masks)
+        raw = self.gate(g_in).view(B, C, 7 + 3) / max(self.temperature, 1e-6)
+        route_logits_gate = raw[:, :, :7]
+        block_logits_gate = raw[:, :, 7:]
 
         # Availability masks
-        route_mask = self._route_availability_mask(masks, B, device)                  
-        block_mask = self._block_availability_mask(route_mask)                        
+        route_mask = self._route_availability_mask(masks, B, device)
+        block_mask = self._block_availability_mask(route_mask)
 
         # Masked softmax
-        route_w = self._masked_softmax(route_logits_gate, route_mask.unsqueeze(1).expand(-1, C, -1), dim=2)  
-        block_w = self._masked_softmax(block_logits_gate, block_mask.unsqueeze(1).expand(-1, C, -1), dim=2)  
+        route_w = self._masked_softmax(route_logits_gate, route_mask.unsqueeze(1).expand(-1, C, -1), dim=2)
+        block_w = self._masked_softmax(block_logits_gate, block_mask.unsqueeze(1).expand(-1, C, -1), dim=2)
 
+        # Stack route logits in the same order as self.routes
         R = torch.cat([
             (route_logits_dict[r].unsqueeze(-1) if route_logits_dict[r].dim() == 2
-             else route_logits_dict[r].unsqueeze(1).unsqueeze(-1))  
+             else route_logits_dict[r].unsqueeze(1).unsqueeze(-1))
             for r in self.routes
         ], dim=2)
+
         # Block-wise sums
         def sum_block(names: List[str]) -> torch.Tensor:
             idx = torch.tensor([self.routes.index(r) for r in names], device=R.device)
-            R_blk = R.index_select(dim=2, index=idx)      
+            R_blk = R.index_select(dim=2, index=idx)
             w_blk = route_w.index_select(dim=2, index=idx)
-            return (w_blk * R_blk).sum(dim=2)             
+            return (w_blk * R_blk).sum(dim=2)
 
         y_uni = sum_block(self.blocks["uni"])
         y_bi  = sum_block(self.blocks["bi"])
         y_tri = sum_block(self.blocks["tri"])
 
-        block_logits = torch.stack([y_uni, y_bi, y_tri], dim=1)                        
-        block_logits = block_logits * block_mask.unsqueeze(-1)                         
+        block_logits = torch.stack([y_uni, y_bi, y_tri], dim=1)
+        block_logits = block_logits * block_mask.unsqueeze(-1)
 
         # Final blend across blocks
-        y = (block_w.transpose(1, 2) * block_logits).sum(dim=1)                         
+        y = (block_w.transpose(1, 2) * block_logits).sum(dim=1)
         return y, route_w, block_w, block_logits
