@@ -1,27 +1,3 @@
-# Multimodal encoders for L (structured), N (notes), I (images)
-# + Fusion encoders for LN, LI, NI (bimodal) and LNI (trimodal)
-
-# Unimodal encoders:
-#   - BEHRT-style Transformer for structured 24h time-series 
-#   - BioClinicalBERT with per-NOTE chunking (512 tokens), note-level pooling, then patient-level pooling
-#   - Image encoder (ResNet-34) -> global avg-pool features (C=512) -> projection to d
-
-# Fusion encoders:
-#   - PairwiseFusion: learns interactions for (L,N), (L,I), (N,I) -> R^d
-#   - TrimodalFusion: learns interactions for (L,N,I) -> R^d
-
-# Shapes:
-#   Structured input:  x_L             : Tensor [B, T=24, F]
-#   Notes input:       notes           : List[str]  OR List[List[str]] (len = B)
-#   Images input:      imgs            : Tensor [B, 3, H, W]
-#   Unimodal outputs:  z_L, z_N, z_I  ∈ R^d (batch tensors [B, d])
-#   Fusion outputs:    z_LN, z_LI, z_NI, z_LNI ∈ R^d (batch tensors [B, d])
-
-# Utilities:
-#   - build_encoders(EncoderConfig)              -> (behrt, bbert, imgenc)
-#   - build_fusions(FusionConfig)                -> dict {"LN","LI","NI","LNI"} -> nn.Module
-#   - make_route_inputs(z_dict, fusion_modules)  -> dict for all 7 routes mapped to [B, d]
-
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Literal, Tuple, Sequence, Union, Dict
