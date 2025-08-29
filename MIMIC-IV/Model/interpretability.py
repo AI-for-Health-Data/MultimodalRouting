@@ -1,18 +1,3 @@
-# What this notebook does:
-# 1) Exports per-sample, per-task *route contributions*:
-#       - raw route logits  s_r^{(c)}  (one for each of the 7 routes and 3 tasks)
-#       - learned route weights w_r^{(c)} (from the gate)
-#       - weighted route contributions w_r^{(c)} * s_r^{(c)}
-#     plus block logits/weights, final logits/probs, and labels.
-#
-# 2) Summarizes global contributions (mean absolute contributions per route).
-#
-# 3) Computes a practical UC / BI / TI decomposition per task using
-#    *batch-mean* expectations as a plug-in estimator:
-#       UC ≈ f(xL, μN, μI) + f(μL, xN, μI) + f(μL, μN, xI) - 2 f(μL, μN, μI)
-#       BI ≈ sum of pairwise interactions (LN, LI, NI) using inclusion–exclusion with μ as baseline
-#       TI  = f(xL, xN, xI) - UC - BI
-
 import os, json
 import numpy as np
 import pandas as pd
@@ -23,16 +8,33 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+from env_config import CFG, DEVICE, ROUTES, TASKS
+from encoders import build_fusions_enc
+from train_step1_unimodal import ICUStayDataset, collate_fn
 
-# Ensure fusion modules exist (LN, LI, NI, LNI)
+# Ensure fusion modules exist 
 def _ensure_fusions_interpret():
     global fusion
-    if "fusion" in globals() and isinstance(fusion, dict):
-        needed = {"LN","LI","NI","LNI"}
-        if needed.issubset(set(fusion.keys())):
-            for k in needed:
-                fusion[k] = fusion[k].to(DEVICE).eval()
-            return
+    need = {"LN", "LI", "NI", "LNI"}
+    if "fusion" in globals() and isinstance(fusion, dict) and need.issubset(fusion.keys()):
+        for k in need:
+            fusion[k] = fusion[k].to(DEVICE).eval()
+        return
+
+    # Build canonical fusions
+    fusion = build_fusions_enc(d=CFG.d, p_drop=CFG.dropout, hidden=4 * 256)
+    for k in need:
+        fusion[k] = fusion[k].to(DEVICE).eval()
+
+    step3_path = os.path.join(CFG.ckpt_root, "step3_trimodal_router.pt")
+    if os.path.exists(step3_path):
+        try:
+            ckpt3 = torch.load(step3_path, map_location=DEVICE)
+            if "fusion_LNI" in ckpt3:
+                fusion["LNI"].load_state_dict(ckpt3["fusion_LNI"], strict=False)
+                print("Loaded fusion['LNI'] weights from step3_trimodal_router.pt")
+        except Exception as e:
+            print(f"[warn] Could not load fusion_LNI from step3: {e}")
 
     class _PairwiseFusion(nn.Module):
         def __init__(self, d: int, hidden: int = None, p_drop: float = 0.1):
