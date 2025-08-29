@@ -20,6 +20,16 @@ from env_config import CFG, DEVICE
 from encoders import EncoderConfig, build_encoders
 from routing_and_heads import RouteHead
 
+TASK_MAP = {"mort": 0, "pe": 1, "ph": 2}
+COL_MAP  = {"mort": "mort", "pe": "pe", "ph": "ph"}
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--task", type=str, default="mort", choices=list(TASK_MAP.keys()),
+                help="Train a single label at a time.")
+args, _ = ap.parse_known_args()
+TASK  = args.task
+TIDX  = TASK_MAP[TASK]
+TCOL  = COL_MAP[TASK]
 
 class ICUStayDataset(Dataset):
     def __init__(self, root: str, split: str = "train"):
@@ -56,13 +66,9 @@ class ICUStayDataset(Dataset):
         # Images: list of image paths (we load 1st for efficiency)
         img_paths = self.images[self.images.stay_id == stay_id].image_path.tolist()
 
-        # Labels: [mort, pe, ph]
-        row_y = (
-            self.labels[self.labels.stay_id == stay_id][["mort", "pe", "ph"]]
-            .values[0]
-            .astype(np.float32)
-        )
-        y = torch.from_numpy(row_y)
+        # Single label (scalar) — select only the chosen task
+        row = self.labels[self.labels.stay_id == stay_id][["mort", "pe", "ph"]].values[0].astype(np.float32)
+        y = torch.tensor(row[TIDX], dtype=torch.float32)  
 
         # Sensitive metadata dict
         sens = self.sensitive[self.sensitive.stay_id == stay_id].iloc[0].to_dict()
@@ -84,12 +90,10 @@ def pad_or_trim_struct(x: torch.Tensor, T: int, F: int) -> torch.Tensor:
     pad = torch.zeros(T - t, F, dtype=x.dtype)
     return torch.cat([pad, x], dim=0)
 
-
 IMG_TFMS = TF.Compose([
     TF.Resize((224, 224)),
     TF.ToTensor(),
 ])
-
 
 def load_first_image(paths: List[str]) -> torch.Tensor:
     if not paths:
@@ -101,7 +105,6 @@ def load_first_image(paths: List[str]) -> torch.Tensor:
     except Exception:
         return torch.zeros(3, 224, 224)
 
-
 def collate_fn(batch):
     T_len = CFG.structured_seq_len
     F_dim = CFG.structured_n_feats
@@ -112,10 +115,12 @@ def collate_fn(batch):
         for b in batch
     ]
     imgs_batch = torch.stack([load_first_image(b["image_paths"]) for b in batch], dim=0)
-    y_batch = torch.stack([b["y"] for b in batch], dim=0)
+
+    # single label -> make shape [B, 1] for BCEWithLogits
+    y_batch = torch.stack([b["y"] for b in batch], dim=0).unsqueeze(1).to(torch.float32)
+
     sens_batch = [b["sens"] for b in batch]
     return xL_batch, notes_batch, imgs_batch, y_batch, sens_batch
-
 
 if __name__ == "__main__":
     # Build encoders with CFG
@@ -135,13 +140,22 @@ if __name__ == "__main__":
 
     # Unimodal heads (L, N, I)
     route_heads: Dict[str, RouteHead] = {
-        r: RouteHead(d_in=CFG.d, n_tasks=3, p_drop=CFG.dropout).to(DEVICE)
+        r: RouteHead(d_in=CFG.d, n_tasks=1, p_drop=CFG.dropout).to(DEVICE)
         for r in ["L", "N", "I"]
     }
 
     ROOT = os.path.join(CFG.data_root, "MIMIC-IV")
     train_ds = ICUStayDataset(ROOT, split="train")
     val_ds = ICUStayDataset(ROOT, split="val")
+
+    # compute scalar pos_weight for class imbalance on the selected task
+    try:
+        y_train_np = train_ds.labels[[TCOL]].values.astype("float32").reshape(-1)
+        pos = float((y_train_np > 0.5).sum())
+        neg = float(len(y_train_np) - pos)
+        pos_weight = torch.tensor(neg / max(pos, 1.0), dtype=torch.float32, device=DEVICE)
+    except Exception:
+        pos_weight = None
 
     # pin_memory/non_blocking if really on CUDA
     IS_CUDA = (
@@ -178,18 +192,18 @@ if __name__ == "__main__":
     scaler = torch.cuda.amp.GradScaler(enabled=IS_CUDA)
 
     best_val = float("inf")
-
+    
     for epoch in range(CFG.max_epochs_uni):
         behrt.train(); bbert.train(); imgenc.train()
         route_heads["L"].train(); route_heads["N"].train(); route_heads["I"].train()
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{CFG.max_epochs_uni} [UNI]", dynamic_ncols=True)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{CFG.max_epochs_uni} [UNI:{TASK}]", dynamic_ncols=True)
         running = 0.0; n_steps = 0
 
         for xL, notes_list, imgs, y, sens in pbar:
             xL   = xL.to(DEVICE, non_blocking=IS_CUDA)
             imgs = imgs.to(DEVICE, non_blocking=IS_CUDA)
-            y    = y.to(DEVICE, non_blocking=IS_CUDA)
+            y    = y.to(DEVICE, non_blocking=IS_CUDA)  # [B,1]
 
             opt.zero_grad(set_to_none=True)
 
@@ -199,15 +213,16 @@ if __name__ == "__main__":
                 zN = bbert(notes_list)
                 zI = imgenc(imgs)
 
-                # Unimodal heads -> logits
-                logits_L = route_heads["L"](zL)
-                logits_N = route_heads["N"](zN)
-                logits_I = route_heads["I"](zI)
+                # Unimodal heads -> single-logit per sample
+                logits_L = route_heads["L"](zL)  # [B,1]
+                logits_N = route_heads["N"](zN)  # [B,1]
+                logits_I = route_heads["I"](zI)  # [B,1]
 
                 # BCE over the three unimodal routes (mean)
-                loss_L = F.binary_cross_entropy_with_logits(logits_L, y)
-                loss_N = F.binary_cross_entropy_with_logits(logits_N, y)
-                loss_I = F.binary_cross_entropy_with_logits(logits_I, y)
+                bce_kwargs = {"pos_weight": pos_weight} if (pos_weight is not None) else {}
+                loss_L = F.binary_cross_entropy_with_logits(logits_L, y, **bce_kwargs)
+                loss_N = F.binary_cross_entropy_with_logits(logits_N, y, **bce_kwargs)
+                loss_I = F.binary_cross_entropy_with_logits(logits_I, y, **bce_kwargs)
                 loss = (loss_L + loss_N + loss_I) / 3.0
 
             scaler.scale(loss).backward()
@@ -226,7 +241,7 @@ if __name__ == "__main__":
             for xL, notes_list, imgs, y, sens in val_loader:
                 xL   = xL.to(DEVICE, non_blocking=IS_CUDA)
                 imgs = imgs.to(DEVICE, non_blocking=IS_CUDA)
-                y    = y.to(DEVICE, non_blocking=IS_CUDA)
+                y    = y.to(DEVICE, non_blocking=IS_CUDA)  # [B,1]
 
                 zL = behrt(xL)
                 zN = bbert(notes_list)
@@ -236,21 +251,22 @@ if __name__ == "__main__":
                 logits_N = route_heads["N"](zN)
                 logits_I = route_heads["I"](zI)
 
+                bce_kwargs = {"pos_weight": pos_weight} if (pos_weight is not None) else {}
                 lval = (
-                    F.binary_cross_entropy_with_logits(logits_L, y)
-                    + F.binary_cross_entropy_with_logits(logits_N, y)
-                    + F.binary_cross_entropy_with_logits(logits_I, y)
+                    F.binary_cross_entropy_with_logits(logits_L, y, **bce_kwargs)
+                    + F.binary_cross_entropy_with_logits(logits_N, y, **bce_kwargs)
+                    + F.binary_cross_entropy_with_logits(logits_I, y, **bce_kwargs)
                 ) / 3.0
 
                 val_loss += float(lval); n_val += 1
 
         val_loss /= max(n_val, 1)
-        print(f"Val loss: {val_loss:.4f}")
+        print(f"[{TASK}] Val loss: {val_loss:.4f}")
 
         if val_loss < best_val:
             best_val = val_loss
             os.makedirs(CFG.ckpt_root, exist_ok=True)
-            ckpt_path = os.path.join(CFG.ckpt_root, "step1_unimodal.pt")
+            ckpt_path = os.path.join(CFG.ckpt_root, f"{TASK}_step1_unimodal.pt")
             torch.save(
                 {
                     "behrt": behrt.state_dict(),
@@ -260,6 +276,7 @@ if __name__ == "__main__":
                     "N": route_heads["N"].state_dict(),
                     "I": route_heads["I"].state_dict(),
                     "best_val": best_val,
+                    "task": TASK,
                     "cfg": vars(CFG),
                 },
                 ckpt_path,
