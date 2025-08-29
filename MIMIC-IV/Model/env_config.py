@@ -1,11 +1,3 @@
-# ------------------------------------------------------------------------------
-# Environment and shared configuration for the MultimodalRouting project.
-# Modalities: L (structured labs/vitals), N (notes), I (images)
-# Tasks:      mortality ("mort"), pulmonary embolism ("pe"), pulmonary hypertension ("ph")
-# Routing backend (current): "learned_gate" — 7 route heads + learned per-task
-# route/block weights (gating over [L, N, I] embeddings).
-# ------------------------------------------------------------------------------
-
 import os
 import sys
 import math
