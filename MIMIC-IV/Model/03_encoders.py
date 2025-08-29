@@ -28,7 +28,6 @@ from typing import List, Optional, Literal, Tuple, Sequence, Union, Dict
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 # BEHRT-style encoder (Structured)
@@ -259,7 +258,6 @@ class BioClinBERTEncoder(nn.Module):
         return torch.stack(Z, dim=0)  # [B, d]
   
 
-
 # Image encoder (ResNet-34 backbone)
 class ImageEncoder(nn.Module):
     def __init__(
@@ -271,10 +269,15 @@ class ImageEncoder(nn.Module):
     ) -> None:
         super().__init__()
         import torchvision
-        backbone = torchvision.models.resnet34(weights=torchvision.models.ResNet34_Weights.DEFAULT)
-        modules = list(backbone.children())[:-2]  
+        try:
+            backbone = torchvision.models.resnet34(
+                weights=torchvision.models.ResNet34_Weights.DEFAULT
+            )
+        except Exception:
+            backbone = torchvision.models.resnet34(weights=None)  # offline fallback
+        modules = list(backbone.children())[:-2]
         self.backbone = nn.Sequential(*modules)
-        self.gap = nn.AdaptiveAvgPool2d((1, 1)) 
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
         self.out_channels = 512
 
         self.proj = nn.Sequential(
@@ -294,6 +297,7 @@ class ImageEncoder(nn.Module):
                 nn.Tanh(),
                 nn.Linear(attn_hidden, 1),
             )
+
 
     def _encode_one(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, 3, H, W] or [3, H, W]
@@ -367,13 +371,12 @@ class PairwiseFusion(nn.Module):
         )
 
     def forward(self, zA: torch.Tensor, zB: torch.Tensor) -> torch.Tensor:
-        # zA, zB: [B, d]
         had = zA * zB
         diff = (zA - zB).abs()
-        # bilinear scalar per sample (diagonal of zA @ W @ zB^T)
-        s = (zA @ self.bilinear @ zB.transpose(0, 1)).diagonal().unsqueeze(1)  
-        x = torch.cat([zA, zB, had, diff, s], dim=1)  
-        return self.net(x)  
+        # Faster bilinear scalar (optional):
+        s = ((zA @ self.bilinear) * zB).sum(dim=1, keepdim=True)
+        x = torch.cat([zA, zB, had, diff, s], dim=1)
+        return self.net(x)
 
 
 class TrimodalFusion(nn.Module):
@@ -420,8 +423,15 @@ class EncoderConfig:
     img_agg: Literal["last", "mean", "attention"] = "last"
 
 
-def build_encoders(cfg: EncoderConfig) -> Tuple[BEHRTLabEncoder, BioClinBERTEncoder, ImageEncoder]:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def build_encoders(
+    cfg: EncoderConfig,
+    device: Optional[Union[str, torch.device]] = None,
+) -> Tuple[BEHRTLabEncoder, BioClinBERTEncoder, ImageEncoder]:
+    # Resolve device (accepts "cuda", "cpu", torch.device, etc.)
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
 
     behrt = BEHRTLabEncoder(
         n_feats=cfg.structured_n_feats,
@@ -440,7 +450,7 @@ def build_encoders(cfg: EncoderConfig) -> Tuple[BEHRTLabEncoder, BioClinBERTEnco
         dropout=cfg.dropout,
         note_agg=cfg.note_agg,
         max_notes_concat=cfg.max_notes_concat,
-        device=device,
+        device=device,  # pass through so HF tensors land on the right device
     ).to(device)
 
     imgenc = ImageEncoder(
@@ -456,19 +466,20 @@ def build_encoders(cfg: EncoderConfig) -> Tuple[BEHRTLabEncoder, BioClinBERTEnco
 class FusionConfig:
     d: int = 256
     dropout: float = 0.1
-    hidden: int = 4 * 256  
+    hidden: int = 4 * 256
 
-
-def build_fusions(cfg: FusionConfig) -> Dict[str, nn.Module]:
-    """Create fusion encoders for LN, LI, NI, and LNI."""
-    devicestr = "cuda" if torch.cuda.is_available() else "cpu"
-    device = torch.device(devicestr)
-
-    LN = PairwiseFusion(d=cfg.d, hidden=cfg.hidden, dropout=cfg.dropout).to(device)
-    LI = PairwiseFusion(d=cfg.d, hidden=cfg.hidden, dropout=cfg.dropout).to(device)
-    NI = PairwiseFusion(d=cfg.d, hidden=cfg.hidden, dropout=cfg.dropout).to(device)
-    LNI = TrimodalFusion(d=cfg.d, hidden=cfg.hidden, dropout=cfg.dropout).to(device)
+def build_fusions(d: int, p_drop: float, hidden: int = 4 * 256) -> Dict[str, nn.Module]:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    LN  = PairwiseFusion(d=d, hidden=hidden, dropout=p_drop).to(device)
+    LI  = PairwiseFusion(d=d, hidden=hidden, dropout=p_drop).to(device)
+    NI  = PairwiseFusion(d=d, hidden=hidden, dropout=p_drop).to(device)
+    LNI = TrimodalFusion(d=d, hidden=hidden, dropout=p_drop).to(device)
     return {"LN": LN, "LI": LI, "NI": NI, "LNI": LNI}
+
+# Optional convenience if you still want config-style:
+def build_fusions_from_cfg(cfg: FusionConfig) -> Dict[str, nn.Module]:
+    return build_fusions(d=cfg.d, p_drop=cfg.dropout, hidden=cfg.hidden)
+
 
 
 def make_route_inputs(
