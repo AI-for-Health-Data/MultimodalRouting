@@ -1,194 +1,47 @@
-# Load checkpoints, run per-patient predictions, and display route/block weights
-# using the learned-gate router (per-task route/block weights).
+from __future__ import annotations
 
 import os
 import json
-from pprint import pprint
+import argparse
+from typing import Dict, List
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from env_config import CFG, DEVICE, ROUTES, BLOCKS, TASKS
+from env_config import CFG, DEVICE, ROUTES, BLOCKS
 from encoders import EncoderConfig, build_encoders
-from routing_and_heads import LearnedGateRouter, RouteHead, build_fusions
-
-# Encoders
-behrt, bbert, imgenc = build_encoders(
-    EncoderConfig(
-        d=CFG.d,
-        dropout=CFG.dropout,
-        structured_seq_len=CFG.structured_seq_len,
-        structured_n_feats=CFG.structured_n_feats,
-        text_model_name=CFG.text_model_name,
-        text_max_len=CFG.max_text_len,
-        note_agg="mean",
-        max_notes_concat=8,
-        img_agg="last",
-    ),
-    device=DEVICE,
+from routing_and_heads import (
+    build_fusions,
+    RouteGateNet,
+    FinalConcatHead,
+    forward_emb_concat,
 )
+from train_step1_unimodal import ICUStayDataset, collate_fn
 
-# Fusion modules (LN/LI/NI/LNI)
-fusion = build_fusions(d=CFG.d, p_drop=CFG.dropout)
 
-# Route heads
-route_heads = {
-    r: RouteHead(d_in=CFG.d, n_tasks=len(TASKS), p_drop=CFG.dropout).to(DEVICE)
-    for r in ROUTES
-}
+TASK_MAP = {"mort": 0, "pe": 1, "ph": 2}
+COL_MAP  = {"mort": "mort", "pe": "pe", "ph": "ph"}
 
-# Learned-gate router
-router = LearnedGateRouter(
-    routes=ROUTES,
-    blocks=BLOCKS,
-    d=CFG.d,
-    n_tasks=len(TASKS),
-    hidden=1024,
-    p_drop=CFG.dropout,
-    use_masks=True,
-    temperature=1.0,
-).to(DEVICE)
 
-ckpt1 = torch.load(os.path.join(CFG.ckpt_root, "step1_unimodal.pt"), map_location=DEVICE)
-ckpt2 = torch.load(os.path.join(CFG.ckpt_root, "step2_bimodal.pt"), map_location=DEVICE)
-ckpt3 = torch.load(os.path.join(CFG.ckpt_root, "step3_trimodal_router.pt"), map_location=DEVICE)
+def parse_args():
+    ap = argparse.ArgumentParser(description="Embedding-level fusion inference demo")
+    ap.add_argument("--task", type=str, default=getattr(CFG, "task_name", "mort"),
+                    choices=list(TASK_MAP.keys()),
+                    help="Which single-task checkpoint set to load.")
+    ap.add_argument("--data_root", type=str, default=CFG.data_root,
+                    help="Root containing MIMIC-IV parquet data.")
+    ap.add_argument("--ckpt_root", type=str, default=CFG.ckpt_root,
+                    help="Where checkpoints are saved.")
+    ap.add_argument("--batch_size", type=int, default=CFG.batch_size)
+    ap.add_argument("--show_k", type=int, default=5,
+                    help="How many patients to print from the first batch.")
+    ap.add_argument("--inspect_idx", type=int, default=0,
+                    help="Index within the first batch to show detailed gates.")
+    return ap.parse_args()
 
-# encoders
-behrt.load_state_dict(ckpt1["behrt"], strict=False)
-bbert.load_state_dict(ckpt1["bbert"], strict=False)
-imgenc.load_state_dict(ckpt1["imgenc"], strict=False)
 
-# heads: step1 (unimodal)
-for key in ["L", "N", "I"]:
-    route_heads[key].load_state_dict(ckpt1[key], strict=False)
 
-# heads: step2 (bimodal) — commonly saved as LN/LI/NI heads
-for key in ["LN", "LI", "NI"]:
-    if key in ckpt2:
-        route_heads[key].load_state_dict(ckpt2[key], strict=False)
-
-for fused_key in ["fusion_LN", "fusion_LI", "fusion_NI"]:
-    if fused_key in ckpt2:
-        name = fused_key.split("_", 1)[1]  # "LN" / "LI" / "NI"
-        try:
-            fusion[name].load_state_dict(ckpt2[fused_key], strict=False)
-            print(f"Loaded fusion['{name}'] from step2_bimodal.pt")
-        except Exception:
-            pass
-
-# step3: LNI head + router 
-if "LNI" in ckpt3:
-    route_heads["LNI"].load_state_dict(ckpt3["LNI"], strict=False)
-router.load_state_dict(ckpt3["router"], strict=False)
-if "fusion_LNI" in ckpt3:
-    try:
-        fusion["LNI"].load_state_dict(ckpt3["fusion_LNI"], strict=False)
-        print("Loaded fusion['LNI'] from step3_trimodal_router.pt")
-    except Exception:
-        pass
-
-# eval mode
-behrt.eval(); bbert.eval(); imgenc.eval()
-for r in ROUTES: route_heads[r].eval()
-for k in ["LN", "LI", "NI", "LNI"]: fusion[k].eval()
-router.eval()
-
-def _ensure_test_loader():
-    """Build test_loader if not present in globals()."""
-    import json, pandas as pd, numpy as np
-    from torch.utils.data import Dataset
-    import torchvision.transforms as T
-
-    class ICUStayDataset(Dataset):
-        def __init__(self, root: str, split: str = "test"):
-            super().__init__()
-            self.root = root
-            with open(os.path.join(root, "splits.json")) as f:
-                splits = json.load(f)
-            self.ids = list(splits[split])
-
-            self.struct = pd.read_parquet(os.path.join(root, "structured_24h.parquet"))
-            self.notes  = pd.read_parquet(os.path.join(root, "notes_24h.parquet"))
-            self.images = pd.read_parquet(os.path.join(root, "images_24h.parquet"))
-            self.labels = pd.read_parquet(os.path.join(root, "labels.parquet"))
-            self.sensitive = pd.read_parquet(os.path.join(root, "sensitive.parquet"))
-
-            base_cols = {"stay_id", "hour"}
-            self.feat_cols = [c for c in self.struct.columns if c not in base_cols]
-
-        def __len__(self): return len(self.ids)
-
-        def __getitem__(self, idx: int):
-            import numpy as np
-            stay_id = self.ids[idx]
-            df_s = self.struct[self.struct.stay_id == stay_id].sort_values("hour")
-            xs_np = df_s[self.feat_cols].to_numpy(dtype=np.float32)
-            xs = torch.from_numpy(xs_np)
-
-            notes_list = self.notes[self.notes.stay_id == stay_id].text.tolist()
-            img_paths = self.images[self.images.stay_id == stay_id].image_path.tolist()
-
-            row_y = self.labels[self.labels.stay_id == stay_id][["mort", "pe", "ph"]].values[0].astype(np.float32)
-            y = torch.from_numpy(row_y)
-
-            sens = self.sensitive[self.sensitive.stay_id == stay_id].iloc[0].to_dict()
-
-            return {"stay_id": stay_id, "x_struct": xs, "notes_list": notes_list,
-                    "image_paths": img_paths, "y": y, "sens": sens}
-
-    def pad_or_trim_struct(x: torch.Tensor, T: int, F: int) -> torch.Tensor:
-        t = x.shape[0]
-        if t >= T: return x[-T:]
-        pad = torch.zeros(T - t, F, dtype=x.dtype)
-        return torch.cat([pad, x], dim=0)
-
-    import torchvision.transforms as T
-    IMG_TFMS = T.Compose([T.Resize((224, 224)), T.ToTensor()])
-
-    def load_first_image(paths: list[str]) -> torch.Tensor:
-        if not paths:
-            return torch.zeros(3, 224, 224)
-        p = paths[0]
-        try:
-            from PIL import Image
-            img = Image.open(p).convert("RGB")
-            return IMG_TFMS(img)
-        except Exception:
-            return torch.zeros(3, 224, 224)
-
-    def collate_fn(batch):
-        B = len(batch)
-        T = CFG.structured_seq_len
-        F = CFG.structured_n_feats
-
-        xL_batch = torch.stack([pad_or_trim_struct(b["x_struct"], T, F) for b in batch], dim=0)
-
-        notes_batch = [
-            b["notes_list"] if isinstance(b["notes_list"], list) else [str(b["notes_list"])]
-            for b in batch
-        ]
-
-        imgs_batch  = torch.stack([load_first_image(b["image_paths"]) for b in batch], dim=0)
-        y_batch     = torch.stack([b["y"] for b in batch], dim=0)
-        sens_batch  = [b["sens"] for b in batch]
-        return xL_batch, notes_batch, imgs_batch, y_batch, sens_batch
-
-    ROOT_local = os.path.join(CFG.data_root, "MIMIC-IV")
-    test_ds_local = ICUStayDataset(ROOT_local, split="test")
-    test_loader_local = DataLoader(
-        test_ds_local,
-        batch_size=CFG.batch_size,
-        shuffle=False,
-        num_workers=CFG.num_workers,
-        collate_fn=collate_fn,
-        pin_memory=(DEVICE == "cuda")
-    )
-    return test_loader_local
-
-test_loader = _ensure_test_loader()
-
-def build_masks(xL, notes_list, imgs):
+def build_masks(xL: torch.Tensor, notes_list, imgs: torch.Tensor) -> dict:
     B = xL.size(0)
     mL = torch.ones(B, 1, device=xL.device)
 
@@ -203,125 +56,224 @@ def build_masks(xL, notes_list, imgs):
     mI = mI_vals.to(xL.device).unsqueeze(1)
     return {"L": mL, "N": mN, "I": mI}
 
-def embeddings_from_batch(xL, notes_list, imgs):
-    zL = behrt(xL)
-    zN = bbert(notes_list)
-    zI = imgenc(imgs)
-    return {"L": zL, "N": zN, "I": zI}
 
-def all_route_logits(z):
-    out = {
-        "L": route_heads["L"](z["L"]),
-        "N": route_heads["N"](z["N"]),
-        "I": route_heads["I"](z["I"]),
-    }
-    zLN  = fusion["LN"](z["L"], z["N"])
-    zLI  = fusion["LI"](z["L"], z["I"])
-    zNI  = fusion["NI"](z["N"], z["I"])
-    zLNI = fusion["LNI"](z["L"], z["N"], z["I"])
-    out["LN"]  = route_heads["LN"](zLN)
-    out["LI"]  = route_heads["LI"](zLI)
-    out["NI"]  = route_heads["NI"](zNI)
-    out["LNI"] = route_heads["LNI"](zLNI)
-    return out
 
-route_index = {r: i for i, r in enumerate(ROUTES)}
-block_names = ["uni", "bi", "tri"]
+def build_stack():
+    behrt, bbert, imgenc = build_encoders(
+        EncoderConfig(
+            d=CFG.d,
+            dropout=CFG.dropout,
+            structured_seq_len=CFG.structured_seq_len,
+            structured_n_feats=CFG.structured_n_feats,
+            text_model_name=CFG.text_model_name,
+            text_max_len=CFG.max_text_len,
+            note_agg="mean",
+            max_notes_concat=8,
+            img_agg="last",
+        ),
+        device=DEVICE,
+    )
+    fusion    = build_fusions(d=CFG.d, p_drop=CFG.dropout)
+    gate_net  = RouteGateNet(d=CFG.d, hidden=4 * 256, p_drop=CFG.dropout, use_masks=True).to(DEVICE)
+    final_head = FinalConcatHead(d=CFG.d, n_tasks=1, p_drop=CFG.dropout).to(DEVICE)
+    return behrt, bbert, imgenc, fusion, gate_net, final_head
+
+
+def load_checkpoints(task: str,
+                     behrt, bbert, imgenc,
+                     fusion: Dict[str, torch.nn.Module],
+                     gate_net: RouteGateNet,
+                     final_head: FinalConcatHead) -> None:
+
+    c1 = os.path.join(CFG.ckpt_root, f"{task}_step1_unimodal.pt")
+    c2 = os.path.join(CFG.ckpt_root, f"{task}_step2_bimodal.pt")
+    c3 = os.path.join(CFG.ckpt_root, f"{task}_step3_concat_gate.pt")
+
+    if not os.path.exists(c1):
+        raise FileNotFoundError(f"Missing Step-1 checkpoint: {c1}")
+    if not os.path.exists(c2):
+        raise FileNotFoundError(f"Missing Step-2 checkpoint: {c2}")
+    if not os.path.exists(c3):
+        raise FileNotFoundError(f"Missing Step-3 checkpoint: {c3}")
+
+    ckpt1 = torch.load(c1, map_location=DEVICE)
+    ckpt2 = torch.load(c2, map_location=DEVICE)
+    ckpt3 = torch.load(c3, map_location=DEVICE)
+
+    # Encoders
+    behrt.load_state_dict(ckpt1["behrt"], strict=False)
+    bbert.load_state_dict(ckpt1["bbert"], strict=False)
+    imgenc.load_state_dict(ckpt1["imgenc"], strict=False)
+
+    # Pairwise fusions from Step-2
+    if "fusion_LN" in ckpt2: fusion["LN"].load_state_dict(ckpt2["fusion_LN"], strict=False)
+    if "fusion_LI" in ckpt2: fusion["LI"].load_state_dict(ckpt2["fusion_LI"], strict=False)
+    if "fusion_NI" in ckpt2: fusion["NI"].load_state_dict(ckpt2["fusion_NI"], strict=False)
+
+    # Step-3: gate + final head 
+    if "gate" in ckpt3:
+        gate_net.load_state_dict(ckpt3["gate"], strict=False)
+    elif "gate_net" in ckpt3:
+        gate_net.load_state_dict(ckpt3["gate_net"], strict=False)
+    else:
+        raise KeyError("Step-3 checkpoint missing 'gate'/'gate_net' state dict.")
+
+    if "final_head" in ckpt3:
+        final_head.load_state_dict(ckpt3["final_head"], strict=False)
+    else:
+        raise KeyError("Step-3 checkpoint missing 'final_head' state dict.")
+
+    if "fusion_LNI" in ckpt3:
+        try:
+            fusion["LNI"].load_state_dict(ckpt3["fusion_LNI"], strict=False)
+        except Exception:
+            pass
+
+    print(f"[{task}] Loaded: {os.path.basename(c1)}, {os.path.basename(c2)}, {os.path.basename(c3)}")
 
 @torch.no_grad()
-def run_inference_demo(loader: DataLoader, show_k: int = 5, inspect_idx: int = 0):
+def run_inference_demo(loader: DataLoader,
+                       behrt, bbert, imgenc,
+                       fusion, gate_net, final_head,
+                       task: str, show_k: int = 5, inspect_idx: int = 0):
+    behrt.eval(); bbert.eval(); imgenc.eval()
+    for k in fusion: fusion[k].eval()
+    gate_net.eval(); final_head.eval()
+
     xL, notes_list, imgs, y, sens = next(iter(loader))
     xL   = xL.to(DEVICE)
     imgs = imgs.to(DEVICE)
-    y    = y.to(DEVICE)
+    y    = y.to(DEVICE)  
 
-    z = embeddings_from_batch(xL, notes_list, imgs)
+    # Unimodal embeddings
+    zL = behrt(xL)
+    zN = bbert(notes_list)
+    zI = imgenc(imgs)
+    z  = {"L": zL, "N": zN, "I": zI}
+
     masks = build_masks(xL, notes_list, imgs)
-    route_logits = all_route_logits(z)
 
-    ylogits, route_w, block_w, block_logits = router(z, route_logits, masks=masks)
-    probs = torch.sigmoid(ylogits)  # [B, C]
+    ylogits, gates, routes_raw, routes_weighted = forward_emb_concat(
+        z_unimodal=z,
+        fusion=fusion,
+        final_head=final_head,
+        gate_net=gate_net,
+        masks=masks,
+        l2norm_each=False,
+    )
+    probs = torch.sigmoid(ylogits) 
 
-    print("Predicted probabilities (", ", ".join(TASKS), ") for first", show_k, "patients:")
-    print(probs[:show_k].cpu().numpy())
+    B = probs.size(0)
+    show_k = min(show_k, B)
+    print(f"\nPredicted probabilities for task '{task}' (first {show_k} patients):")
+    print(probs[:show_k].flatten().cpu().numpy())
 
-    i = min(inspect_idx, probs.size(0)-1)  
-    print(f"\n--- Per-task route & block weights for sample index {i} ---")
-    for t_idx, t_name in enumerate(TASKS):
-        rw = {r: float(route_w[i, t_idx, route_index[r]]) for r in ROUTES}
-        bw = {block_names[b]: float(block_w[i, t_idx, b]) for b in range(3)}
+    i = min(inspect_idx, B - 1)
+    print(f"\n--- Route gates for sample index {i} ---")
+    gate_i = gates[i].cpu().numpy() 
+    gate_dict = {ROUTES[j]: float(gate_i[j]) for j in range(len(ROUTES))}
+    idx_map = {r: j for j, r in enumerate(ROUTES)}
+    block_means = {}
+    for blk, names in BLOCKS.items():
+        idx = [idx_map[n] for n in names]
+        block_means[blk] = float(torch.tensor(gate_i[idx]).mean().item())
 
-        top_routes = sorted(rw.items(), key=lambda kv: kv[1], reverse=True)
-        print(f"\nTask = {t_name}")
-        print("  Final prob:", float(probs[i, t_idx]))
-        print("  Block weights:", {k: round(v, 4) for k, v in bw.items()})
-        print("  Top routes by weight:")
-        for name, w in top_routes:
-            print(f"    {name:>3}: {w:.4f}")
-
-    print("\nBlock logits (before block weighting) for that sample:")
-    for t_idx, t_name in enumerate(TASKS):
-        print(f"  {t_name}: uni={float(block_logits[i,0,t_idx]):+.4f}, "
-              f"bi={float(block_logits[i,1,t_idx]):+.4f}, "
-              f"tri={float(block_logits[i,2,t_idx]):+.4f}")
+    print("Final prob:", float(probs[i].item()))
+    print("Block mean gates:", {k: round(v, 4) for k, v in block_means.items()})
+    print("Route gates (sorted):")
+    for name, w in sorted(gate_dict.items(), key=lambda kv: kv[1], reverse=True):
+        print(f"  {name:>3}: {w:.4f}")
 
     return {
-        "probs": probs,
-        "ylogits": ylogits,
-        "route_w": route_w,
-        "block_w": block_w,
-        "block_logits": block_logits,
-        "route_logits": route_logits,
-        "masks": masks,
-        "z": z,
-        "y_true": y,
-        "sens": sens,
+        "probs": probs,                    
+        "ylogits": ylogits,                
+        "gates": gates,                    
+        "routes_raw": routes_raw,          
+        "routes_weighted": routes_weighted,
+        "y_true": y,                       
+        "sens": sens,                      
     }
 
-@torch.no_grad()
-def run_inference_loader(loader: DataLoader):
-    behrt.eval(); bbert.eval(); imgenc.eval()
-    for r in ROUTES: route_heads[r].eval()
-    for k in ["LN", "LI", "NI", "LNI"]: fusion[k].eval()
-    router.eval()
 
-    all_probs, all_logits, all_targets = [], [], []
-    all_route_w, all_block_w = [], []
+@torch.no_grad()
+def run_inference_loader(loader: DataLoader,
+                         behrt, bbert, imgenc,
+                         fusion, gate_net, final_head):
+    behrt.eval(); bbert.eval(); imgenc.eval()
+    for k in fusion: fusion[k].eval()
+    gate_net.eval(); final_head.eval()
+
+    all_probs, all_logits = [], []
+    all_gates = []
 
     for xL, notes_list, imgs, y, sens in loader:
         xL   = xL.to(DEVICE)
         imgs = imgs.to(DEVICE)
-        y    = y.to(DEVICE)
 
-        z = embeddings_from_batch(xL, notes_list, imgs)
+        zL = behrt(xL)
+        zN = bbert(notes_list)
+        zI = imgenc(imgs)
+        z  = {"L": zL, "N": zN, "I": zI}
+
         masks = build_masks(xL, notes_list, imgs)
-        route_logits = all_route_logits(z)
-        ylogits, route_w, block_w, _ = router(z, route_logits, masks=masks)
+
+        ylogits, gates, _, _ = forward_emb_concat(
+            z_unimodal=z,
+            fusion=fusion,
+            final_head=final_head,
+            gate_net=gate_net,
+            masks=masks,
+            l2norm_each=False,
+        )
         probs = torch.sigmoid(ylogits)
 
         all_probs.append(probs.cpu())
         all_logits.append(ylogits.cpu())
-        all_targets.append(y.cpu())
-        all_route_w.append(route_w.cpu())
-        all_block_w.append(block_w.cpu())
+        all_gates.append(gates.cpu())
 
-    probs = torch.cat(all_probs, dim=0).numpy()
+    probs  = torch.cat(all_probs, dim=0).numpy()
     logits = torch.cat(all_logits, dim=0).numpy()
-    targets = torch.cat(all_targets, dim=0).numpy()
-    route_w = torch.cat(all_route_w, dim=0).numpy()
-    block_w = torch.cat(all_block_w, dim=0).numpy()
+    gates  = torch.cat(all_gates, dim=0).numpy()
 
     return {
-        "probs": probs,
-        "logits": logits,
-        "targets": targets,
-        "route_w": route_w,
-        "block_w": block_w,
-        "tasks": TASKS,
+        "probs": probs,     
+        "logits": logits,   
+        "gates": gates,     
         "routes": ROUTES,
-        "blocks": ["uni", "bi", "tri"],
+        "blocks": list(BLOCKS.keys()),
     }
 
+
+def main():
+    args = parse_args()
+
+    if args.data_root != CFG.data_root:
+        CFG.data_root = args.data_root
+    if args.ckpt_root != CFG.ckpt_root:
+        CFG.ckpt_root = args.ckpt_root
+
+    behrt, bbert, imgenc, fusion, gate_net, final_head = build_stack()
+    load_checkpoints(args.task, behrt, bbert, imgenc, fusion, gate_net, final_head)
+
+    root = os.path.join(CFG.data_root, "MIMIC-IV")
+    test_ds = ICUStayDataset(root, split="test")
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=CFG.num_workers,
+        collate_fn=collate_fn,
+        pin_memory=("cuda" in str(DEVICE) and torch.cuda.is_available()),
+    )
+
+    _ = run_inference_demo(
+        test_loader,
+        behrt, bbert, imgenc, fusion, gate_net, final_head,
+        task=args.task,
+        show_k=args.show_k,
+        inspect_idx=args.inspect_idx,
+    )
+
+
 if __name__ == "__main__":
-    test_loader = _ensure_test_loader()
-    _ = run_inference_demo(test_loader, show_k=5, inspect_idx=0)
+    main()
