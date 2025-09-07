@@ -1,115 +1,123 @@
+from __future__ import annotations
+
 import os, json
+from typing import Dict, List, Tuple, Optional
+
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from env_config import CFG, DEVICE, ROUTES, TASKS
-from encoders import build_fusions_enc
+
+from env_config import CFG, DEVICE, ROUTES, BLOCKS, TASKS
+from encoders import EncoderConfig, build_encoders
+from routing_and_heads import (
+    build_fusions,            
+    RouteGateNet,             
+    FinalConcatHead,          
+    make_route_inputs,        
+    concat_routes,            
+)
+
 from train_step1_unimodal import ICUStayDataset, collate_fn
 
-# Ensure fusion modules exist 
-def _ensure_fusions_interpret():
-    global fusion
-    need = {"LN", "LI", "NI", "LNI"}
-    if "fusion" in globals() and isinstance(fusion, dict) and need.issubset(fusion.keys()):
-        for k in need:
-            fusion[k] = fusion[k].to(DEVICE).eval()
-        return
 
-    # Build canonical fusions
-    fusion = build_fusions_enc(d=CFG.d, p_drop=CFG.dropout, hidden=4 * 256)
-    for k in need:
-        fusion[k] = fusion[k].to(DEVICE).eval()
+def _build_stack():
+    # Encoders
+    behrt, bbert, imgenc = build_encoders(
+        EncoderConfig(
+            d=CFG.d,
+            dropout=CFG.dropout,
+            structured_seq_len=CFG.structured_seq_len,
+            structured_n_feats=CFG.structured_n_feats,
+            text_model_name=CFG.text_model_name,
+            text_max_len=CFG.max_text_len,
+            note_agg="mean",
+            max_notes_concat=8,
+            img_agg="last",
+        ),
+        device=DEVICE,
+    )
 
-    step3_path = os.path.join(CFG.ckpt_root, "step3_trimodal_router.pt")
-    if os.path.exists(step3_path):
-        try:
-            ckpt3 = torch.load(step3_path, map_location=DEVICE)
-            if "fusion_LNI" in ckpt3:
-                fusion["LNI"].load_state_dict(ckpt3["fusion_LNI"], strict=False)
-                print("Loaded fusion['LNI'] weights from step3_trimodal_router.pt")
-        except Exception as e:
-            print(f"[warn] Could not load fusion_LNI from step3: {e}")
+    # Fusion blocks
+    fusion = build_fusions(d=CFG.d, p_drop=CFG.dropout)
 
-    class _PairwiseFusion(nn.Module):
-        def __init__(self, d: int, hidden: int = None, p_drop: float = 0.1):
-            super().__init__()
-            hidden = hidden or (2 * d)
-            self.net = nn.Sequential(
-                nn.LayerNorm(2 * d),
-                nn.Linear(2 * d, hidden),
-                nn.GELU(),
-                nn.Dropout(p_drop),
-                nn.Linear(hidden, d),
-            )
-            self.gate = nn.Sequential(
-                nn.LayerNorm(d),
-                nn.Linear(d, d),
-                nn.Sigmoid(),
-            )
-        def forward(self, za: torch.Tensor, zb: torch.Tensor) -> torch.Tensor:
-            h = torch.cat([za, zb], dim=-1)  
-            f = self.net(h)                  
-            base = (za + zb) / 2.0
-            g = self.gate(base)
-            return g * f + (1.0 - g) * base
+    # Embedding-level router (7 per-route gates) + Final head (MLP over concat of 7*d)
+    gate = RouteGateNet(d=CFG.d, hidden=4 * 256, p_drop=CFG.dropout, use_masks=True).to(DEVICE)
+    final_head = FinalConcatHead(d=CFG.d, n_tasks=1, p_drop=CFG.dropout).to(DEVICE) 
 
-    class _TriFusion(nn.Module):
-        def __init__(self, d: int, hidden: int = None, p_drop: float = 0.1):
-            super().__init__()
-            hidden = hidden or (3 * d)
-            self.net = nn.Sequential(
-                nn.LayerNorm(3 * d),
-                nn.Linear(3 * d, hidden),
-                nn.GELU(),
-                nn.Dropout(p_drop),
-                nn.Linear(hidden, d),
-            )
-            self.gate = nn.Sequential(
-                nn.LayerNorm(d),
-                nn.Linear(d, d),
-                nn.Sigmoid(),
-            )
-        def forward(self, zL: torch.Tensor, zN: torch.Tensor, zI: torch.Tensor) -> torch.Tensor:
-            h = torch.cat([zL, zN, zI], dim=-1)  
-            f = self.net(h)                      
-            base = (zL + zN + zI) / 3.0
-            g = self.gate(base)
-            return g * f + (1.0 - g) * base
+    return behrt, bbert, imgenc, fusion, gate, final_head
 
-    fusion = {
-        "LN":  _PairwiseFusion(d=CFG.d, p_drop=CFG.dropout).to(DEVICE).eval(),
-        "LI":  _PairwiseFusion(d=CFG.d, p_drop=CFG.dropout).to(DEVICE).eval(),
-        "NI":  _PairwiseFusion(d=CFG.d, p_drop=CFG.dropout).to(DEVICE).eval(),
-        "LNI": _TriFusion     (d=CFG.d, p_drop=CFG.dropout).to(DEVICE).eval(),
-    }
 
-    step3_path = os.path.join(CFG.ckpt_root, "step3_trimodal_router.pt")
-    if os.path.exists(step3_path):
-        try:
-            ckpt3 = torch.load(step3_path, map_location=DEVICE)
-            if "fusion_LNI" in ckpt3:
-                fusion["LNI"].load_state_dict(ckpt3["fusion_LNI"])
-                print("Loaded fusion['LNI'] weights from step3_trimodal_router.pt")
-        except Exception:
-            pass
+def _load_checkpoints(
+    behrt, bbert, imgenc, fusion, gate: RouteGateNet, final_head: FinalConcatHead, task: Optional[str] = None
+) -> None:
+    tname = task or getattr(CFG, "task_name", "mort")
 
-_ensure_fusions_interpret()
+    ckpt1 = os.path.join(CFG.ckpt_root, f"{tname}_step1_unimodal.pt")
+    ckpt2 = os.path.join(CFG.ckpt_root, f"{tname}_step2_bimodal.pt")
+    ckpt3 = os.path.join(CFG.ckpt_root, f"{tname}_step3_concat_gate.pt")
 
-def build_masks(xL: torch.Tensor, notes_list: List[List[str]], imgs: torch.Tensor) -> Dict[str, torch.Tensor]:
+    if os.path.exists(ckpt1):
+        s1 = torch.load(ckpt1, map_location=DEVICE)
+        behrt.load_state_dict(s1["behrt"], strict=False)
+        bbert.load_state_dict(s1["bbert"], strict=False)
+        imgenc.load_state_dict(s1["imgenc"], strict=False)
+        print(f"Loaded step1 encoders from {ckpt1}")
+    else:
+        print(f"[warn] step1 not found: {ckpt1}")
+
+    if os.path.exists(ckpt2):
+        s2 = torch.load(ckpt2, map_location=DEVICE)
+        for k in ["fusion_LN", "fusion_LI", "fusion_NI"]:
+            name = k.split("_", 1)[1]
+            if k in s2 and name in fusion:
+                try:
+                    fusion[name].load_state_dict(s2[k], strict=False)
+                    print(f"Loaded fusion['{name}'] from {ckpt2}")
+                except Exception as e:
+                    print(f"[warn] couldn't load {k} → fusion['{name}']: {e}")
+    else:
+        print(f"[warn] step2 not found: {ckpt2}")
+
+    if os.path.exists(ckpt3):
+        s3 = torch.load(ckpt3, map_location=DEVICE)
+        key_gate = "gate" if "gate" in s3 else ("gate_net" if "gate_net" in s3 else None)
+        if key_gate:
+            gate.load_state_dict(s3[key_gate], strict=False)
+            print(f"Loaded gate ({key_gate}) from {ckpt3}")
+        else:
+            print(f"[warn] no gate weights found in {ckpt3} (expected 'gate' or 'gate_net')")
+
+        if "final_head" in s3:
+            final_head.load_state_dict(s3["final_head"], strict=False)
+            print(f"Loaded final_head from {ckpt3}")
+        else:
+            print(f"[warn] no final_head weights found in {ckpt3}")
+
+        if "fusion_LNI" in s3 and "LNI" in fusion:
+            try:
+                fusion["LNI"].load_state_dict(s3["fusion_LNI"], strict=False)
+                print(f"Loaded fusion['LNI'] from {ckpt3}")
+            except Exception as e:
+                print(f"[warn] couldn't load fusion_LNI: {e}")
+    else:
+        print(f"[warn] step3 not found: {ckpt3}")
+
+
+def build_masks(xL: torch.Tensor, notes_list, imgs: torch.Tensor) -> Dict[str, torch.Tensor]:
     B = xL.size(0)
     mL = torch.ones(B, 1, device=xL.device)
 
-    mN_list = []
-    for notes in notes_list:
-        present = 1.0 if (isinstance(notes, list) and any((isinstance(t, str) and len(t.strip()) > 0) for t in notes)) else 0.0
-        mN_list.append(present)
-    mN = torch.tensor(mN_list, device=xL.device, dtype=torch.float32).unsqueeze(1)
+    # Notes present if any non-empty note
+    present_N = [
+        1.0 if (isinstance(notes, list) and any((isinstance(t, str) and len(t.strip()) > 0) for t in notes)) else 0.0
+        for notes in notes_list
+    ]
+    mN = torch.tensor(present_N, device=xL.device, dtype=torch.float32).unsqueeze(1)
 
     with torch.no_grad():
         mI_vals = (imgs.abs().flatten(1).sum(dim=1) > 0).float()
@@ -117,154 +125,95 @@ def build_masks(xL: torch.Tensor, notes_list: List[List[str]], imgs: torch.Tenso
 
     return {"L": mL, "N": mN, "I": mI}
 
-route_index = {r: i for i, r in enumerate(ROUTES)}
 
-# Forward utilities
-def embeddings_from_batch(xL: torch.Tensor, notes_list: List[List[str]], imgs: torch.Tensor) -> Dict[str, torch.Tensor]:
-    """Run encoders and return unimodal embeddings."""
+@torch.no_grad()
+def embeddings_from_batch(behrt, bbert, imgenc, xL, notes_list, imgs) -> Dict[str, torch.Tensor]:
     zL = behrt(xL)
-    zN = bbert(notes_list)   
+    zN = bbert(notes_list)
     zI = imgenc(imgs)
     return {"L": zL, "N": zN, "I": zI}
 
-def route_logits_from_embeddings(z: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """
-    Build logits for all 7 routes using route heads.
-    Multi-modal routes use *fusion* embeddings (not raw concat).
-    Returns dict r -> [B, C].
-    """
-    out = {
-        "L": route_heads["L"](z["L"]),
-        "N": route_heads["N"](z["N"]),
-        "I": route_heads["I"](z["I"]),
-    }
-    # Pairwise fused embeddings
-    zLN = fusion["LN"](z["L"], z["N"])
-    zLI = fusion["LI"](z["L"], z["I"])
-    zNI = fusion["NI"](z["N"], z["I"])
-    out["LN"] = route_heads["LN"](zLN)
-    out["LI"] = route_heads["LI"](zLI)
-    out["NI"] = route_heads["NI"](zNI)
 
-    # Trimodal fused embedding
-    zLNI = fusion["LNI"](z["L"], z["N"], z["I"])
-    out["LNI"] = route_heads["LNI"](zLNI)
-    return out
-
-def eval_f(
-    z: Dict[str, torch.Tensor],
-    masks: Dict[str, torch.Tensor]
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-    """
-    Evaluate the full model:
-      returns (final logits, route_w, block_w, block_logits, route_logits).
-    """
-    route_logits = route_logits_from_embeddings(z)                                 
-    ylogits, route_w, block_w, block_logits = router(z, route_logits, masks=masks)  
-    return ylogits, route_w, block_w, block_logits, route_logits
-
-# 1. Collect per-sample contributions 
-def collect_contributions(loader: DataLoader, limit_batches: int | None = None) -> pd.DataFrame:
-    behrt.eval(); bbert.eval(); imgenc.eval()
-    for r in ROUTES: route_heads[r].eval()
-    for k in ["LN","LI","NI","LNI"]: fusion[k].eval()
-    router.eval()
-
-    rows = []
-    global_idx = 0
-
-    with torch.no_grad():
-        for bidx, (xL, notes_list, imgs, y, sens) in enumerate(tqdm(loader, desc="Collecting contributions", dynamic_ncols=True)):
-            if (limit_batches is not None) and (bidx >= limit_batches):
-                break
-
-            xL   = xL.to(DEVICE)
-            imgs = imgs.to(DEVICE)
-            y    = y.to(DEVICE)
-
-            z = embeddings_from_batch(xL, notes_list, imgs)
-            masks = build_masks(xL, notes_list, imgs)
-
-            # Full forward
-            ylogits, route_w, block_w, block_logits, route_logits = eval_f(z, masks)
-            probs = torch.sigmoid(ylogits)  # [B, C]
-
-            B = y.size(0)
-
-            # Record per-sample
-            for i in range(B):
-                rec = {"row_id": int(global_idx)}
-                # labels & preds per task
-                for t_idx, t_name in enumerate(TASKS):
-                    rec[f"y_true__{t_name}"] = float(y[i, t_idx])
-                    rec[f"y_prob__{t_name}"] = float(probs[i, t_idx])
-                    rec[f"y_logit__{t_name}"] = float(ylogits[i, t_idx])
-
-                    # block-level
-                    rec[f"block_w__uni__{t_name}"] = float(block_w[i, t_idx, 0])
-                    rec[f"block_w__bi__{t_name}"]  = float(block_w[i, t_idx, 1])
-                    rec[f"block_w__tri__{t_name}"] = float(block_w[i, t_idx, 2])
-
-                    rec[f"block_logit__uni__{t_name}"] = float(block_logits[i, 0, t_idx])
-                    rec[f"block_logit__bi__{t_name}"]  = float(block_logits[i, 1, t_idx])
-                    rec[f"block_logit__tri__{t_name}"] = float(block_logits[i, 2, t_idx])
-
-                    # route-level
-                    for r in ROUTES:
-                        sr = float(route_logits[r][i, t_idx])                                  
-                        wr = float(route_w[i, t_idx, route_index[r]])                          
-                        rec[f"route_logit__{r}__{t_name}"] = sr
-                        rec[f"route_w__{r}__{t_name}"]     = wr
-                        rec[f"route_contrib__{r}__{t_name}"] = sr * wr                        
-                rows.append(rec)
-                global_idx += 1
-
-    df = pd.DataFrame.from_records(rows)
-    return df
-
-# 2. Global summaries 
-def global_summary(df: pd.DataFrame) -> Dict[str, float]:
-    """Mean absolute route *raw* contribution across all tasks (|s_r^{(c)}|)."""
-    out: Dict[str, float] = {}
-    for r in ROUTES:
-        cols = [f"route_logit__{r}__{t}" for t in TASKS]
-        if all(c in df.columns for c in cols):
-            vals = df[cols].to_numpy()
-            out[r] = float(np.nanmean(np.abs(vals)))
-        else:
-            out[r] = float("nan")
-    return out
-
-def global_summary_weighted(df: pd.DataFrame) -> Dict[str, float]:
-    """Mean absolute *weighted* route contribution |w_r^{(c)} * s_r^{(c)}|."""
-    out: Dict[str, float] = {}
-    for r in ROUTES:
-        cols = [f"route_contrib__{r}__{t}" for t in TASKS]
-        if all(c in df.columns for c in cols):
-            vals = df[cols].to_numpy()
-            out[r] = float(np.nanmean(np.abs(vals)))
-        else:
-            out[r] = float("nan")
-    return out
-
-# 3. UC / BI / TI decomposition 
 @torch.no_grad()
-def compute_dataset_means(loader: DataLoader, max_batches: int | None = 8) -> Dict[str, torch.Tensor]:
-    """Compute dataset-mean embeddings μL, μN, μI to approximate expectations."""
-    behrt.eval(); bbert.eval(); imgenc.eval()
-    sum_L = None; sum_N = None; sum_I = None
-    total = 0
+def forward_full(
+    z: Dict[str, torch.Tensor],
+    fusion: Dict[str, nn.Module],
+    gate: RouteGateNet,
+    final_head: FinalConcatHead,
+    masks: Optional[Dict[str, torch.Tensor]] = None,
+    l2norm_each: bool = False,
+):
 
-    for bidx, (xL, notes_list, imgs, y, sens) in enumerate(tqdm(loader, desc="Computing μL, μN, μI", dynamic_ncols=True)):
+    routes_raw = make_route_inputs(z, fusion)                      
+    gates = gate(z, masks=masks)                                   
+    x_cat, routes_weighted = concat_routes(routes_raw, gates=gates, l2norm=l2norm_each)
+    ylogits = final_head(x_cat)                                    
+    return ylogits, gates, routes_raw, routes_weighted
+
+
+@torch.no_grad()
+def route_contributions_occlusion(
+    z: Dict[str, torch.Tensor],
+    fusion: Dict[str, nn.Module],
+    gate: RouteGateNet,
+    final_head: FinalConcatHead,
+    masks: Optional[Dict[str, torch.Tensor]] = None,
+    l2norm_each: bool = False,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+
+    routes_raw = make_route_inputs(z, fusion)          
+    gates_full = gate(z, masks=masks)                  
+
+    x_full, _ = concat_routes(routes_raw, gates=gates_full, l2norm=l2norm_each)
+    y_full = final_head(x_full)                        
+
+    contribs: Dict[str, torch.Tensor] = {}
+    for ri, r in enumerate(ROUTES):
+        gates_wo = gates_full.clone()
+        gates_wo[:, ri] = 0.0                         
+        x_wo, _ = concat_routes(routes_raw, gates=gates_wo, l2norm=l2norm_each)
+        y_wo = final_head(x_wo)
+        contribs[r] = y_full - y_wo                   
+    return y_full, contribs
+
+
+def block_weights_from_gates(gates: torch.Tensor) -> torch.Tensor:
+    device = gates.device
+    idx = {r: i for i, r in enumerate(ROUTES)}
+    uni = gates[:, [idx["L"], idx["N"], idx["I"]]].sum(dim=1, keepdim=True)
+    bi  = gates[:, [idx["LN"], idx["LI"], idx["NI"]]].sum(dim=1, keepdim=True)
+    tri = gates[:, [idx["LNI"]]].sum(dim=1, keepdim=True)
+    W = torch.cat([uni, bi, tri], dim=1)               
+    denom = (W.sum(dim=1, keepdim=True) + 1e-12)
+    return W / denom
+
+
+
+def global_mean_abs_contrib(contrib_frame: pd.DataFrame) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for r in ROUTES:
+        col = f"route_contrib__{r}"
+        if col in contrib_frame.columns:
+            out[r] = float(np.nanmean(np.abs(contrib_frame[col].values)))
+        else:
+            out[r] = float("nan")
+    return out
+
+
+@torch.no_grad()
+def compute_dataset_means(
+    loader: DataLoader,
+    behrt, bbert, imgenc,
+    max_batches: Optional[int] = 8
+) -> Dict[str, torch.Tensor]:
+    behrt.eval(); bbert.eval(); imgenc.eval()
+    sum_L = None; sum_N = None; sum_I = None; total = 0
+    for bidx, (xL, notes_list, imgs, y, sens) in enumerate(tqdm(loader, desc="Estimating μL,μN,μI", dynamic_ncols=True)):
         if (max_batches is not None) and (bidx >= max_batches):
             break
-        xL   = xL.to(DEVICE)
-        imgs = imgs.to(DEVICE)
-
-        z = embeddings_from_batch(xL, notes_list, imgs)
-        B = z["L"].size(0)
-        total += B
-
+        xL = xL.to(DEVICE); imgs = imgs.to(DEVICE)
+        z = embeddings_from_batch(behrt, bbert, imgenc, xL, notes_list, imgs)
+        B = z["L"].size(0); total += B
         if sum_L is None:
             sum_L = z["L"].sum(dim=0)
             sum_N = z["N"].sum(dim=0)
@@ -273,64 +222,61 @@ def compute_dataset_means(loader: DataLoader, max_batches: int | None = 8) -> Di
             sum_L += z["L"].sum(dim=0)
             sum_N += z["N"].sum(dim=0)
             sum_I += z["I"].sum(dim=0)
-
     if total == 0:
         d = CFG.d
-        device = torch.device(DEVICE)
-        return {"L": torch.zeros(d, device=device), "N": torch.zeros(d, device=device), "I": torch.zeros(d, device=device)}
+        zero = torch.zeros(d, device=DEVICE)
+        return {"L": zero[None, :], "N": zero[None, :], "I": zero[None, :]}
+    return {
+        "L": (sum_L / total)[None, :],
+        "N": (sum_N / total)[None, :],
+        "I": (sum_I / total)[None, :],
+    }
 
-    mu_L = (sum_L / total).unsqueeze(0)  
-    mu_N = (sum_N / total).unsqueeze(0)
-    mu_I = (sum_I / total).unsqueeze(0)
-    return {"L": mu_L, "N": mu_N, "I": mu_I}
-
-def _repeat_like(mu: torch.Tensor, B: int) -> torch.Tensor:
-    return mu.expand(B, -1)  # [B, d]
 
 @torch.no_grad()
-def uc_bi_ti_for_batch(xL: torch.Tensor, notes_list: List[List[str]], imgs: torch.Tensor,
-                       mus: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Returns per-sample, per-task (UC, BI, TI, F_full) as tensors [B, C].
-    Uses μL, μN, μI for expectations. Masks are set to 1 for present, 0 for μ if you prefer;
-    here we just pass masks=ones to focus on interaction in logit space (consistent gating).
-    """
-    # Prepare
-    xL   = xL.to(DEVICE)
-    imgs = imgs.to(DEVICE)
-    z    = embeddings_from_batch(xL, notes_list, imgs)
-    B    = z["L"].size(0)
+def F_embed(
+    zL, zN, zI,
+    fusion, gate: RouteGateNet, final_head: FinalConcatHead,
+    masks: Optional[Dict[str, torch.Tensor]] = None,
+    l2norm_each: bool = False
+) -> torch.Tensor:
+    z = {"L": zL, "N": zN, "I": zI}
+    ylogits, _, _, _ = forward_full(z, fusion, gate, final_head, masks=masks, l2norm_each=l2norm_each)
+    return ylogits  # [B,1]
 
-    # mean embeddings tiled to batch
-    muL = _repeat_like(mus["L"].to(DEVICE), B)
-    muN = _repeat_like(mus["N"].to(DEVICE), B)
-    muI = _repeat_like(mus["I"].to(DEVICE), B)
 
-    ones_mask = {"L": torch.ones(B, 1, device=DEVICE),
-                 "N": torch.ones(B, 1, device=DEVICE),
-                 "I": torch.ones(B, 1, device=DEVICE)}
+@torch.no_grad()
+def uc_bi_ti_for_batch(
+    xL: torch.Tensor, notes_list, imgs: torch.Tensor,
+    behrt, bbert, imgenc,
+    fusion, gate: RouteGateNet, final_head: FinalConcatHead,
+    mus: Dict[str, torch.Tensor],
+    l2norm_each: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    xL = xL.to(DEVICE); imgs = imgs.to(DEVICE)
+    z  = embeddings_from_batch(behrt, bbert, imgenc, xL, notes_list, imgs)
+    B  = z["L"].size(0)
 
-    # Define a small helper to evaluate f for given (L,N,I)
-    def F(zL: torch.Tensor, zN: torch.Tensor, zI: torch.Tensor) -> torch.Tensor:
-        zz = {"L": zL, "N": zN, "I": zI}
-        ylogits, _, _, _, _ = eval_f(zz, ones_mask)  
-        return ylogits
+    ones = {k: torch.ones(B, 1, device=DEVICE) for k in ["L", "N", "I"]}
 
-    # Full and baselines
-    F_full = F(z["L"], z["N"], z["I"])         
-    F_mmm  = F(muL,   muN,   muI)              
+    muL = mus["L"].expand(B, -1)
+    muN = mus["N"].expand(B, -1)
+    muI = mus["I"].expand(B, -1)
 
-    # Unimodal terms with others at μ
-    F_Lmm = F(z["L"], muN,    muI)             
-    F_mNm = F(muL,    z["N"], muI)             
-    F_mmI = F(muL,    muN,    z["I"])          
+    F_full = F_embed(z["L"], z["N"], z["I"], fusion, gate, final_head, masks=ones, l2norm_each=l2norm_each)
+    F_mmm  = F_embed(muL,   muN,   muI,   fusion, gate, final_head, masks=ones, l2norm_each=l2norm_each)
 
-    # Pairwise terms (others at μ)
-    F_LNm = F(z["L"], z["N"], muI)             
-    F_LmI = F(z["L"], muN,    z["I"])          
-    F_mNI = F(muL,    z["N"], z["I"])          
+    # Unimodal contrasts
+    F_Lmm = F_embed(z["L"], muN,   muI,   fusion, gate, final_head, masks=ones, l2norm_each=l2norm_each)
+    F_mNm = F_embed(muL,   z["N"], muI,   fusion, gate, final_head, masks=ones, l2norm_each=l2norm_each)
+    F_mmI = F_embed(muL,   muN,   z["I"], fusion, gate, final_head, masks=ones, l2norm_each=l2norm_each)
 
-    # UC, BI, TI (per-task, per-sample)
+    # Pairwise contrasts
+    F_LNm = F_embed(z["L"], z["N"], muI,  fusion, gate, final_head, masks=ones, l2norm_each=l2norm_each)
+    F_LmI = F_embed(z["L"], muN,   z["I"], fusion, gate, final_head, masks=ones, l2norm_each=l2norm_each)
+    F_mNI = F_embed(muL,   z["N"], z["I"], fusion, gate, final_head, masks=ones, l2norm_each=l2norm_each)
+
+    # Decomposition 
     UC = F_Lmm + F_mNm + F_mmI - 2.0 * F_mmm
 
     BI_TV = F_LNm - F_Lmm - F_mNm + F_mmm
@@ -339,72 +285,133 @@ def uc_bi_ti_for_batch(xL: torch.Tensor, notes_list: List[List[str]], imgs: torc
     BI = BI_TV + BI_TA + BI_VA
 
     TI = F_full - UC - BI
-
     return UC, BI, TI, F_full
 
-@torch.no_grad()
-def collect_uc_bi_ti(loader: DataLoader, mus: Dict[str, torch.Tensor], limit_batches: int | None = None) -> pd.DataFrame:
-    """Compute UC/BI/TI per sample and task; return a tidy DataFrame."""
-    for k in ["LN","LI","NI","LNI"]: fusion[k].eval()
+def collect_contributions(
+    loader: DataLoader,
+    behrt, bbert, imgenc, fusion, gate: RouteGateNet, final_head: FinalConcatHead,
+    limit_batches: Optional[int] = None,
+    l2norm_each: bool = False,
+) -> pd.DataFrame:
+    behrt.eval(); bbert.eval(); imgenc.eval()
+    for k in ["LN", "LI", "NI", "LNI"]:
+        fusion[k].eval()
+    gate.eval(); final_head.eval()
+
     rows = []
     gid = 0
-    for bidx, (xL, notes_list, imgs, y, sens) in enumerate(tqdm(loader, desc="UC/BI/TI", dynamic_ncols=True)):
-        if (limit_batches is not None) and (bidx >= limit_batches):
-            break
-        xL   = xL.to(DEVICE)
-        imgs = imgs.to(DEVICE)
-        y    = y.to(DEVICE)
+    with torch.no_grad():
+        for bidx, (xL, notes_list, imgs, y, sens) in enumerate(tqdm(loader, desc="Collecting local contributions", dynamic_ncols=True)):
+            if (limit_batches is not None) and (bidx >= limit_batches):
+                break
+            xL = xL.to(DEVICE); imgs = imgs.to(DEVICE); y = y.to(DEVICE)
+            z = embeddings_from_batch(behrt, bbert, imgenc, xL, notes_list, imgs)
+            masks = build_masks(xL, notes_list, imgs)
 
-        UC, BI, TI, F_full = uc_bi_ti_for_batch(xL, notes_list, imgs, mus)
-        B, _ = F_full.shape
-        for i in range(B):
-            rec = {"row_id": int(gid)}
-            for t_idx, t_name in enumerate(TASKS):
-                rec[f"UC__{t_name}"] = float(UC[i, t_idx])
-                rec[f"BI__{t_name}"] = float(BI[i, t_idx])
-                rec[f"TI__{t_name}"] = float(TI[i, t_idx])
-                rec[f"F__{t_name}"]  = float(F_full[i, t_idx])
-                rec[f"y_true__{t_name}"] = float(y[i, t_idx])
-            rows.append(rec)
-            gid += 1
+            # Full forward + gates
+            y_full, gates, routes_raw, routes_weighted = forward_full(z, fusion, gate, final_head, masks=masks, l2norm_each=l2norm_each)
+            probs = torch.sigmoid(y_full)                     
+            B = y.size(0)
+
+            _, contribs = route_contributions_occlusion(z, fusion, gate, final_head, masks=masks, l2norm_each=l2norm_each)
+
+            bw = block_weights_from_gates(gates)            
+
+            for i in range(B):
+                rec = {"row_id": int(gid)}
+                rec["y_true"]  = float(y[i, 0]) if y.dim() == 2 else float(y[i])
+                rec["y_prob"]  = float(probs[i, 0])
+                rec["y_logit"] = float(y_full[i, 0])
+
+                # Block weights
+                rec["block_w__uni"] = float(bw[i, 0])
+                rec["block_w__bi"]  = float(bw[i, 1])
+                rec["block_w__tri"] = float(bw[i, 2])
+
+                # Per-route gate and contribution (logit-space Δ)
+                idx = {r: k for k, r in enumerate(ROUTES)}
+                for r in ROUTES:
+                    rec[f"gate__{r}"] = float(gates[i, idx[r]])
+                    rec[f"route_contrib__{r}"] = float(contribs[r][i, 0])
+                    rec[f"route_emb_norm__{r}"] = float(routes_raw[r][i].norm(p=2).item())
+
+                rows.append(rec); gid += 1
+
     return pd.DataFrame.from_records(rows)
 
-ROOT = os.path.join(CFG.data_root, "MIMIC-IV")  # or INSPECT
-test_ds = ICUStayDataset(ROOT, split="test")
-test_loader = DataLoader(
-    test_ds,
-    batch_size=CFG.batch_size,
-    shuffle=False,
-    num_workers=CFG.num_workers,
-    collate_fn=collate_fn,
-    pin_memory=True
-)
 
-# 1. Collect route-level contributions (logits, weights, contributions)
-df_contrib = collect_contributions(test_loader)
-print("Contribution columns:", len(df_contrib.columns), "rows:", len(df_contrib))
-display_cols = [c for c in df_contrib.columns if c.startswith("route_logit__")][:9]  
-print(df_contrib[["row_id"] + display_cols].head(3).to_string(index=False))
+def collect_uc_bi_ti(
+    loader: DataLoader,
+    behrt, bbert, imgenc, fusion, gate: RouteGateNet, final_head: FinalConcatHead,
+    mus: Dict[str, torch.Tensor],
+    limit_batches: Optional[int] = None,
+    l2norm_each: bool = False,
+) -> pd.DataFrame:
+    for k in ["LN", "LI", "NI", "LNI"]:
+        fusion[k].eval()
+    gate.eval(); final_head.eval()
 
-# 2. Global summaries
-gs_raw = global_summary(df_contrib)
-gs_w   = global_summary_weighted(df_contrib)
-print("\nGlobal mean |route logits| per route:")
-print(json.dumps(gs_raw, indent=2))
-print("\nGlobal mean |weighted route contributions| per route:")
-print(json.dumps(gs_w, indent=2))
+    rows = []
+    gid = 0
+    with torch.no_grad():
+        for bidx, (xL, notes_list, imgs, y, sens) in enumerate(tqdm(loader, desc="UC/BI/TI", dynamic_ncols=True)):
+            if (limit_batches is not None) and (bidx >= limit_batches):
+                break
+            xL = xL.to(DEVICE); imgs = imgs.to(DEVICE); y = y.to(DEVICE)
 
-# 3) UC / BI / TI (using dataset means for expectations)
-mus = compute_dataset_means(test_loader, max_batches=8)
-df_inter = collect_uc_bi_ti(test_loader, mus, limit_batches=None)
-print("\nUC/BI/TI (first 5 rows):")
-print(df_inter.head().to_string(index=False))
+            UC, BI, TI, F_full = uc_bi_ti_for_batch(
+                xL, notes_list, imgs, behrt, bbert, imgenc,
+                fusion, gate, final_head, mus, l2norm_each=l2norm_each,
+            )
+            B = F_full.size(0)
+            for i in range(B):
+                rec = {
+                    "row_id": int(gid),
+                    "UC": float(UC[i, 0]),
+                    "BI": float(BI[i, 0]),
+                    "TI": float(TI[i, 0]),
+                    "F":  float(F_full[i, 0]),
+                    "y_true": float(y[i, 0]) if y.dim() == 2 else float(y[i]),
+                }
+                rows.append(rec); gid += 1
+    return pd.DataFrame.from_records(rows)
 
-# Aggregate UC/BI/TI per task
-agg = {}
-for t in TASKS:
-    agg[f"UC_mean__{t}"] = float(df_inter[f"UC__{t}"].mean())
-    agg[f"BI_mean__{t}"] = float(df_inter[f"BI__{t}"].mean())
-    agg[f"TI_mean__{t}"] = float(df_inter[f"TI__{t}"].mean())
-print("\nMean UC/BI/TI by task:")
-print(json.dumps(agg, indent=2))
+
+
+if __name__ == "__main__":
+    behrt, bbert, imgenc, fusion, gate, final_head = _build_stack()
+    _load_checkpoints(behrt, bbert, imgenc, fusion, gate, final_head, task=getattr(CFG, "task_name", "mort"))
+
+    ROOT = os.path.join(CFG.data_root, "MIMIC-IV")
+    test_ds = ICUStayDataset(ROOT, split="test")
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=CFG.batch_size,
+        shuffle=False,
+        num_workers=CFG.num_workers,
+        collate_fn=collate_fn,
+        pin_memory=(DEVICE == "cuda"),
+    )
+
+    # Local contributions (per sample)
+    df_contrib = collect_contributions(test_loader, behrt, bbert, imgenc, fusion, gate, final_head)
+    print(f"[contrib] cols={len(df_contrib.columns)}, rows={len(df_contrib)}")
+    print(df_contrib.head(3).to_string(index=False))
+
+    # Global summary of |Δ| per route
+    gs = global_mean_abs_contrib(df_contrib)
+    print("\nGlobal mean |Δ(logit)| per route:")
+    print(json.dumps(gs, indent=2))
+
+    # UC/BI/TI with dataset-mean embeddings (expectation baselines)
+    mus = compute_dataset_means(test_loader, behrt, bbert, imgenc, max_batches=8)
+    df_inter = collect_uc_bi_ti(test_loader, behrt, bbert, imgenc, fusion, gate, final_head, mus)
+    print("\nUC/BI/TI (first 5 rows):")
+    print(df_inter.head().to_string(index=False))
+
+    print("\nMean UC/BI/TI:")
+    print(json.dumps({
+        "UC_mean": float(df_inter["UC"].mean()),
+        "BI_mean": float(df_inter["BI"].mean()),
+        "TI_mean": float(df_inter["TI"].mean()),
+    }, indent=2))
