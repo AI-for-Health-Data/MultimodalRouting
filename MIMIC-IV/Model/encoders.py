@@ -1,29 +1,17 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import List, Optional, Literal, Tuple, Sequence, Union, Dict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+from env_config import DEVICE  # keep a single source of truth for device
 
 
-# BEHRT-style encoder (Structured)
+
 class BEHRTLabEncoder(nn.Module):
-    """BEHRT-style Transformer encoder over first 24 hours using ALL provided features.
-
-    Args:
-        n_feats: number of structured features (all labs/vitals/etc. you keep in ETL)
-        d: shared embedding size
-        seq_len: expected sequence length (default 24 hours)
-        n_layers: transformer encoder layers
-        n_heads: attention heads
-        dropout: dropout prob
-        pool: 'last' or 'mean' over time
-
-    Input:
-        x: Tensor [B, T, n_feats]
-    Output:
-        z_L: Tensor [B, d]
-    """
     def __init__(
         self,
         n_feats: int,
@@ -37,7 +25,7 @@ class BEHRTLabEncoder(nn.Module):
         super().__init__()
         self.pool = pool
         self.input_proj = nn.Linear(n_feats, d)
-        # Learnable positional encoding over 24h
+        # Learnable positional encoding over seq_len hours
         self.pos = nn.Parameter(torch.randn(1, seq_len, d) * 0.02)
 
         enc_layer = nn.TransformerEncoderLayer(
@@ -58,33 +46,15 @@ class BEHRTLabEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, T, _ = x.shape
-        h = self.input_proj(x) + self.pos[:, :T, :]
-        h = self.enc(h)  
-        if self.pool == "last":
-            h = h[:, -1]
-        else:
-            h = h.mean(dim=1)
-        z = self.out(h)
-        return z  # [B, d]
+        h = self.input_proj(x) + self.pos[:, :T, :]   
+        h = self.enc(h)                                
+        h = h[:, -1] if self.pool == "last" else h.mean(dim=1)
+        z = self.out(h)                               
+        return z
 
 
-# Notes encoder (BioClinicalBERT with per-note chunking)
+
 class BioClinBERTEncoder(nn.Module):
-    """BioClinicalBERT encoder with per-note 512-token chunking.
-
-    Per patient:
-      - Split each NOTE into ≤512-token chunks (non-overlapping).
-      - Encode with BioClinicalBERT; take [CLS] for each chunk.
-      - Average chunk [CLS] → NOTE embedding; project 768→d.
-      - Aggregate note embeddings per patient (mean / attention / concat[K]) → z_N ∈ R^d.
-
-    Accepts either:
-      - List[str]  of length B (one merged text per patient), or
-      - List[List[str]] of length B (list of notes per patient).
-
-    Output:
-        z_N: Tensor [B, d]
-    """
     def __init__(
         self,
         model_name: str,
@@ -103,41 +73,35 @@ class BioClinBERTEncoder(nn.Module):
         self.note_agg = note_agg
         self.max_notes_concat = max_notes_concat
 
-        # Try to load HF assets; fall back to random features if unavailable.
         try:
-            from transformers import AutoTokenizer, AutoModel  # type: ignore
+            from transformers import AutoTokenizer, AutoModel  
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
             self.bert = AutoModel.from_pretrained(model_name)
-            self.bert.eval()  # important for deterministic behavior (disable dropout)
+            self.bert.eval()  # deterministic (disable dropout)
             self.hf_available = True
         except Exception:
             self.tokenizer = None
             self.bert = None
             self.hf_available = False
 
-        # BioClinicalBERT hidden size = 768 → project to d
         self.proj = nn.Sequential(nn.LayerNorm(768), nn.Linear(768, d))
         self.drop = nn.Dropout(dropout)
 
-        # Optional attention over note embeddings
         if note_agg == "attention":
             self.attn = nn.Sequential(
                 nn.LayerNorm(d),
                 nn.Linear(d, attn_hidden),
                 nn.Tanh(),
-                nn.Linear(attn_hidden, 1),  # scalar score per note
+                nn.Linear(attn_hidden, 1),
             )
         else:
             self.attn = None
 
-        # Optional explicit device override
         self.device_override = device
 
     def _encode_chunks(self, texts: List[str]) -> torch.Tensor:
-        """Encode a list of ≤512-token chunks → [N, 768] CLS embeddings."""
         device = self.device_override or next(self.parameters()).device
         if not self.hf_available:
-            # Fallback for offline / missing transformers
             return torch.randn(len(texts), 768, device=device)
 
         batch = self.tokenizer(
@@ -149,17 +113,16 @@ class BioClinBERTEncoder(nn.Module):
         ).to(device)
 
         with torch.no_grad():
-            out = self.bert(**batch).last_hidden_state[:, 0]  # CLS per chunk
-        return out  # [N, 768]
+            out = self.bert(**batch).last_hidden_state[:, 0]  
+        return out  
 
     def _chunk_note(self, text: str) -> List[str]:
-        """Break a note into ~512-token chunks using whitespace token approximation."""
         if text is None:
             return [""]
         toks = text.split()
         chunks = []
         for i in range(0, len(toks), self.max_len):
-            piece = " ".join(toks[i : i + self.max_len])
+            piece = " ".join(toks[i:i + self.max_len])
             if piece:
                 chunks.append(piece)
         if not chunks:
@@ -167,32 +130,27 @@ class BioClinBERTEncoder(nn.Module):
         return chunks
 
     def _pool_notes(self, note_vecs: List[torch.Tensor]) -> torch.Tensor:
-        """Aggregate K note embeddings [K, d] -> [d] according to self.note_agg.
-        If 'concat', concat last K then project back to d with a cached Linear.
-        """
         device = self.device_override or next(self.parameters()).device
         if len(note_vecs) == 0:
             return torch.zeros(self.d, device=device)
 
-        H = torch.stack(note_vecs, dim=0)  # [K, d]
+        H = torch.stack(note_vecs, dim=0)  
 
         if self.note_agg == "mean":
             return H.mean(dim=0)
 
         elif self.note_agg == "attention":
-            # scores: [K,1] → softmax → weighted sum
-            scores = self.attn(H)  # type: ignore[arg-type]
+            scores = self.attn(H)  
             w = torch.softmax(scores.squeeze(-1), dim=0)
             return (w.unsqueeze(0) @ H).squeeze(0)
 
-        else:  # "concat"
+        else:  
             K = min(self.max_notes_concat, H.size(0))
-            Hk = H[-K:]                 # take last K notes
-            concat = Hk.reshape(-1)     # [K*d]
+            Hk = H[-K:]                 
+            concat = Hk.reshape(-1)     
             proj_in = concat.numel()
             key = f"concat_proj_{proj_in}"
             if not hasattr(self, key):
-                # Cache a projection layer sized for this K
                 setattr(self, key, nn.Linear(proj_in, self.d).to(device))
             layer: nn.Linear = getattr(self, key)
             return layer(concat)
@@ -201,40 +159,36 @@ class BioClinBERTEncoder(nn.Module):
     def _normalize_input(
         batch_notes: Union[Sequence[str], Sequence[Sequence[str]]]
     ) -> List[List[str]]:
-        """Normalize to List[List[str]] (notes per patient)."""
         if len(batch_notes) == 0:
             return []
         if isinstance(batch_notes[0], str):
-            return [[t] for t in batch_notes]  # one merged text per patient
+            return [[t] for t in batch_notes]
         return [list(notes) for notes in batch_notes]
 
     def forward(self, batch_notes: Union[List[str], List[List[str]]]) -> torch.Tensor:
-        """Encode a batch of patients’ notes into z_N ∈ R^{B×d}."""
         device = self.device_override or next(self.parameters()).device
         patients = self._normalize_input(batch_notes)
         Z: List[torch.Tensor] = []
 
         for notes in patients:
-            # Per NOTE: chunk → encode → mean over chunks → project 768→d → dropout
             note_embs: List[torch.Tensor] = []
             for note_text in notes:
                 chunks = self._chunk_note(note_text)
-                cls_vecs = self._encode_chunks(chunks)              # [Nc, 768]
-                cls_mean = cls_vecs.mean(dim=0, keepdim=True)       # [1, 768]
-                z_note = self.drop(self.proj(cls_mean)).squeeze(0)  # [d]
+                cls_vecs = self._encode_chunks(chunks)              
+                cls_mean = cls_vecs.mean(dim=0, keepdim=True)       
+                z_note = self.drop(self.proj(cls_mean)).squeeze(0)  
                 note_embs.append(z_note)
 
-            # Aggregate notes for this patient → [d]
             z_patient = self._pool_notes(note_embs)
             Z.append(z_patient.to(device))
 
         if len(Z) == 0:
             return torch.zeros(0, self.d, device=device)
 
-        return torch.stack(Z, dim=0)  # [B, d]
-  
+        return torch.stack(Z, dim=0) 
 
-# Image encoder (ResNet-34 backbone)
+
+
 class ImageEncoder(nn.Module):
     def __init__(
         self,
@@ -250,7 +204,7 @@ class ImageEncoder(nn.Module):
                 weights=torchvision.models.ResNet34_Weights.DEFAULT
             )
         except Exception:
-            backbone = torchvision.models.resnet34(weights=None)  # offline fallback
+            backbone = torchvision.models.resnet34(weights=None)  
         modules = list(backbone.children())[:-2]
         self.backbone = nn.Sequential(*modules)
         self.gap = nn.AdaptiveAvgPool2d((1, 1))
@@ -274,14 +228,12 @@ class ImageEncoder(nn.Module):
                 nn.Linear(attn_hidden, 1),
             )
 
-
     def _encode_one(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, 3, H, W] or [3, H, W]
         if x.dim() == 3:
             x = x.unsqueeze(0)
-        h = self.backbone(x)        
-        h = self.gap(h)             
-        z = self.proj(h)            
+        h = self.backbone(x)    
+        h = self.gap(h)         
+        z = self.proj(h)        
         return z
 
     def _pool_images(self, embs: List[torch.Tensor]) -> torch.Tensor:
@@ -291,31 +243,27 @@ class ImageEncoder(nn.Module):
         elif self.img_agg == "mean":
             return H.mean(dim=0)
         else:
-            scores = self.attn(H)  
-            w = torch.softmax(scores.squeeze(-1), dim=0)  
+            scores = self.attn(H)                     
+            w = torch.softmax(scores.squeeze(-1), dim=0)
             return (w.unsqueeze(0) @ H).squeeze(0)
 
     def forward(self, x: Union[torch.Tensor, List[torch.Tensor], List[List[torch.Tensor]]]) -> torch.Tensor:
         device = next(self.parameters()).device
 
-        # Case A: Tensor [B,3,H,W]
         if isinstance(x, torch.Tensor):
-            z = self._encode_one(x.to(device))  
+            z = self._encode_one(x.to(device))   
             return z
 
-        # Case B/C: list input
         if len(x) == 0:
-            d_out = self.proj[2].out_features  
+            d_out = self.proj[2].out_features
             return torch.zeros(0, d_out, device=device)
 
-        # If flat list of Tensors -> one image per patient
         if isinstance(x[0], torch.Tensor):
-            embs = [self._encode_one(img.to(device)).squeeze(0) for img in x]  
+            embs = [self._encode_one(img.to(device)).squeeze(0) for img in x]
             return torch.stack(embs, dim=0)
 
-        # Else: list of list (multi-image per patient)
         out: List[torch.Tensor] = []
-        for imgs in x:  # imgs: List[Tensor]
+        for imgs in x:
             if len(imgs) == 0:
                 d_out = self.proj[2].out_features
                 out.append(torch.zeros(d_out, device=device))
@@ -325,59 +273,73 @@ class ImageEncoder(nn.Module):
         return torch.stack(out, dim=0)
 
 
-# Fusion Encoders (Bimodal + Trimodal)
+
 class PairwiseFusion(nn.Module):
-    """Bimodal encoder producing a fused feature in R^d from (zA, zB).
-       Uses rich interactions: concat, hadamard, abs diff, and a bilinear scalar."""
-    def __init__(self, d: int, hidden: int = 4 * 256, dropout: float = 0.1):
+    def __init__(self, d: int,
+                 hidden: Optional[Sequence[int]] = None,
+                 dropout: float = 0.1,
+                 feature_mode: str = "rich"):
         super().__init__()
-        # trainable bilinear for a scalar interaction
-        self.bilinear = nn.Parameter(torch.empty(d, d))
-        nn.init.xavier_uniform_(self.bilinear)
-        # input feature: [zA, zB, zA*zB, |zA-zB|] -> 4d plus scalar s
-        in_dim = 4 * d + 1
+        assert feature_mode in {"concat", "rich"}
+        self.d = d
+        self.feature_mode = feature_mode
+        in_dim = 2 * d if feature_mode == "concat" else 4 * d
         self.net = nn.Sequential(
             nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, hidden),
+            nn.Linear(in_dim, hidden or (4 * d)),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden, d),
+            nn.Linear(hidden or (4 * d), d),
             nn.GELU(),
             nn.Dropout(dropout),
         )
+        self.res_scale = nn.Parameter(torch.tensor(0.5))
 
     def forward(self, zA: torch.Tensor, zB: torch.Tensor) -> torch.Tensor:
-        had = zA * zB
-        diff = (zA - zB).abs()
-        # Faster bilinear scalar (optional):
-        s = ((zA @ self.bilinear) * zB).sum(dim=1, keepdim=True)
-        x = torch.cat([zA, zB, had, diff, s], dim=1)
-        return self.net(x)
+        if self.feature_mode == "concat":
+            x = torch.cat([zA, zB], dim=-1)
+        else:
+            had = zA * zB
+            diff = (zA - zB).abs()
+            x = torch.cat([zA, zB, had, diff], dim=-1)
+        h = self.net(x)
+        base = 0.5 * (zA + zB)
+        return h + self.res_scale * base
 
 
 class TrimodalFusion(nn.Module):
-    """Trimodal encoder R^d × R^d × R^d -> R^d with pairwise + triple interactions."""
-    def __init__(self, d: int, hidden: int = 4 * 256, dropout: float = 0.1):
+    def __init__(self, d: int,
+                 hidden: Optional[Sequence[int]] = None,
+                 dropout: float = 0.1,
+                 feature_mode: str = "rich"):
         super().__init__()
-        # Use pairwise and triple hadamard interactions for expressiveness with low cost
-        in_dim = 7 * d  # [L,N,I, L*N, L*I, N*I, L*N*I]
+        assert feature_mode in {"concat", "rich"}
+        self.d = d
+        self.feature_mode = feature_mode
+        in_dim = 3 * d if feature_mode == "concat" else 7 * d
         self.net = nn.Sequential(
             nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, hidden),
+            nn.Linear(in_dim, hidden or (4 * d)),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden, d),
+            nn.Linear(hidden or (4 * d), d),
             nn.GELU(),
             nn.Dropout(dropout),
         )
+        self.res_scale = nn.Parameter(torch.tensor(0.5))
 
     def forward(self, zL: torch.Tensor, zN: torch.Tensor, zI: torch.Tensor) -> torch.Tensor:
-        zLN = zL * zN
-        zLI = zL * zI
-        zNI = zN * zI
-        zLNI = zL * zN * zI
-        x = torch.cat([zL, zN, zI, zLN, zLI, zNI, zLNI], dim=1)  
-        return self.net(x) 
+        if self.feature_mode == "concat":
+            x = torch.cat([zL, zN, zI], dim=-1)
+        else:
+            zLN  = zL * zN
+            zLI  = zL * zI
+            zNI  = zN * zI
+            zLNI = zL * zN * zI
+            x = torch.cat([zL, zN, zI, zLN, zLI, zNI, zLNI], dim=1)
+        h = self.net(x)
+        base = (zL + zN + zI) / 3.0
+        return h + self.res_scale * base
 
 
 @dataclass
@@ -403,12 +365,7 @@ def build_encoders(
     cfg: EncoderConfig,
     device: Optional[Union[str, torch.device]] = None,
 ) -> Tuple[BEHRTLabEncoder, BioClinBERTEncoder, ImageEncoder]:
-    # Use the same DEVICE as the rest of the project
-    from env_config import DEVICE as GLOBAL_DEVICE
-    if device is None:
-        device = torch.device(GLOBAL_DEVICE) 
-    else:
-        device = torch.device(device)
+    dev = torch.device(DEVICE if device is None else device)
 
     behrt = BEHRTLabEncoder(
         n_feats=cfg.structured_n_feats,
@@ -418,7 +375,7 @@ def build_encoders(
         n_heads=cfg.structured_heads,
         dropout=cfg.dropout,
         pool=cfg.structured_pool,
-    ).to(device)
+    ).to(dev)
 
     bbert = BioClinBERTEncoder(
         model_name=cfg.text_model_name,
@@ -427,44 +384,57 @@ def build_encoders(
         dropout=cfg.dropout,
         note_agg=cfg.note_agg,
         max_notes_concat=cfg.max_notes_concat,
-        device=device,
-    ).to(device)
+        device=dev,
+    ).to(dev)
 
-    # ensure HF model (if present) is on device
     if getattr(bbert, "hf_available", False) and bbert.bert is not None:
-        bbert.bert.to(device)                
+        bbert.bert.to(dev)
         bbert.bert.eval()
 
     imgenc = ImageEncoder(
         d=cfg.d,
         dropout=cfg.dropout,
         img_agg=cfg.img_agg,
-    ).to(device)
+    ).to(dev)
 
     return behrt, bbert, imgenc
+
 
 @dataclass
 class FusionConfig:
     d: int = 256
     dropout: float = 0.1
-    hidden: int = 4 * 256
+    hidden: Optional[Sequence[int]] = None
+    feature_mode: str = "rich"  
 
-def build_fusions_enc(d: int, p_drop: float, hidden: int = 4 * 256) -> Dict[str, nn.Module]:
-    dev = torch.device(DEVICE)  # <<< also unify device here if you keep it
-    LN  = PairwiseFusion(d=d, hidden=hidden, dropout=p_drop).to(dev)
-    LI  = PairwiseFusion(d=d, hidden=hidden, dropout=p_drop).to(dev)
-    NI  = PairwiseFusion(d=d, hidden=hidden, dropout=p_drop).to(dev)
-    LNI = TrimodalFusion(d=d, hidden=hidden, dropout=p_drop).to(dev)
+
+def build_fusions_enc(
+    d: int,
+    p_drop: float,
+    hidden: Optional[Sequence[int]] = None,
+    feature_mode: str = "rich",
+) -> Dict[str, nn.Module]:
+    dev = torch.device(DEVICE)
+    LN  = PairwiseFusion(d=d, hidden=hidden, dropout=p_drop, feature_mode=feature_mode).to(dev)
+    LI  = PairwiseFusion(d=d, hidden=hidden, dropout=p_drop, feature_mode=feature_mode).to(dev)
+    NI  = PairwiseFusion(d=d, hidden=hidden, dropout=p_drop, feature_mode=feature_mode).to(dev)
+    LNI = TrimodalFusion(d=d, hidden=hidden, dropout=p_drop, feature_mode=feature_mode).to(dev)
     return {"LN": LN, "LI": LI, "NI": NI, "LNI": LNI}
 
+
 def build_fusions_from_cfg(cfg: FusionConfig) -> Dict[str, nn.Module]:
-    return build_fusions_enc(d=cfg.d, p_drop=cfg.dropout, hidden=cfg.hidden)
+    return build_fusions_enc(
+        d=cfg.d,
+        p_drop=cfg.dropout,
+        hidden=cfg.hidden,
+        feature_mode=cfg.feature_mode,
+    )
+
 
 def make_route_inputs(
     z: Dict[str, torch.Tensor],
     fusion: Dict[str, nn.Module],
 ) -> Dict[str, torch.Tensor]:
-    """Produce d-dim inputs for all 7 routes using fusion modules."""
     assert {"L", "N", "I"}.issubset(z), "z must contain L, N, I"
     assert {"LN", "LI", "NI", "LNI"}.issubset(fusion), "Missing fusion blocks"
 
@@ -478,16 +448,21 @@ def make_route_inputs(
         "LNI": fusion["LNI"](z["L"], z["N"], z["I"]),
     }
 
+
 __all__ = [
+    # Encoders
     "BEHRTLabEncoder",
     "BioClinBERTEncoder",
     "ImageEncoder",
+    # Fusion blocks (embedding-level)
     "PairwiseFusion",
     "TrimodalFusion",
+    # Configs & builders
     "EncoderConfig",
     "FusionConfig",
     "build_encoders",
     "build_fusions_enc",
     "build_fusions_from_cfg",
+    # Utility
     "make_route_inputs",
 ]
