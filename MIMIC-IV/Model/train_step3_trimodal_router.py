@@ -406,7 +406,8 @@ def main():
             if gate_net is not None:
                 save_obj["gate_net"] = gate_net.state_dict()
 
-            ckpt_out = os.path.join(CFG.ckpt_root, f"{TASK}_step3_emb_fusion.pt")
+      
+            ckpt_out = os.path.join(CFG.ckpt_root, f"{TASK}_step3_concat_gate.pt")
             torch.save(save_obj, ckpt_out)
             print(f"Saved best model -> {ckpt_out}")
 
