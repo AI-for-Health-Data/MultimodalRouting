@@ -3,20 +3,24 @@ from __future__ import annotations
 import os
 import json
 import argparse
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from env_config import CFG, DEVICE, ROUTES, BLOCKS
 from encoders import EncoderConfig, build_encoders
 from routing_and_heads import (
     build_fusions,
+    build_route_heads,
     RouteGateNet,
     FinalConcatHead,
-    forward_emb_concat,
+    make_route_inputs,
+    route_availability_mask,
+    concat_routes,
 )
-from train_step1_unimodal import ICUStayDataset, collate_fn
+from train_step1_unimodal import ICUStayDataset, collate_fn_factory
 
 
 TASK_MAP = {"mort": 0, "pe": 1, "ph": 2}
@@ -39,8 +43,6 @@ def parse_args():
                     help="Index within the first batch to show detailed gates.")
     return ap.parse_args()
 
-
-
 def build_masks(xL: torch.Tensor, notes_list, imgs: torch.Tensor) -> dict:
     B = xL.size(0)
     mL = torch.ones(B, 1, device=xL.device)
@@ -55,8 +57,6 @@ def build_masks(xL: torch.Tensor, notes_list, imgs: torch.Tensor) -> dict:
         mI_vals = (imgs.abs().flatten(1).sum(dim=1) > 0).float()
     mI = mI_vals.to(xL.device).unsqueeze(1)
     return {"L": mL, "N": mN, "I": mI}
-
-
 
 def build_stack():
     behrt, bbert, imgenc = build_encoders(
@@ -73,17 +73,19 @@ def build_stack():
         ),
         device=DEVICE,
     )
-    fusion    = build_fusions(d=CFG.d, p_drop=CFG.dropout)
-    gate_net  = RouteGateNet(d=CFG.d, hidden=4 * 256, p_drop=CFG.dropout, use_masks=True).to(DEVICE)
-    final_head = FinalConcatHead(d=CFG.d, n_tasks=1, p_drop=CFG.dropout).to(DEVICE)
-    return behrt, bbert, imgenc, fusion, gate_net, final_head
+    fusion       = build_fusions(d=CFG.d, p_drop=CFG.dropout)
+    route_heads  = build_route_heads(d=CFG.d, n_tasks=1, p_drop=CFG.dropout)
+    gate_net     = RouteGateNet(d=CFG.d, hidden=4 * 256, p_drop=CFG.dropout, use_masks=True).to(DEVICE)
+    final_head   = FinalConcatHead(d=CFG.d, n_tasks=1, p_drop=CFG.dropout).to(DEVICE)
+    return behrt, bbert, imgenc, fusion, route_heads, gate_net, final_head
 
 
 def load_checkpoints(task: str,
                      behrt, bbert, imgenc,
                      fusion: Dict[str, torch.nn.Module],
+                     route_heads: Dict[str, torch.nn.Module],
                      gate_net: RouteGateNet,
-                     final_head: FinalConcatHead) -> None:
+                     final_head: FinalConcatHead) -> Tuple[str, float, bool]:
 
     c1 = os.path.join(CFG.ckpt_root, f"{task}_step1_unimodal.pt")
     c2 = os.path.join(CFG.ckpt_root, f"{task}_step2_bimodal.pt")
@@ -105,18 +107,28 @@ def load_checkpoints(task: str,
     bbert.load_state_dict(ckpt1["bbert"], strict=False)
     imgenc.load_state_dict(ckpt1["imgenc"], strict=False)
 
-    # Pairwise fusions from Step-2
+    if "L" in ckpt1:  route_heads["L"].load_state_dict(ckpt1["L"], strict=False)
+    if "N" in ckpt1:  route_heads["N"].load_state_dict(ckpt1["N"], strict=False)
+    if "I" in ckpt1:  route_heads["I"].load_state_dict(ckpt1["I"], strict=False)
+    if "LN" in ckpt2: route_heads["LN"].load_state_dict(ckpt2["LN"], strict=False)
+    if "LI" in ckpt2: route_heads["LI"].load_state_dict(ckpt2["LI"], strict=False)
+    if "NI" in ckpt2: route_heads["NI"].load_state_dict(ckpt2["NI"], strict=False)
+
     if "fusion_LN" in ckpt2: fusion["LN"].load_state_dict(ckpt2["fusion_LN"], strict=False)
     if "fusion_LI" in ckpt2: fusion["LI"].load_state_dict(ckpt2["fusion_LI"], strict=False)
     if "fusion_NI" in ckpt2: fusion["NI"].load_state_dict(ckpt2["fusion_NI"], strict=False)
 
-    # Step-3: gate + final head 
+    gate_mode      = ckpt3.get("gate_mode", "learned")
+    loss_gate_alpha = float(ckpt3.get("loss_gate_alpha", 4.0))
+    l2norm_each     = bool(ckpt3.get("l2norm_each", False))
+
     if "gate" in ckpt3:
         gate_net.load_state_dict(ckpt3["gate"], strict=False)
     elif "gate_net" in ckpt3:
         gate_net.load_state_dict(ckpt3["gate_net"], strict=False)
     else:
-        raise KeyError("Step-3 checkpoint missing 'gate'/'gate_net' state dict.")
+        if gate_mode == "learned":
+            raise KeyError("Step-3 checkpoint missing 'gate'/'gate_net' but gate_mode='learned'.")
 
     if "final_head" in ckpt3:
         final_head.load_state_dict(ckpt3["final_head"], strict=False)
@@ -128,22 +140,59 @@ def load_checkpoints(task: str,
             fusion["LNI"].load_state_dict(ckpt3["fusion_LNI"], strict=False)
         except Exception:
             pass
+    if "LNI_head" in ckpt3:
+        try:
+            route_heads["LNI"].load_state_dict(ckpt3["LNI_head"], strict=False)
+        except Exception:
+            pass
 
-    print(f"[{task}] Loaded: {os.path.basename(c1)}, {os.path.basename(c2)}, {os.path.basename(c3)}")
+    print(f"[{task}] Loaded: {os.path.basename(c1)}, {os.path.basename(c2)}, {os.path.basename(c3)} "
+          f"(gate_mode={gate_mode}, alpha={loss_gate_alpha}, l2norm={l2norm_each})")
+    return gate_mode, loss_gate_alpha, l2norm_each
+
+@torch.no_grad()
+def _compute_gates(gate_mode: str,
+                   routes_emb: Dict[str, torch.Tensor],
+                   route_heads: Dict[str, torch.nn.Module],
+                   gate_net: RouteGateNet,
+                   z_unimodal: Dict[str, torch.Tensor],
+                   y: torch.Tensor,
+                   masks: Dict[str, torch.Tensor],
+                   loss_gate_alpha: float) -> torch.Tensor:
+    B = y.size(0)
+    avail = route_availability_mask(masks, batch_size=B, device=y.device)
+    if gate_mode == "uniform":
+        return avail / (avail.sum(dim=1, keepdim=True).clamp_min(1.0))
+    if gate_mode == "learned":
+        g = gate_net(z_unimodal, masks=masks)
+        return g / (g.sum(dim=1, keepdim=True).clamp_min(1e-6))
+    # loss_based
+    per_route_losses = []
+    for r in ROUTES:
+        logits_r = route_heads[r](routes_emb[r])
+        l_i = F.binary_cross_entropy_with_logits(logits_r, y, reduction="none").squeeze(1)
+        per_route_losses.append(l_i)
+    Lmat = torch.stack(per_route_losses, dim=1) 
+    masked_logits = (-float(loss_gate_alpha) * Lmat) + torch.log(avail + 1e-12)
+    return torch.softmax(masked_logits, dim=1)
+
 
 @torch.no_grad()
 def run_inference_demo(loader: DataLoader,
                        behrt, bbert, imgenc,
-                       fusion, gate_net, final_head,
-                       task: str, show_k: int = 5, inspect_idx: int = 0):
+                       fusion, route_heads, gate_net, final_head,
+                       task: str, show_k: int, inspect_idx: int,
+                       gate_mode: str, loss_gate_alpha: float, l2norm_each: bool):
     behrt.eval(); bbert.eval(); imgenc.eval()
     for k in fusion: fusion[k].eval()
+    for k in route_heads: route_heads[k].eval()
     gate_net.eval(); final_head.eval()
 
+    # Grab first batch
     xL, notes_list, imgs, y, sens = next(iter(loader))
     xL   = xL.to(DEVICE)
     imgs = imgs.to(DEVICE)
-    y    = y.to(DEVICE)  
+    y    = y.to(DEVICE)
 
     # Unimodal embeddings
     zL = behrt(xL)
@@ -151,17 +200,17 @@ def run_inference_demo(loader: DataLoader,
     zI = imgenc(imgs)
     z  = {"L": zL, "N": zN, "I": zI}
 
+    # Build routes + masks
+    routes_emb = make_route_inputs(z, fusion)
     masks = build_masks(xL, notes_list, imgs)
 
-    ylogits, gates, routes_raw, routes_weighted = forward_emb_concat(
-        z_unimodal=z,
-        fusion=fusion,
-        final_head=final_head,
-        gate_net=gate_net,
-        masks=masks,
-        l2norm_each=False,
-    )
-    probs = torch.sigmoid(ylogits) 
+    # Gates
+    gates = _compute_gates(gate_mode, routes_emb, route_heads, gate_net, z, y, masks, loss_gate_alpha)
+
+    # Concat & predict
+    x_cat, Zw = concat_routes(routes_emb, gates=gates, l2norm=l2norm_each)
+    ylogits = final_head(x_cat)
+    probs = torch.sigmoid(ylogits)
 
     B = probs.size(0)
     show_k = min(show_k, B)
@@ -170,7 +219,7 @@ def run_inference_demo(loader: DataLoader,
 
     i = min(inspect_idx, B - 1)
     print(f"\n--- Route gates for sample index {i} ---")
-    gate_i = gates[i].cpu().numpy() 
+    gate_i = gates[i].cpu().numpy()
     gate_dict = {ROUTES[j]: float(gate_i[j]) for j in range(len(ROUTES))}
     idx_map = {r: j for j, r in enumerate(ROUTES)}
     block_means = {}
@@ -185,62 +234,9 @@ def run_inference_demo(loader: DataLoader,
         print(f"  {name:>3}: {w:.4f}")
 
     return {
-        "probs": probs,                    
-        "ylogits": ylogits,                
-        "gates": gates,                    
-        "routes_raw": routes_raw,          
-        "routes_weighted": routes_weighted,
-        "y_true": y,                       
-        "sens": sens,                      
-    }
-
-
-@torch.no_grad()
-def run_inference_loader(loader: DataLoader,
-                         behrt, bbert, imgenc,
-                         fusion, gate_net, final_head):
-    behrt.eval(); bbert.eval(); imgenc.eval()
-    for k in fusion: fusion[k].eval()
-    gate_net.eval(); final_head.eval()
-
-    all_probs, all_logits = [], []
-    all_gates = []
-
-    for xL, notes_list, imgs, y, sens in loader:
-        xL   = xL.to(DEVICE)
-        imgs = imgs.to(DEVICE)
-
-        zL = behrt(xL)
-        zN = bbert(notes_list)
-        zI = imgenc(imgs)
-        z  = {"L": zL, "N": zN, "I": zI}
-
-        masks = build_masks(xL, notes_list, imgs)
-
-        ylogits, gates, _, _ = forward_emb_concat(
-            z_unimodal=z,
-            fusion=fusion,
-            final_head=final_head,
-            gate_net=gate_net,
-            masks=masks,
-            l2norm_each=False,
-        )
-        probs = torch.sigmoid(ylogits)
-
-        all_probs.append(probs.cpu())
-        all_logits.append(ylogits.cpu())
-        all_gates.append(gates.cpu())
-
-    probs  = torch.cat(all_probs, dim=0).numpy()
-    logits = torch.cat(all_logits, dim=0).numpy()
-    gates  = torch.cat(all_gates, dim=0).numpy()
-
-    return {
-        "probs": probs,     
-        "logits": logits,   
-        "gates": gates,     
-        "routes": ROUTES,
-        "blocks": list(BLOCKS.keys()),
+        "probs": probs, "ylogits": ylogits, "gates": gates,
+        "routes_raw": routes_emb, "routes_weighted": {r: Zw[:, j, :] for j, r in enumerate(ROUTES)},
+        "y_true": y, "sens": sens,
     }
 
 
@@ -252,8 +248,17 @@ def main():
     if args.ckpt_root != CFG.ckpt_root:
         CFG.ckpt_root = args.ckpt_root
 
-    behrt, bbert, imgenc, fusion, gate_net, final_head = build_stack()
-    load_checkpoints(args.task, behrt, bbert, imgenc, fusion, gate_net, final_head)
+    behrt, bbert, imgenc, fusion, route_heads, gate_net, final_head = build_stack()
+    gate_mode, loss_gate_alpha, l2norm_each = load_checkpoints(
+        args.task, behrt, bbert, imgenc, fusion, route_heads, gate_net, final_head
+    )
+
+    tidx = TASK_MAP[args.task]
+    base_collate = collate_fn_factory(tidx)
+    def collate_fn(batch):
+        xL, notes, imgs, y = base_collate(batch)
+        sens = [{} for _ in batch]  
+        return xL, notes, imgs, y, sens
 
     root = os.path.join(CFG.data_root, "MIMIC-IV")
     test_ds = ICUStayDataset(root, split="test")
@@ -268,10 +273,13 @@ def main():
 
     _ = run_inference_demo(
         test_loader,
-        behrt, bbert, imgenc, fusion, gate_net, final_head,
+        behrt, bbert, imgenc, fusion, route_heads, gate_net, final_head,
         task=args.task,
         show_k=args.show_k,
         inspect_idx=args.inspect_idx,
+        gate_mode=gate_mode,
+        loss_gate_alpha=loss_gate_alpha,
+        l2norm_each=l2norm_each,
     )
 
 
