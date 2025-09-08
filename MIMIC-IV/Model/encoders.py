@@ -79,8 +79,6 @@ class BEHRTLabEncoder(nn.Module):
             z = _masked_mean(h, m)
         return z
 
-
-
 class BioClinBERTEncoder(nn.Module):
     def __init__(
         self,
@@ -88,10 +86,11 @@ class BioClinBERTEncoder(nn.Module):
         d: int,
         max_len: int = 512,
         dropout: float = 0.1,
-        note_agg: Literal["mean", "attention", "concat"] = "mean",
-        max_notes_concat: int = 8,
+        note_agg: Literal["mean", "attention"] = "mean",
+        max_notes_concat: int = 8,        
         attn_hidden: int = 256,
         device: Optional[torch.device] = None,
+        project_to_d: bool = True,        
     ) -> None:
         super().__init__()
         self.model_name = model_name
@@ -111,22 +110,28 @@ class BioClinBERTEncoder(nn.Module):
             self.bert = None
             self.hf_available = False
 
-        self.proj = nn.Sequential(nn.LayerNorm(768), nn.Linear(768, d))
+        # 768 -> d projection 
+        if project_to_d and d != 768:
+            self.proj = nn.Sequential(nn.LayerNorm(768), nn.Linear(768, d))
+            self.out_dim = d
+        else:
+            self.proj = nn.Identity()
+            self.out_dim = 768 
+
         self.drop = nn.Dropout(dropout)
 
+        self.attn = None
         if note_agg == "attention":
             self.attn = nn.Sequential(
-                nn.LayerNorm(d),
-                nn.Linear(d, attn_hidden),
+                nn.LayerNorm(self.out_dim),
+                nn.Linear(self.out_dim, attn_hidden),
                 nn.Tanh(),
                 nn.Linear(attn_hidden, 1),
             )
-        else:
-            self.attn = None
 
         self.device_override = device
 
-    def _encode_chunk_cls(self, texts: List[str]) -> torch.Tensor:
+    def _encode_text_batch_to_cls(self, texts: List[str]) -> torch.Tensor:
         device = self.device_override or next(self.parameters()).device
         if not self.hf_available:
             return torch.randn(len(texts), 768, device=device)
@@ -140,8 +145,8 @@ class BioClinBERTEncoder(nn.Module):
         ).to(device)
 
         with torch.no_grad():
-            hidden = self.bert(**batch).last_hidden_state
-            cls_vecs = hidden[:, 0]  
+            hidden = self.bert(**batch).last_hidden_state  
+            cls_vecs = hidden[:, 0]                        
         return cls_vecs
 
     def _chunk_note(self, text: str) -> List[str]:
@@ -149,7 +154,7 @@ class BioClinBERTEncoder(nn.Module):
             return [""]
         toks = text.split()
         chunks = []
-        step = self.max_len  
+        step = self.max_len 
         for i in range(0, len(toks), step):
             piece = " ".join(toks[i: i + step])
             if piece:
@@ -158,22 +163,20 @@ class BioClinBERTEncoder(nn.Module):
             chunks = [""]
         return chunks
 
+
     @staticmethod
-    def _normalize_input(
-        batch_notes: Union[Sequence[str], Sequence[Sequence[str]]]
-    ) -> List[List[str]]:
+    def _normalize_input(batch_notes: Union[Sequence[str], Sequence[Sequence[str]]]) -> List[List[str]]:
         if len(batch_notes) == 0:
             return []
         if isinstance(batch_notes[0], str):
             return [[t] for t in batch_notes]
         return [list(notes) for notes in batch_notes]
 
-    def encode_seq(
+    def encode_seq(  
         self,
         batch_notes: Union[List[str], List[List[str]]],
         max_total_chunks: int = 32,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         device = self.device_override or next(self.parameters()).device
         patients = self._normalize_input(batch_notes)
 
@@ -181,54 +184,109 @@ class BioClinBERTEncoder(nn.Module):
         lengths: List[int] = []
 
         for notes in patients:
-            chunk_cls: List[torch.Tensor] = []
+            chunks_all: List[str] = []
             remaining = max_total_chunks
             for note_text in notes:
                 if remaining <= 0:
                     break
-                chunks = self._chunk_note(note_text)
-                if len(chunks) > remaining:
-                    chunks = chunks[:remaining]
-                if len(chunks) == 0:
-                    continue
-                cls_vecs = self._encode_chunk_cls(chunks)  
-                z = self.drop(self.proj(cls_vecs))        
-                chunk_cls.append(z)
-                remaining -= z.size(0)
+                c = self._chunk_note(note_text)
+                if len(c) > remaining:
+                    c = c[:remaining]
+                chunks_all.extend(c)
+                remaining -= len(c)
 
-            if len(chunk_cls) == 0:
-                chunk_cls.append(torch.zeros(1, self.d, device=device))
+            if len(chunks_all) == 0:
+                H = torch.zeros(1, self.out_dim, device=device)
+            else:
+                cls = self._encode_text_batch_to_cls(chunks_all)      
+                H = self.drop(self.proj(cls))                         
 
-            H = torch.cat(chunk_cls, dim=0)  
             seqs.append(H)
             lengths.append(H.size(0))
 
         if len(seqs) == 0:
-            return torch.zeros(0, 1, self.d, device=device), torch.zeros(0, 1, device=device)
+            return torch.zeros(0, 1, self.out_dim, device=device), torch.zeros(0, 1, device=device)
 
         Smax = max(lengths)
         B = len(seqs)
-        Hpad = torch.zeros(B, Smax, self.d, device=device)
+        Hpad = torch.zeros(B, Smax, self.out_dim, device=device)
         M = torch.zeros(B, Smax, device=device)
 
         for i, H in enumerate(seqs):
             s = H.size(0)
             Hpad[i, :s] = H
             M[i, :s] = 1.0
+        return Hpad, M
+        
+    def encode_chunks(
+        self,
+        batch_chunks: List[List[str]],          
+        max_total_chunks: Optional[int] = None, 
+        chunk_bs: int = 16,                     
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        device = self.device_override or next(self.parameters()).device
+        seqs: List[torch.Tensor] = []
+        lengths: List[int] = []
 
+        for chunks in batch_chunks:
+            if chunks is None or len(chunks) == 0:
+                H = torch.zeros(1, self.out_dim, device=device)
+                seqs.append(H)
+                lengths.append(1)
+                continue
+
+            if max_total_chunks is not None:
+                chunks = chunks[:max_total_chunks]
+
+            cls_list: List[torch.Tensor] = []
+            for start in range(0, len(chunks), chunk_bs):
+                end = min(start + chunk_bs, len(chunks))
+                cls = self._encode_text_batch_to_cls(chunks[start:end]) 
+                cls_list.append(cls)
+
+            cls_all = torch.cat(cls_list, dim=0) if len(cls_list) > 0 else torch.zeros(0, 768, device=device)
+            if cls_all.size(0) == 0:
+                H = torch.zeros(1, self.out_dim, device=device)
+            else:
+                H = self.drop(self.proj(cls_all))  
+            seqs.append(H)
+            lengths.append(H.size(0))
+
+        if len(seqs) == 0:
+            return torch.zeros(0, 1, self.out_dim, device=device), torch.zeros(0, 1, device=device)
+
+        Smax = max(lengths)
+        B = len(seqs)
+        Hpad = torch.zeros(B, Smax, self.out_dim, device=device)
+        M = torch.zeros(B, Smax, device=device)
+        for i, H in enumerate(seqs):
+            s = H.size(0)
+            Hpad[i, :s] = H
+            M[i, :s] = 1.0
         return Hpad, M
 
-    def forward(self, batch_notes: Union[List[str], List[List[str]]]) -> torch.Tensor:
+    def forward(
+        self,
+        notes_or_chunks: Union[List[str], List[List[str]]]
+    ) -> torch.Tensor:
+        is_prechunked = (
+            isinstance(notes_or_chunks, list)
+            and len(notes_or_chunks) > 0
+            and isinstance(notes_or_chunks[0], list)
+        )
 
-        device = self.device_override or next(self.parameters()).device
-        H, M = self.encode_seq(batch_notes)
+        if is_prechunked:
+            H, M = self.encode_chunks(notes_or_chunks)
+        else:
+            H, M = self.encode_seq(notes_or_chunks)
+
         if self.attn is None or (M.sum(dim=1) == 0).any():
             return _masked_mean(H, M)
-        scores = self.attn(H)  
-        scores = scores.squeeze(-1)
-        scores = scores + (M < 0.5) * (-1e9)
-        w = torch.softmax(scores, dim=1)  
-        z = (w.unsqueeze(-1) * H).sum(dim=1)
+
+        scores = self.attn(H).squeeze(-1)  
+        scores = scores.masked_fill(M < 0.5, torch.finfo(scores.dtype).min)
+        w = torch.softmax(scores, dim=1)   
+        z = (w.unsqueeze(-1) * H).sum(dim=1)  
         return z
 
 class ImageEncoder(nn.Module):
