@@ -11,6 +11,7 @@ from tqdm.auto import tqdm
 from PIL import Image
 
 import torch
+import torchvision.transforms as TF
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import functional as VF  
@@ -236,6 +237,9 @@ def main():
 
     for epoch in range(CFG.max_epochs_uni):
         behrt.train(); bbert.train(); imgenc.train()
+        # Keep HF BERT in eval so dropout stays off
+        if getattr(bbert, "hf_available", False) and bbert.bert is not None:
+            bbert.bert.eval()
         for k in ["L", "N", "I"]:
             route_heads[k].train()
 
