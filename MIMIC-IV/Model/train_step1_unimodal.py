@@ -13,7 +13,7 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as TF
+from torchvision.transforms import functional as VF  
 
 from env_config import CFG, DEVICE, ensure_dir
 from encoders import EncoderConfig, build_encoders
@@ -22,6 +22,10 @@ from routing_and_heads import RouteHead
 
 TASK_MAP = {"mort": 0, "pe": 1, "ph": 2}
 COL_MAP  = {"mort": "mort", "pe": "pe", "ph": "ph"}
+
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD  = (0.229, 0.224, 0.225)
 
 
 def parse_args():
@@ -71,7 +75,7 @@ class ICUStayDataset(Dataset):
     def __getitem__(self, idx: int):
         stay_id = self.ids[idx]
 
-        # Structured: 24h time-series -> [T, F]
+        # Structured: 24h time-series 
         df_s = self.struct[self.struct.stay_id == stay_id].sort_values("hour")
         xs_np = df_s[self.feat_cols].to_numpy(dtype=np.float32)
         xs = torch.from_numpy(xs_np)  
@@ -94,7 +98,6 @@ class ICUStayDataset(Dataset):
         }
 
 
-
 def pad_or_trim_struct(x: torch.Tensor, T: int, F: int) -> torch.Tensor:
     t = x.shape[0]
     if t >= T:
@@ -107,16 +110,26 @@ IMG_TFMS = TF.Compose([
     TF.ToTensor(),
 ])
 
-def load_first_image(paths: List[str]) -> torch.Tensor:
+def _cxr_to_tensor_medfuse(pil_img: Image.Image) -> torch.Tensor:
+    pil_img = pil_img.convert("L")
+    pil_img = VF.resize(pil_img, 256, antialias=True)
+    pil_img = VF.center_crop(pil_img, 224)
+    x = VF.to_tensor(pil_img)        
+    x = x.repeat(3, 1, 1)            
+    x = VF.normalize(x, IMAGENET_MEAN, IMAGENET_STD)
+    return x
+
+
+def load_cxr_tensor(paths: List[str]) -> torch.Tensor:
     if not paths:
         return torch.zeros(3, 224, 224)
-    p = paths[0]
+    p = paths[-1]  
     try:
-        img = Image.open(p).convert("RGB")
-        return IMG_TFMS(img)
+        img = Image.open(p)
+        return _cxr_to_tensor_medfuse(img)
     except Exception:
         return torch.zeros(3, 224, 224)
-
+        
 def collate_fn_factory(tidx: int):
     def _collate(batch):
         T_len = CFG.structured_seq_len
@@ -129,9 +142,10 @@ def collate_fn_factory(tidx: int):
             for b in batch
         ]
 
-        imgs_batch = torch.stack([load_first_image(b["image_paths"]) for b in batch], dim=0)
+        # MedFuse: last CXR, grayscale->3ch, 256->224, ImageNet normalize
+        imgs_batch = torch.stack([load_cxr_tensor(b["image_paths"]) for b in batch], dim=0)  
 
-        # extract single task from y 
+        # extract single task from y
         y_all = torch.stack([b["y"] for b in batch], dim=0)  
         y_batch = y_all[:, tidx].unsqueeze(1).to(torch.float32)  
 
@@ -146,7 +160,7 @@ def main():
     TCOL  = COL_MAP[TASK]
     ROOT  = os.path.join(args.data_root, "MIMIC-IV")
 
-    # Build encoders with CFG (shared d)
+    # Build encoders with CFG (shared d); ImageEncoder uses MedFuse-style head in encoders.py
     behrt, bbert, imgenc = build_encoders(
         EncoderConfig(
             d=CFG.d,
@@ -220,7 +234,6 @@ def main():
 
     best_val = float("inf")
 
-
     for epoch in range(CFG.max_epochs_uni):
         behrt.train(); bbert.train(); imgenc.train()
         for k in ["L", "N", "I"]:
@@ -232,7 +245,7 @@ def main():
         for xL, notes_list, imgs, y in pbar:
             xL   = xL.to(DEVICE, non_blocking=IS_CUDA)
             imgs = imgs.to(DEVICE, non_blocking=IS_CUDA)
-            y    = y.to(DEVICE, non_blocking=IS_CUDA) 
+            y    = y.to(DEVICE, non_blocking=IS_CUDA)
 
             opt.zero_grad(set_to_none=True)
 
@@ -240,7 +253,7 @@ def main():
                 # Encoders -> embeddings
                 zL = behrt(xL)                 
                 zN = bbert(notes_list)         
-                zI = imgenc(imgs)             
+                zI = imgenc(imgs)              
 
                 # Unimodal heads -> single-logit per sample
                 logits_L = route_heads["L"](zL)  
@@ -262,7 +275,6 @@ def main():
             running += float(loss); n_steps += 1
             pbar.set_postfix(loss=f"{running / max(n_steps,1):.4f}")
 
-
         behrt.eval(); bbert.eval(); imgenc.eval()
         for k in ["L", "N", "I"]:
             route_heads[k].eval()
@@ -272,7 +284,7 @@ def main():
             for xL, notes_list, imgs, y in val_loader:
                 xL   = xL.to(DEVICE, non_blocking=IS_CUDA)
                 imgs = imgs.to(DEVICE, non_blocking=IS_CUDA)
-                y    = y.to(DEVICE, non_blocking=IS_CUDA)  
+                y    = y.to(DEVICE, non_blocking=IS_CUDA)
 
                 with torch.cuda.amp.autocast(enabled=amp_enabled):
                     zL = behrt(xL)
@@ -294,7 +306,6 @@ def main():
 
         val_loss /= max(n_val, 1)
         print(f"[{TASK}] Val loss: {val_loss:.4f}")
-
 
         if val_loss < best_val:
             best_val = val_loss
