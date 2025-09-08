@@ -33,9 +33,7 @@ TASKS: List[str] = ["mort", "pe", "ph"]
 
 @dataclass
 class Config:
-    # Model dims & optimization
     d: int = 256
-    alpha: float = 4.0
     dropout: float = 0.1
     lr: float = 2e-4
     batch_size: int = 16
@@ -53,35 +51,35 @@ class Config:
     # Structured sequence (first 24h)
     structured_seq_len: int = 24
     structured_n_feats: int = 128
+    # (optional if you want to expose)
+    structured_layers: int = 2
+    structured_heads: int = 8
 
     # Image encoder
     image_model_name: str = "resnet34"
 
     # Fairness
-    sensitive_keys: List[str] = field(
-        default_factory=lambda: ["age_group", "race", "ethnicity", "insurance"]
-    )
+    sensitive_keys: List[str] = field(default_factory=lambda: ["age_group", "race", "ethnicity", "insurance"])
     lambda_fair: float = 0.0
 
+    # Routing / fusion
     routing_backend: str = "embedding_concat"
-
-    # Embedding-level fusion extras
-    use_gates: bool = True    
-    gamma: float = 1.0       
-    
-
+    use_gates: bool = True
+    gamma: float = 1.0
+    loss_gate_alpha: float = 4.0         
+    route_gate_mode: str = "loss_based" 
+    l2norm_each: bool = False           
     data_root: str = "./data"
     ckpt_root: str = "./checkpoints"
-
-    # Selected task for single-task training/eval
     task_name: str = "mort"
 
     use_cudnn_benchmark: bool = True
-    precision_amp: str = "auto"  
-    deterministic: bool = False  
-    
+    precision_amp: str = "auto"
+    deterministic: bool = False
     seed: int = 42
     verbose: bool = True
+
+    alpha: float = 4.0
 
 
 CFG: Config = Config()
