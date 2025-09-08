@@ -19,6 +19,11 @@ from env_config import CFG, DEVICE, ensure_dir
 from encoders import EncoderConfig, build_encoders
 from routing_and_heads import RouteHead, build_fusions
 
+from torchvision.transforms import functional as VF
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD  = (0.229, 0.224, 0.225)
+
 
 TASK_MAP = {"mort": 0, "pe": 1, "ph": 2}
 COL_MAP  = {"mort": "mort", "pe": "pe", "ph": "ph"}
@@ -85,18 +90,23 @@ def pad_or_trim_struct(x: torch.Tensor, T: int, F: int) -> torch.Tensor:
     pad = torch.zeros(T - t, F, dtype=x.dtype)
     return torch.cat([pad, x], dim=0)
 
-IMG_TFMS = TF.Compose([
-    TF.Resize((224, 224)),
-    TF.ToTensor(),
-])
 
-def load_first_image(paths: List[str]) -> torch.Tensor:
+def _cxr_to_tensor_medfuse(pil_img: Image.Image) -> torch.Tensor:
+    pil_img = pil_img.convert("L")
+    pil_img = VF.resize(pil_img, 256, antialias=True)
+    pil_img = VF.center_crop(pil_img, 224)
+    x = VF.to_tensor(pil_img)          
+    x = x.repeat(3, 1, 1)              
+    x = VF.normalize(x, IMAGENET_MEAN, IMAGENET_STD)
+    return x
+
+def load_cxr_tensor(paths: List[str]) -> torch.Tensor:
     if not paths:
         return torch.zeros(3, 224, 224)
-    p = paths[0]
+    p = paths[0] 
     try:
-        img = Image.open(p).convert("RGB")
-        return IMG_TFMS(img)
+        img = Image.open(p)
+        return _cxr_to_tensor_medfuse(img)
     except Exception:
         return torch.zeros(3, 224, 224)
 
@@ -112,7 +122,8 @@ def collate_fn_factory(tidx: int):
             for b in batch
         ]
 
-        imgs_batch = torch.stack([load_first_image(b["image_paths"]) for b in batch], dim=0)
+        imgs_batch = torch.stack([load_cxr_tensor(b["image_paths"]) for b in batch], dim=0)
+
 
         y_all   = torch.stack([b["y"] for b in batch], dim=0)  
         y_batch = y_all[:, tidx].unsqueeze(1).to(torch.float32)  
