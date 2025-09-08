@@ -636,7 +636,7 @@ class EncoderConfig:
     # notes
     text_model_name: str = "emilyalsentzer/Bio_ClinicalBERT"
     text_max_len: int = 512
-    note_agg: Literal["mean", "attention", "concat"] = "mean"
+    note_agg: Literal["mean", "attention"] = "mean"
     max_notes_concat: int = 8
     # images
     img_agg: Literal["last", "mean", "attention"] = "last"
@@ -709,21 +709,21 @@ def encode_all_routes_from_batch(
     bbert: BioClinBERTEncoder,
     imgenc: ImageEncoder,
     extractor: MultimodalFeatureExtractor,
-    xL: torch.Tensor,               # [B, TL, F]
-    notes_list: Union[List[str], List[List[str]]],
+    xL: torch.Tensor,                              
+    notes_list: Union[List[str], List[List[str]]], 
     imgs: Union[List[torch.Tensor], List[List[torch.Tensor]]],
     mL: Optional[torch.Tensor] = None,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-    """
-    Convenience: from raw batch inputs → route embeddings + p_i.
-    - Builds sequences + masks for each modality
-    - Runs MulT-style extractor
-    """
     dev = next(extractor.parameters()).device
 
-    L_seq, mL_seq = behrt.encode_seq(xL.to(dev), mask=mL.to(dev) if mL is not None else None)  
-    N_seq, mN_seq = bbert.encode_seq(notes_list)  
-    I_seq, mI_seq = imgenc.encode_seq(imgs)       
+    L_seq, mL_seq = behrt.encode_seq(xL.to(dev), mask=mL.to(dev) if mL is not None else None)
+
+    if isinstance(notes_list, list) and len(notes_list) > 0 and isinstance(notes_list[0], list):
+        N_seq, mN_seq = bbert.encode_chunks(notes_list)
+    else:
+        N_seq, mN_seq = bbert.encode_seq(notes_list)
+
+    I_seq, mI_seq = imgenc.encode_seq(imgs)
 
     return extractor(L_seq, mL_seq, N_seq, mN_seq, I_seq, mI_seq)
 
