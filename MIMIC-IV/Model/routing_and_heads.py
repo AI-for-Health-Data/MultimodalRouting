@@ -240,17 +240,24 @@ def concat_routes(
     gates: torch.Tensor,
     l2norm: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    order = ROUTES
+    Z_list = [route_embs[r] for r in order]
 
-    B = next(iter(route_embs.values())).size(0)
-    d = next(iter(route_embs.values())).size(1)
-    Z = torch.stack([route_embs[r] for r in ROUTES], dim=1)  
+    B = Z_list[0].size(0)
+    d_set = {z.size(1) for z in Z_list}
+    assert len(d_set) == 1, f"Route embedding dims differ: {d_set}"
+    d = next(iter(d_set))
+
+    Z = torch.stack(Z_list, dim=1)  
     if l2norm:
         Z = F.normalize(Z, dim=2)
-    Gw = gates.unsqueeze(-1)  
-    Zw = Gw * Z               
-    x_cat = Zw.reshape(B, 7 * d)
-    return x_cat, Zw
 
+    R = len(order)
+    assert gates.shape == (B, R), f"gates shape {tuple(gates.shape)} != {(B, R)}"
+    Zw = gates.to(Z.dtype).unsqueeze(-1) * Z  
+
+    x_cat = Zw.reshape(B, R * d)             
+    return x_cat, Zw
 
 
 @torch.no_grad()
