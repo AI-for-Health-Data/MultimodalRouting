@@ -79,8 +79,7 @@ def build_modality_masks(
     return {"L": mL, "N": mN, "I": mI}
 
 
-from train_step1_unimodal import ICUStayDataset, collate_fn
-
+from train_step1_unimodal import ICUStayDataset, collate_fn_factory
 
 def _is_cuda(dev) -> bool:
     return torch.cuda.is_available() and (("cuda" in str(dev)) or (isinstance(dev, torch.device) and dev.type == "cuda"))
@@ -113,6 +112,14 @@ def main():
     args = ap.parse_args()
 
     TASK = args.task
+
+    TASK_MAP = {"mort": 0, "pe": 1, "ph": 2}
+    tidx = TASK_MAP[TASK]
+
+    def collate_fn(batch):
+        xL, notes, imgs, y = collate_fn_factory(tidx)(batch)
+        sens = [{} for _ in batch]  
+        return xL, notes, imgs, y, sens
 
     # Encoders
     behrt, bbert, imgenc = build_encoders(
@@ -301,7 +308,7 @@ def main():
 
                 bce_final  = bce_logits(ylogits, y, reduction="mean")
                 eddi_final = eddi_final_from_logits(ylogits, y, sens)
-                total = float(args.gamma) * bce_final + (1.0 - float(args.gamma)) * eddi_final
+                total = (float(args.gamma) * bce_final) + ((1.0 - float(args.gamma)) * (float(args.lambda_fair) * eddi_final))
 
                 if args.train_lni_head_aux:
                     aux_lni = bce_logits(logits_per_route["LNI"], y, reduction="mean")
@@ -374,7 +381,8 @@ def main():
 
                 bce_final  = bce_logits(ylogits, y, reduction="mean")
                 eddi_final = eddi_final_from_logits(ylogits, y, sens)
-                lval = float(args.gamma) * bce_final + (1.0 - float(args.gamma)) * eddi_final
+                lval = (float(args.gamma) * bce_final) + ((1.0 - float(args.gamma)) * (float(args.lambda_fair) * eddi_final))
+
 
                 if args.train_lni_head_aux:
                     lval = lval + float(args.aux_lni_weight) * bce_logits(logits_per_route["LNI"], y, reduction="mean")
