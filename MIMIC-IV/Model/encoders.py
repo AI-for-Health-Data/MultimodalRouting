@@ -231,37 +231,21 @@ class BioClinBERTEncoder(nn.Module):
         z = (w.unsqueeze(-1) * H).sum(dim=1)
         return z
 
-
-
-
 class ImageEncoder(nn.Module):
-    def __init__(
-        self,
-        d: int,
-        dropout: float = 0.1,
-        img_agg: Literal["last", "mean", "attention"] = "last",
-        attn_hidden: int = 256,
-    ) -> None:
+    def __init__(self, d: int, dropout: float = 0.1, img_agg: Literal["last", "mean", "attention"] = "last", attn_hidden: int = 256) -> None:
         super().__init__()
         import torchvision
         try:
-            backbone = torchvision.models.resnet34(
-                weights=torchvision.models.ResNet34_Weights.DEFAULT
-            )
+            backbone = torchvision.models.resnet34(weights=torchvision.models.ResNet34_Weights.DEFAULT)
         except Exception:
             backbone = torchvision.models.resnet34(weights=None)
-        modules = list(backbone.children())[:-2]
+        modules = list(backbone.children())[:-2]  
         self.backbone = nn.Sequential(*modules)
         self.gap = nn.AdaptiveAvgPool2d((1, 1))
         self.out_channels = 512
 
-        self.proj = nn.Sequential(
-            nn.Flatten(),
-            nn.LayerNorm(self.out_channels),
-            nn.Linear(self.out_channels, d),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
+        # MedFuse projection head: just a Linear 512->d
+        self.proj = nn.Linear(self.out_channels, d)
 
         self.img_agg = img_agg
         self.attn = None
@@ -278,6 +262,7 @@ class ImageEncoder(nn.Module):
             x = x.unsqueeze(0)  
         h = self.backbone(x)       
         h = self.gap(h)            
+        h = torch.flatten(h, 1)    
         z = self.proj(h)           
         return z
 
@@ -286,33 +271,32 @@ class ImageEncoder(nn.Module):
         batch_images: Union[List[torch.Tensor], List[List[torch.Tensor]]],
         min_token_if_empty: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         device = next(self.parameters()).device
 
         if isinstance(batch_images, list) and len(batch_images) > 0 and isinstance(batch_images[0], torch.Tensor):
-            batch_images = [[img] for img in batch_images] 
+            batch_images = [[img] for img in batch_images]
 
         seqs: List[torch.Tensor] = []
         lengths: List[int] = []
 
-        for imgs in batch_images: 
+        for imgs in batch_images:
             embs: List[torch.Tensor] = []
             for img in imgs:
-                z = self._encode_one(img.to(device)).squeeze(0) 
+                z = self._encode_one(img.to(device)).squeeze(0)
                 embs.append(z)
             if len(embs) == 0 and min_token_if_empty:
-                embs.append(torch.zeros(self.proj[2].out_features, device=device))
-            H = torch.stack(embs, dim=0) if len(embs) > 0 else torch.zeros(0, self.proj[2].out_features, device=device)
+                embs.append(torch.zeros(self.proj.out_features, device=device))
+            H = torch.stack(embs, dim=0) if len(embs) > 0 else torch.zeros(0, self.proj.out_features, device=device)
             seqs.append(H)
             lengths.append(max(1, H.size(0)))
 
         if len(seqs) == 0:
-            D = self.proj[2].out_features
+            D = self.proj.out_features
             return torch.zeros(0, 1, D, device=device), torch.zeros(0, 1, device=device)
 
         T_max = max(lengths)
         B = len(seqs)
-        D = seqs[0].size(-1) if seqs[0].numel() > 0 else self.proj[2].out_features
+        D = seqs[0].size(-1) if seqs[0].numel() > 0 else self.proj.out_features
 
         Hpad = torch.zeros(B, T_max, D, device=device)
         M = torch.zeros(B, T_max, device=device)
@@ -327,41 +311,35 @@ class ImageEncoder(nn.Module):
 
         return Hpad, M
 
-    def forward(
-        self,
-        x: Union[torch.Tensor, List[torch.Tensor], List[List[torch.Tensor]]]
-    ) -> torch.Tensor:
+    def forward(self, x: Union[torch.Tensor, List[torch.Tensor], List[List[torch.Tensor]]]) -> torch.Tensor:
         device = next(self.parameters()).device
 
         # Single tensor -> one image
         if isinstance(x, torch.Tensor):
-            z = self._encode_one(x.to(device))
-            return z
+            return self._encode_one(x.to(device))
 
         # Batch of images (one per patient)
         if len(x) == 0:
-            d_out = self.proj[2].out_features
-            return torch.zeros(0, d_out, device=device)
+            return torch.zeros(0, self.proj.out_features, device=device)
 
         if isinstance(x[0], torch.Tensor):
-            embs = [self._encode_one(img.to(device)).squeeze(0) for img in x]  
+            embs = [self._encode_one(img.to(device)).squeeze(0) for img in x]
             return torch.stack(embs, dim=0)
 
         # Variable number per patient
         out: List[torch.Tensor] = []
-        for imgs in x:  
+        for imgs in x:
             if len(imgs) == 0:
-                d_out = self.proj[2].out_features
-                out.append(torch.zeros(d_out, device=device))
+                out.append(torch.zeros(self.proj.out_features, device=device))
                 continue
             embs = [self._encode_one(img.to(device)).squeeze(0) for img in imgs]
-            H = torch.stack(embs, dim=0)  # [T, D]
+            H = torch.stack(embs, dim=0)  
             if self.img_agg == "last":
                 out.append(H[-1])
             elif self.img_agg == "mean":
                 out.append(H.mean(dim=0))
             else:
-                scores = self.attn(H)  # [T, 1]
+                scores = self.attn(H)  
                 w = torch.softmax(scores.squeeze(-1), dim=0)
                 out.append((w.unsqueeze(0) @ H.unsqueeze(0)).squeeze(0).squeeze(0))
         return torch.stack(out, dim=0)
