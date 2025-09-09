@@ -21,7 +21,31 @@ from routing_and_heads import (
     concat_routes,
 )
 
+from PIL import Image
+from torchvision.transforms import functional as VF
 
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+def _cxr_to_tensor_medfuse(pil_img):
+    pil_img = pil_img.convert("L")
+    pil_img = VF.resize(pil_img, 256, antialias=True)
+    pil_img = VF.center_crop(pil_img, 224)
+    x = VF.to_tensor(pil_img)
+    x = x.repeat(3, 1, 1)
+    x = VF.normalize(x, IMAGENET_MEAN, IMAGENET_STD)
+    return x
+
+def _load_first_cxr(paths):
+    if not paths:
+        return torch.zeros(3, 224, 224)
+    p = paths[0]  
+    try:
+        img = Image.open(p)
+        return _cxr_to_tensor_medfuse(img)
+    except Exception:
+        return torch.zeros(3, 224, 224)
+        
 def _group_index(batch_groups: List[dict], key: str, device) -> Dict[str, torch.Tensor]:
     buckets: Dict[str, List[int]] = {}
     for i, meta in enumerate(batch_groups):
@@ -79,7 +103,7 @@ def build_modality_masks(
     return {"L": mL, "N": mN, "I": mI}
 
 
-from train_step1_unimodal import ICUStayDataset, collate_fn_factory
+from train_step1_unimodal import ICUStayDataset, pad_or_trim_struct
 
 def _is_cuda(dev) -> bool:
     return torch.cuda.is_available() and (("cuda" in str(dev)) or (isinstance(dev, torch.device) and dev.type == "cuda"))
@@ -117,7 +141,21 @@ def main():
     tidx = TASK_MAP[TASK]
 
     def collate_fn(batch):
-        xL, notes, imgs, y = collate_fn_factory(tidx)(batch)
+        T_len = CFG.structured_seq_len
+        F_dim = CFG.structured_n_feats
+
+        xL = torch.stack([pad_or_trim_struct(b["x_struct"], T_len, F_dim) for b in batch], dim=0)
+
+        notes = [
+            b["notes_list"] if isinstance(b["notes_list"], list) else [str(b["notes_list"])]
+            for b in batch
+        ]
+
+        imgs = torch.stack([_load_first_cxr(b["image_paths"]) for b in batch], dim=0)
+
+        y_all = torch.stack([b["y"] for b in batch], dim=0)
+        y = y_all[:, tidx].unsqueeze(1).to(torch.float32)
+
         sens = [{} for _ in batch]  
         return xL, notes, imgs, y, sens
 
@@ -195,6 +233,10 @@ def main():
     if "fusion_NI" in ckpt2: fusion["NI"].load_state_dict(ckpt2["fusion_NI"], strict=False)
 
     print(f"[{TASK}] Loaded encoders/heads/fusions from {ckpt1_path} & {ckpt2_path}")
+
+    for k in ["LN", "LI", "NI"]:
+        set_requires_grad(fusion[k], False)
+        fusion[k].eval()
 
     # Encoders frozen
     for m in (behrt, bbert, imgenc):
