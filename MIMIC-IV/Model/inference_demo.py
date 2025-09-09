@@ -22,7 +22,6 @@ from routing_and_heads import (
 )
 from train_step1_unimodal import ICUStayDataset, collate_fn_factory
 
-
 TASK_MAP = {"mort": 0, "pe": 1, "ph": 2}
 COL_MAP  = {"mort": "mort", "pe": "pe", "ph": "ph"}
 
