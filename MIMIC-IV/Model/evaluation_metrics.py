@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import json
 import argparse
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -14,7 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from env_config import CFG, DEVICE, ROUTES, BLOCKS, TASKS
+# Import only what we need; define BLOCKS locally for robustness
+from env_config import CFG, DEVICE, ROUTES
 from encoders import EncoderConfig, build_encoders
 from routing_and_heads import (
     build_fusions,
@@ -25,12 +26,38 @@ from routing_and_heads import (
     route_availability_mask,
     concat_routes,
 )
-from train_step1_unimodal import ICUStayDataset, collate_fn_factory
+from train_step1_unimodal import ICUStayDataset, pad_or_trim_struct
 
+from PIL import Image
+from torchvision.transforms import functional as VF
 
 TASK_MAP = {"mort": 0, "pe": 1, "ph": 2}
 COL_MAP  = {"mort": "mort", "pe": "pe", "ph": "ph"}
 
+BLOCKS = {"uni": ["L", "N", "I"], "bi": ["LN", "LI", "NI"], "tri": ["LNI"]}
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+def _cxr_to_tensor_medfuse(pil_img: Image.Image) -> torch.Tensor:
+    pil_img = pil_img.convert("L")
+    pil_img = VF.resize(pil_img, 256, antialias=True)
+    pil_img = VF.center_crop(pil_img, 224)
+    x = VF.to_tensor(pil_img)          
+    x = x.repeat(3, 1, 1)              
+    x = VF.normalize(x, IMAGENET_MEAN, IMAGENET_STD)
+    return x
+
+
+def _load_first_cxr(paths: List[str]) -> torch.Tensor:
+    if not paths:
+        return torch.zeros(3, 224, 224)
+    p = paths[0]  
+    try:
+        img = Image.open(p)
+        return _cxr_to_tensor_medfuse(img)
+    except Exception:
+        return torch.zeros(3, 224, 224)
 
 def _group_index(batch_groups: List[dict], key: str, device) -> Dict[str, torch.Tensor]:
     buckets: Dict[str, List[int]] = {}
@@ -72,11 +99,10 @@ def compute_eddi_final(sens: List[dict], ylogits: torch.Tensor, y: torch.Tensor)
     return eddi_sign_agnostic(err, sens, getattr(CFG, "sensitive_keys", []))
 
 
-def build_masks(xL: torch.Tensor, notes_list, imgs: torch.Tensor) -> dict:
+def build_masks(xL: torch.Tensor, notes_list: List[List[str]], imgs: torch.Tensor) -> dict:
     B = xL.size(0)
     mL = torch.ones(B, 1, device=xL.device)
 
-    # N present if any non-empty note
     mN_list = []
     for notes in notes_list:
         present = 1.0 if (isinstance(notes, list) and any((isinstance(t, str) and len(t.strip()) > 0) for t in notes)) else 0.0
@@ -88,7 +114,6 @@ def build_masks(xL: torch.Tensor, notes_list, imgs: torch.Tensor) -> dict:
     mI = mI_vals.to(xL.device).unsqueeze(1)
 
     return {"L": mL, "N": mN, "I": mI}
-
 
 def _build_stack(n_tasks: int = 1):
     # Encoders
@@ -112,14 +137,13 @@ def _build_stack(n_tasks: int = 1):
     # Route heads (7) used for loss_based gating at eval
     route_heads = build_route_heads(d=CFG.d, n_tasks=1, p_drop=CFG.dropout)
 
-    # Gate net 
-    gate_net   = RouteGateNet(d=CFG.d, hidden=4 * 256, p_drop=CFG.dropout, use_masks=True).to(DEVICE)
+    # Gate net (used if gate_mode='learned')
+    gate_net = RouteGateNet(d=CFG.d, hidden=4 * 256, p_drop=CFG.dropout, use_masks=True).to(DEVICE)
 
     # Final head over concat(7*d)
     final_head = FinalConcatHead(d=CFG.d, n_tasks=n_tasks, p_drop=CFG.dropout).to(DEVICE)
 
     return behrt, bbert, imgenc, fusion, route_heads, gate_net, final_head
-
 
 def _load_checkpoints(task: str,
                       behrt: nn.Module,
@@ -199,17 +223,31 @@ def _load_checkpoints(task: str,
 
     return gate_mode, loss_gate_alpha, l2norm_each
 
+def _collate_eval_factory(tidx: int):
+    """Builds a collate fn that matches Step-2/3 preprocessing (first CXR + MedFuse)."""
+    def _collate(batch):
+        T_len = CFG.structured_seq_len
+        F_dim = CFG.structured_n_feats
+
+        xL = torch.stack([pad_or_trim_struct(b["x_struct"], T_len, F_dim) for b in batch], dim=0)
+
+        notes = [
+            b["notes_list"] if isinstance(b["notes_list"], list) else [str(b["notes_list"])]
+            for b in batch
+        ]
+
+        imgs = torch.stack([_load_first_cxr(b["image_paths"]) for b in batch], dim=0)
+
+        y_all = torch.stack([b["y"] for b in batch], dim=0)
+        y = y_all[:, tidx].unsqueeze(1).to(torch.float32)
+
+        sens = [{} for _ in batch]   # fairness placeholders
+        return xL, notes, imgs, y, sens
+    return _collate
 
 def evaluate(task: str) -> dict:
     assert task in TASK_MAP, f"Unknown task '{task}'"
     t_idx = TASK_MAP[task]
-
-    # Collate with sens placeholders
-    _base_collate = collate_fn_factory(t_idx)
-    def collate_fn_eval(batch):
-        xL, notes, imgs, y = _base_collate(batch)
-        sens = [{} for _ in batch]  
-        return xL, notes, imgs, y, sens
 
     # Data
     ROOT = os.path.join(CFG.data_root, "MIMIC-IV")
@@ -219,7 +257,7 @@ def evaluate(task: str) -> dict:
         batch_size=CFG.batch_size,
         shuffle=False,
         num_workers=CFG.num_workers,
-        collate_fn=collate_fn_eval,
+        collate_fn=_collate_eval_factory(t_idx),
         pin_memory=("cuda" in str(DEVICE) and torch.cuda.is_available()),
     )
 
@@ -234,7 +272,7 @@ def evaluate(task: str) -> dict:
     gate_net.eval(); final_head.eval()
 
     y_all, p_all = [], []
-    sum_route_gates = torch.zeros(7, device=DEVICE)
+    sum_route_gates = torch.zeros(len(ROUTES), device=DEVICE)
     total_examples = 0
 
     eddi_sum = 0.0
@@ -264,11 +302,11 @@ def evaluate(task: str) -> dict:
             if gate_mode == "uniform":
                 gates = avail / (avail.sum(dim=1, keepdim=True).clamp_min(1.0))
             elif gate_mode == "loss_based":
-                # Per-route logits -> per-sample BCE_i 
+                # Per-route logits -> per-sample BCE_i
                 per_route_losses = []
                 for r in ROUTES:
                     log_r = route_heads[r](routes_emb[r])
-                    l_i = F.binary_cross_entropy_with_logits(log_r, y, reduction="none").squeeze(1)  
+                    l_i = F.binary_cross_entropy_with_logits(log_r, y, reduction="none").squeeze(1)
                     per_route_losses.append(l_i)
                 Lmat = torch.stack(per_route_losses, dim=1)  
                 masked_logits = (-float(loss_gate_alpha) * Lmat) + torch.log(avail + 1e-12)
@@ -286,11 +324,11 @@ def evaluate(task: str) -> dict:
             y_all.append(y.detach().cpu().numpy())
             p_all.append(probs.detach().cpu().numpy())
 
-            # Aggregate gates
-            sum_route_gates += gates.sum(dim=0)  
+            # Aggregate gate usage
+            sum_route_gates += gates.sum(dim=0)
             total_examples += B
 
-            # EDDI on final predictions
+            # EDDI fairness on final predictions
             eddi = compute_eddi_final(sens, ylogits, y)
             if eddi.isfinite():
                 eddi_sum += float(eddi)
@@ -309,7 +347,6 @@ def evaluate(task: str) -> dict:
     except Exception:
         metrics["ap"] = float("nan")
 
-    # Mean route gate weights 
     if total_examples > 0:
         mean_route_gates = (sum_route_gates / total_examples).detach().cpu().numpy()
         metrics["mean_route_gates"] = {ROUTES[i]: float(mean_route_gates[i]) for i in range(len(ROUTES))}
@@ -326,7 +363,6 @@ def evaluate(task: str) -> dict:
     metrics["eddi_mean"] = (eddi_sum / eddi_batches) if eddi_batches > 0 else float("nan")
     return metrics
 
-
 def parse_args():
     ap = argparse.ArgumentParser(description="Evaluate embedding-level fusion model for a single task.")
     ap.add_argument("--task", type=str, default=getattr(CFG, "task_name", "mort"),
@@ -338,6 +374,7 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    # Allow overriding paths at runtime
     if args.data_root != CFG.data_root:
         CFG.data_root = args.data_root
     if args.ckpt_root != CFG.ckpt_root:
