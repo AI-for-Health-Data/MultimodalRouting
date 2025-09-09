@@ -124,7 +124,7 @@ def _cxr_to_tensor_medfuse(pil_img: Image.Image) -> torch.Tensor:
 def load_cxr_tensor(paths: List[str]) -> torch.Tensor:
     if not paths:
         return torch.zeros(3, 224, 224)
-    p = paths[-1]  
+    p = paths[0]  
     try:
         img = Image.open(p)
         return _cxr_to_tensor_medfuse(img)
