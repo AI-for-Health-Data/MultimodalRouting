@@ -1,28 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-make_varmap_17.py
-
-Builds a variable map CSV for 17 common ICU variables (7 vitals, 10 labs)
-for MIMIC-IV, matching the schema expected by the cohort builder:
-
-Columns:
-  variable, source, itemid, priority, unit, to_unit
-
-Notes:
-- source ∈ {"chartevents","labevents"}
-- priority: 1 = highest; MetaVision itemids (>=220000) preferred over CareVue
-- unit is taken from the source tables; Temperature has to_unit='c' so downstream code converts F→C
-
-Usage:
-  python make_varmap_17.py \
-      --d_items d_items.csv.gz \
-      --d_labitems d_labitems.csv.gz \
-      --out varmap_mimiciv_17.csv \
-      --max_per_var 8
-"""
-
 import argparse
 import re
 import sys
@@ -38,10 +13,8 @@ def read_tables(d_items_path: str, d_labitems_path: str):
                 df[c] = df[c].astype(str).str.lower()
         return df
 
-    # Normalize helpful columns to lowercase for robust matching
     d_items = lower_cols(d_items, ["label","abbreviation","category","unitname","linksto"])
     d_lab   = lower_cols(d_lab,   ["label","fluid","category","loinc_code"])
-    # d_labitems uses "units" (not "unitname"); create a normalized view as "unitname" for uniformity
     if "units" in d_lab.columns and "unitname" not in d_lab.columns:
         d_lab = d_lab.rename(columns={"units": "unitname"})
 
@@ -49,11 +22,10 @@ def read_tables(d_items_path: str, d_labitems_path: str):
 
 def prefer_metavision_first(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
-    x["priority_hint"] = (x["itemid"] < 220000).astype(int)  # 0 = MV (good), 1 = older CareVue
+    x["priority_hint"] = (x["itemid"] < 220000).astype(int) 
     return x.sort_values(["priority_hint", "itemid"])
 
 def pick_chartevents(d_items: pd.DataFrame, patterns, max_n=8):
-    """Select up to max_n chartevents itemids by regex over label/abbreviation."""
     if "linksto" in d_items.columns:
         ce_items = d_items[d_items["linksto"] == "chartevents"].copy()
     else:
@@ -72,13 +44,11 @@ def pick_chartevents(d_items: pd.DataFrame, patterns, max_n=8):
 
     m = m.drop_duplicates(subset=["itemid"])
     m = prefer_metavision_first(m).head(max_n)
-    # Ensure unit column exists (older dumps may miss it)
     if "unitname" not in m.columns:
         m["unitname"] = ""
     return m[["itemid","unitname"]]
 
 def pick_labevents(d_lab: pd.DataFrame, labels_like, fluids=("blood","serum","plasma"), max_n=8):
-    """Select up to max_n lab itemids by regex over label and restrict to fluids."""
     pat = re.compile("|".join(labels_like), re.IGNORECASE)
     mask = pd.Series(False, index=d_lab.index)
     if "label" in d_lab.columns:
@@ -96,12 +66,7 @@ def pick_labevents(d_lab: pd.DataFrame, labels_like, fluids=("blood","serum","pl
     return m[["itemid","unitname"]]
 
 def build_varmap(d_items, d_lab, max_per_var=8) -> pd.DataFrame:
-    """
-    Define the 17 variables and select itemids for each.
-    Regexes use non-capturing groups (?:...) to avoid Pandas warnings.
-    """
     VAR_CFG = [
-        # (variable, source, selector_fn, regex_patterns, to_unit)
         ("HeartRate",   "chartevents", pick_chartevents, [r"\bheart\s*rate\b", r"\bhr\b"], None),
 
         ("SysBP",       "chartevents", pick_chartevents,
@@ -176,7 +141,6 @@ def main():
 
     vm.to_csv(args.out, index=False)
     print(f"Wrote {args.out} with {len(vm)} rows across {vm['variable'].nunique()} variables.")
-    # Quick preview
     with pd.option_context("display.max_rows", None, "display.width", 120):
         print(vm.groupby(["variable","source"])["itemid"].count().reset_index(name="n").to_string(index=False))
 
