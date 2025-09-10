@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os, json, argparse, re
 import numpy as np
 import pandas as pd
@@ -32,7 +31,7 @@ def build_structured(master: pd.DataFrame, out_path: str):
         if d is None:
             n_bad += 1
             continue
-        X = d["X"].astype("float32")   # [T, F]
+        X = d["X"].astype("float32")   
         cols = list(d["colnames"])
         T, F = X.shape
         if feat_names is None:
