@@ -54,7 +54,7 @@
 
 ## The Three Notebooks
 
-### 1. `build_cohort.ipynb`: 
+### 1. `MIMIC-IV/cohort/build_cohort.py`: 
 filters, labels, splits, CE/LE extraction, 48h binning, CXR pairing, notes chunking, and normalization.
 Required inputs (all in one folder):
 'admissions.csv.gz, patients.csv.gz, diagnoses_icd.csv.gz,
