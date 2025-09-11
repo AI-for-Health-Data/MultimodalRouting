@@ -65,7 +65,7 @@ d_items.csv.gz, d_labitems.csv.gz, varmap_mimiciv_17.csv'
 - Runs the cohort builder (`build_cohort.py`)
 - Handles filters, labels, splits, and CXR pairing
 
-### 2. `build_varmap_17.ipynb`
+### 2. `build_cohort.py`
 - Extracts 17 variable mappings from `d_items.csv.gz` and `d_labitems.csv.gz`
 - Resolves multiple itemids with priority order
 - Defines canonical target units for normalization
