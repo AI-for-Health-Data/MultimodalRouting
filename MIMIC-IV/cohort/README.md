@@ -54,7 +54,7 @@
 
 ## The Three Notebooks
 
-### 2. `build_varmap_17.ipynb`
+### 1. `build_varmap_17.ipynb`
 filters, labels, splits, CE/LE extraction, 48h binning, CXR pairing, notes chunking, and normalization.
 Required inputs (all in one folder):
 'admissions.csv.gz, patients.csv.gz, diagnoses_icd.csv.gz,
