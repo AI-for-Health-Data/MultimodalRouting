@@ -21,8 +21,36 @@ from routing_and_heads import RouteHead, build_fusions
 
 from torchvision.transforms import functional as VF
 
+from torchvision import transforms as T
+
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+def build_image_transform(split: str) -> T.Compose:
+    split = str(split).lower()
+    if split == "train":
+        return T.Compose([
+            T.Grayscale(num_output_channels=3),
+            T.Resize(256),
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomAffine(
+                degrees=10,          
+                translate=(0.05, 0.05),
+                scale=(0.95, 1.05),
+                shear=5,
+            ),
+            T.RandomCrop(224),
+            T.ToTensor(),
+            T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
+    else: 
+        return T.Compose([
+            T.Grayscale(num_output_channels=3),
+            T.Resize(256),
+            T.CenterCrop(224),
+            T.ToTensor(),
+            T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
 
 
 TASK_MAP = {"mort": 0, "pe": 1, "ph": 2}
@@ -31,19 +59,32 @@ COL_MAP  = {"mort": "mort", "pe": "pe", "ph": "ph"}
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Step-2 bimodal training (LN, LI, NI) for a single task")
+
     ap.add_argument(
         "--task", type=str, default=getattr(CFG, "task_name", "mort"),
         choices=list(TASK_MAP.keys()),
         help="Which label to train (single-task)."
     )
-    ap.add_argument(
-        "--data_root", type=str, default=CFG.data_root,
-        help="Root path that contains MIMIC-IV folder (parquets + splits.json)."
-    )
-    ap.add_argument(
-        "--ckpt_root", type=str, default=CFG.ckpt_root,
-        help="Where to save checkpoints."
-    )
+    ap.add_argument("--data_root", type=str, default=CFG.data_root,
+                    help="Root path that contains MIMIC-IV folder (parquets + splits.json).")
+    ap.add_argument("--ckpt_root", type=str, default=CFG.ckpt_root,
+                    help="Where to save checkpoints.")
+
+    ap.add_argument("--bi_fusion_mode", type=str,
+                    default=str(getattr(CFG, "bi_fusion_mode", "mlp")),
+                    choices=["mlp", "attn"],
+                    help="Bimodal fusion type for LN/LI/NI.")
+    ap.add_argument("--feature_mode", type=str,
+                    default=str(getattr(CFG, "feature_mode", "rich")),
+                    choices=["rich", "concat"],
+                    help="Feature construction for MLP fusion.")
+    ap.add_argument("--bi_layers", type=int,
+                    default=int(getattr(CFG, "bi_layers", 2)),
+                    help="Number of attention blocks if bi_fusion_mode='attn'.")
+    ap.add_argument("--bi_heads", type=int,
+                    default=int(getattr(CFG, "bi_heads", 4)),
+                    help="Number of attention heads if bi_fusion_mode='attn'.")
+
     return ap.parse_args()
 
 
@@ -51,6 +92,8 @@ class ICUStayDataset(Dataset):
     def __init__(self, root: str, split: str = "train"):
         super().__init__()
         self.root = root
+        self.split = split
+        self.img_tfms = build_image_transform(split) 
 
         with open(os.path.join(root, "splits.json")) as f:
             splits = json.load(f)
@@ -70,17 +113,29 @@ class ICUStayDataset(Dataset):
     def __getitem__(self, idx: int):
         stay_id = self.ids[idx]
 
+        # Structured: 48h window binned into 24 rows (2h bins) 
         df_s = self.struct[self.struct.stay_id == stay_id].sort_values("hour")
         xs_np = df_s[self.feat_cols].to_numpy(dtype=np.float32)
         xs = torch.from_numpy(xs_np)  
 
+        # Notes: list of pre-chunked texts (already restricted to 0–48h)
         notes_list = self.notes[self.notes.stay_id == stay_id].text.tolist()
-        img_paths  = self.images[self.images.stay_id == stay_id].image_path.tolist()
 
-        row = self.labels[self.labels.stay_id == stay_id][["mort", "pe", "ph"]].values[0].astype(np.float32)
-        y = torch.tensor(row, dtype=torch.float32)  
+        # Images: exporter already picked ONE selected path per stay
+        df_i = self.images[self.images.stay_id == stay_id]
+        img_paths = df_i.image_path.tolist()[-1:] 
+        
+        # Labels
+        row = (self.labels[self.labels.stay_id == stay_id][["mort","pe","ph"]]
+               .values[0].astype(np.float32))
+        y = torch.tensor(row, dtype=torch.float32)
 
-        return {"stay_id": stay_id, "x_struct": xs, "notes_list": notes_list, "image_paths": img_paths, "y": y}
+        return {"stay_id": stay_id,
+                "x_struct": xs,
+                "notes_list": notes_list,
+                "image_paths": img_paths,
+                "y": y}
+        }
 
 
 def pad_or_trim_struct(x: torch.Tensor, T: int, F: int) -> torch.Tensor:
@@ -90,43 +145,35 @@ def pad_or_trim_struct(x: torch.Tensor, T: int, F: int) -> torch.Tensor:
     pad = torch.zeros(T - t, F, dtype=x.dtype)
     return torch.cat([pad, x], dim=0)
 
-
-def _cxr_to_tensor_medfuse(pil_img: Image.Image) -> torch.Tensor:
-    pil_img = pil_img.convert("L")
-    pil_img = VF.resize(pil_img, 256, antialias=True)
-    pil_img = VF.center_crop(pil_img, 224)
-    x = VF.to_tensor(pil_img)          
-    x = x.repeat(3, 1, 1)              
-    x = VF.normalize(x, IMAGENET_MEAN, IMAGENET_STD)
-    return x
-
-def load_cxr_tensor(paths: List[str]) -> torch.Tensor:
+def load_cxr_tensor(paths, tfms):
     if not paths:
         return torch.zeros(3, 224, 224)
-    p = paths[0] 
+    p = paths[-1]
     try:
-        img = Image.open(p)
-        return _cxr_to_tensor_medfuse(img)
+        with Image.open(p) as img:
+            return tfms(img)
     except Exception:
         return torch.zeros(3, 224, 224)
 
-def collate_fn_factory(tidx: int):
+def collate_fn_factory(tidx: int, img_tfms):
     def _collate(batch):
-        T_len = CFG.structured_seq_len
-        F_dim = CFG.structured_n_feats
+        T_len, F_dim = CFG.structured_seq_len, CFG.structured_n_feats
 
-        xL_batch = torch.stack([pad_or_trim_struct(b["x_struct"], T_len, F_dim) for b in batch], dim=0)
+        xL_batch = torch.stack(
+            [pad_or_trim_struct(b["x_struct"], T_len, F_dim) for b in batch], dim=0
+        )
 
         notes_batch = [
             b["notes_list"] if isinstance(b["notes_list"], list) else [str(b["notes_list"])]
             for b in batch
         ]
 
-        imgs_batch = torch.stack([load_cxr_tensor(b["image_paths"]) for b in batch], dim=0)
+        imgs_batch = torch.stack(
+            [load_cxr_tensor(b["image_paths"], img_tfms) for b in batch], dim=0
+        )
 
-
-        y_all   = torch.stack([b["y"] for b in batch], dim=0)  
-        y_batch = y_all[:, tidx].unsqueeze(1).to(torch.float32)  
+        y_all = torch.stack([b["y"] for b in batch], dim=0)
+        y_batch = y_all[:, tidx].unsqueeze(1).to(torch.float32)
 
         return xL_batch, notes_batch, imgs_batch, y_batch
     return _collate
@@ -147,7 +194,7 @@ def main():
     TCOL  = COL_MAP[TASK]
     ROOT  = os.path.join(args.data_root, "MIMIC-IV")
 
-    # Encoders 
+    # Encoders (frozen in this step)
     behrt, bbert, imgenc = build_encoders(
         EncoderConfig(
             d=CFG.d,
@@ -161,9 +208,18 @@ def main():
             img_agg="last",
         )
     )
-
-    # Pairwise fusion modules + BIMODAL heads (single-logit each)
-    fusion = build_fusions(d=CFG.d, p_drop=CFG.dropout)
+    
+    # Build pairwise fusion modules (LN, LI, NI) [chosen mode], plus heads
+    fusion = build_fusions(
+        d=CFG.d,
+        p_drop=CFG.dropout,
+        feature_mode=args.feature_mode,  
+        bi_fusion_mode=args.bi_fusion_mode,  
+        tri_fusion_mode="mlp",           # or "attn"
+        bi_layers=args.bi_layers,
+        bi_heads=args.bi_heads,                    
+    )
+    
     route_heads: Dict[str, RouteHead] = {
         r: RouteHead(d_in=CFG.d, n_tasks=1, p_drop=CFG.dropout).to(DEVICE)
         for r in ["LN", "LI", "NI"]
@@ -186,13 +242,12 @@ def main():
 
     train_loader = DataLoader(
         train_ds, batch_size=CFG.batch_size, shuffle=True, num_workers=CFG.num_workers,
-        collate_fn=collate_fn_factory(TIDX), pin_memory=IS_CUDA, generator=gen, drop_last=False
+        collate_fn=collate_fn_factory(TIDX, img_tfms=val_ds.img_tfms), pin_memory=IS_CUDA, generator=gen, drop_last=False
     )
     val_loader = DataLoader(
         val_ds, batch_size=CFG.batch_size, shuffle=False, num_workers=CFG.num_workers,
-        collate_fn=collate_fn_factory(TIDX), pin_memory=IS_CUDA, generator=gen, drop_last=False
+        collate_fn=collate_fn_factory(TIDX, img_tfms=val_ds.img_tfms), pin_memory=IS_CUDA, generator=gen, drop_last=False
     )
-
 
     ckpt1_path = os.path.join(args.ckpt_root, f"{TASK}_step1_unimodal.pt")
     ckpt1 = torch.load(ckpt1_path, map_location=DEVICE)
@@ -232,13 +287,13 @@ def main():
             route_heads[k].train()
         behrt.eval(); bbert.eval(); imgenc.eval()
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{CFG.max_epochs_bi} [BI:{TASK}]", dynamic_ncols=True)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{CFG.max_epochs_bi} [BI:{TASK}|{args.bi_fusion_mode}]", dynamic_ncols=True)
         running = 0.0; n_steps = 0
 
         for xL, notes_list, imgs, y in pbar:
             xL   = xL.to(DEVICE, non_blocking=IS_CUDA)
             imgs = imgs.to(DEVICE, non_blocking=IS_CUDA)
-            y    = y.to(DEVICE, non_blocking=IS_CUDA)  
+            y    = y.to(DEVICE, non_blocking=IS_CUDA)
 
             opt.zero_grad(set_to_none=True)
 
@@ -246,7 +301,7 @@ def main():
             with torch.no_grad():
                 zL = behrt(xL)           
                 zN = bbert(notes_list)   
-                zI = imgenc(imgs)        
+                zI = imgenc(imgs)         
 
             # Trainable fusion + heads
             with torch.cuda.amp.autocast(enabled=amp_enabled):
@@ -254,9 +309,9 @@ def main():
                 zLI = fusion["LI"](zL, zI)
                 zNI = fusion["NI"](zN, zI)
 
-                log_LN = route_heads["LN"](zLN)  
-                log_LI = route_heads["LI"](zLI)  
-                log_NI = route_heads["NI"](zNI)  
+                log_LN = route_heads["LN"](zLN)
+                log_LI = route_heads["LI"](zLI)
+                log_NI = route_heads["NI"](zNI)
 
                 bce_kw = {"pos_weight": pos_weight} if (pos_weight is not None) else {}
                 loss = (
@@ -272,8 +327,8 @@ def main():
 
             running += float(loss); n_steps += 1
             pbar.set_postfix(loss=f"{running / max(n_steps,1):.4f}")
-
-
+        
+        # Validation
         for k in ["LN", "LI", "NI"]:
             fusion[k].eval()
             route_heads[k].eval()
@@ -303,9 +358,10 @@ def main():
                 val_loss += float(lval); n_val += 1
 
         val_loss /= max(n_val, 1)
-        print(f"[BI:{TASK}] Val loss: {val_loss:.4f}")
+        print(f"[BI:{TASK}|{args.bi_fusion_mode}] Val loss: {val_loss:.4f}")
 
 
+        # Checkpoint best bimodal fusions + heads
         if val_loss < best_val:
             best_val = val_loss
             ensure_dir(args.ckpt_root)
@@ -321,11 +377,14 @@ def main():
                     "best_val": best_val,
                     "task": TASK,
                     "cfg": vars(CFG),
+                    "bi_fusion_mode": args.bi_fusion_mode,
+                    "feature_mode": args.feature_mode,
+                    "bi_layers": args.bi_layers,
+                    "bi_heads": args.bi_heads,
                 },
                 ckpt_path,
             )
             print(f"[{TASK}] Saved best bimodal heads + fusions -> {ckpt_path}")
-
 
 if __name__ == "__main__":
     main()
