@@ -15,37 +15,33 @@ from routing_and_heads import (
     RouteHead,
     build_fusions,
     FinalConcatHead,
-    RouteGateNet,          
+    RouteGateNet,
     route_availability_mask,
     make_route_inputs,
     concat_routes,
 )
 
+from train_step1_unimodal import ICUStayDataset, pad_or_trim_struct
+
 from PIL import Image
-from torchvision.transforms import functional as VF
+from torchvision import transforms as T
 
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD  = (0.229, 0.224, 0.225)
-
-def _cxr_to_tensor_medfuse(pil_img):
-    pil_img = pil_img.convert("L")
-    pil_img = VF.resize(pil_img, 256, antialias=True)
-    pil_img = VF.center_crop(pil_img, 224)
-    x = VF.to_tensor(pil_img)
-    x = x.repeat(3, 1, 1)
-    x = VF.normalize(x, IMAGENET_MEAN, IMAGENET_STD)
-    return x
-
-def _load_first_cxr(paths):
+def load_cxr_tensor(paths, tfms: T.Compose) -> torch.Tensor:
+    """
+    Load the last available CXR and apply Step-1 transforms.
+    Falls back to a zero tensor if missing/failed.
+    """
     if not paths:
         return torch.zeros(3, 224, 224)
-    p = paths[0]  
+    p = paths[-1]  # consistent with Step-1
     try:
-        img = Image.open(p)
-        return _cxr_to_tensor_medfuse(img)
+        with Image.open(p) as img:
+            return tfms(img)
     except Exception:
         return torch.zeros(3, 224, 224)
-        
+
+
+# Fairness utilities (EDDI) 
 def _group_index(batch_groups: List[dict], key: str, device) -> Dict[str, torch.Tensor]:
     buckets: Dict[str, List[int]] = {}
     for i, meta in enumerate(batch_groups):
@@ -56,7 +52,6 @@ def _group_index(batch_groups: List[dict], key: str, device) -> Dict[str, torch.
 def eddi_sign_agnostic(errors: torch.Tensor, batch_groups: List[dict], keys: List[str]) -> torch.Tensor:
     if errors.numel() == 0:
         return torch.tensor(0.0, device=errors.device)
-
     overall = errors.mean()
     accum = 0.0
     nkeys = 0
@@ -80,11 +75,12 @@ def eddi_sign_agnostic(errors: torch.Tensor, batch_groups: List[dict], keys: Lis
     return accum / nkeys
 
 def eddi_final_from_logits(ylogits: torch.Tensor, y: torch.Tensor, sens: List[dict]) -> torch.Tensor:
-    probs = torch.sigmoid(ylogits).squeeze(1)  
-    err = (probs - y.squeeze(1)).abs()         
+    probs = torch.sigmoid(ylogits).squeeze(1)
+    err = (probs - y.squeeze(1)).abs()
     return eddi_sign_agnostic(err, sens, getattr(CFG, "sensitive_keys", []))
 
 
+# Modality availability -> route availability 
 def build_modality_masks(
     xL: torch.Tensor,
     notes_list: List[List[str]],
@@ -103,8 +99,6 @@ def build_modality_masks(
     return {"L": mL, "N": mN, "I": mI}
 
 
-from train_step1_unimodal import ICUStayDataset, pad_or_trim_struct
-
 def _is_cuda(dev) -> bool:
     return torch.cuda.is_available() and (("cuda" in str(dev)) or (isinstance(dev, torch.device) and dev.type == "cuda"))
 
@@ -114,52 +108,100 @@ def set_requires_grad(module: nn.Module, flag: bool) -> None:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Step-3: Embedding-level fusion with loss-based gates + final concat head")
+    ap = argparse.ArgumentParser(description="Step-3: Trimodal router (7-route gating + final concat head)")
     ap.add_argument("--task", type=str, default=getattr(CFG, "task_name", "mort"), choices=["mort", "pe", "ph"])
-    ap.add_argument("--lambda_fair", type=float, default=getattr(CFG, "lambda_fair", 0.0),
-                    help="Weight for EDDI fairness term on final predictions")
-    ap.add_argument("--gamma", type=float, default=getattr(CFG, "gamma", 1.0),
-                    help="Mix: gamma * BCE(final) + (1-gamma) * EDDI(final)")
+
+    # Gates + fairness
     ap.add_argument("--gate_mode", type=str, default=getattr(CFG, "route_gate_mode", "loss_based"),
                     choices=["loss_based", "learned", "uniform"],
-                    help="How to compute route gates")
+                    help="How to compute route gates (loss_based uses per-route BCE; learned uses RouteGateNet).")
     ap.add_argument("--loss_gate_alpha", type=float, default=getattr(CFG, "loss_gate_alpha", 4.0),
-                    help="Alpha for loss-based gates: softmax(-alpha * BCE_i)")
+                    help="Alpha for loss-based gates: softmax(-alpha * BCE_i) (masked by availability).")
     ap.add_argument("--l2norm_each", action="store_true", default=getattr(CFG, "l2norm_each", False),
-                    help="L2-normalize each route embedding before gating/concat")
+                    help="L2-normalize each route embedding before gating/concat.")
+    ap.add_argument("--lambda_fair", type=float, default=getattr(CFG, "lambda_fair", 0.0),
+                    help="Weight for EDDI fairness term on final predictions.")
+    ap.add_argument("--gamma", type=float, default=getattr(CFG, "gamma", 1.0),
+                    help="Mix: gamma * BCE(final) + (1-gamma) * EDDI(final).")
+
+    # Trainable parts
     ap.add_argument("--train_lni_fusion", action="store_true", default=True,
-                    help="If set, train the LNI fusion block")
+                    help="If set, train the LNI fusion block.")
     ap.add_argument("--train_lni_head_aux", action="store_true", default=True,
-                    help="If set, train the LNI head with a small aux loss so its BCE is meaningful for gates")
+                    help="If set, train the LNI head with a small aux loss so its BCE is meaningful for loss-based gates.")
     ap.add_argument("--aux_lni_weight", type=float, default=0.05,
-                    help="Weight for the auxiliary LNI BCE (if train_lni_head_aux)")
+                    help="Weight for the auxiliary LNI BCE (if --train_lni_head_aux).")
+
+    # Fusion choices (must match routing_and_heads.build_fusions options)
+    ap.add_argument("--feature_mode", type=str,
+                    default=str(getattr(CFG, "feature_mode", "rich")),
+                    choices=["rich", "concat"],
+                    help="Feature construction for MLP fusion. Ignored for attn.")
+    ap.add_argument("--bi_fusion_mode", type=str,
+                    default=str(getattr(CFG, "bi_fusion_mode", "mlp")),
+                    choices=["mlp", "attn"],
+                    help="Bimodal fusion type for LN/LI/NI (only used if you re-train/inspect them).")
+    ap.add_argument("--bi_layers", type=int, default=int(getattr(CFG, "bi_layers", 2)),
+                    help="Attention layers for bi_fusion_mode=attn (ignored for mlp).")
+    ap.add_argument("--bi_heads", type=int, default=int(getattr(CFG, "bi_heads", 4)),
+                    help="Attention heads for bi_fusion_mode=attn (ignored for mlp).")
+
+    ap.add_argument("--tri_fusion_mode", type=str,
+                    default=str(getattr(CFG, "tri_fusion_mode", "mlp")),
+                    choices=["mlp", "attn"],
+                    help="Trimodal fusion type for LNI (this is the one trained in Step-3).")
+    ap.add_argument("--tri_layers", type=int, default=int(getattr(CFG, "tri_layers", 2)),
+                    help="Attention layers for tri_fusion_mode=attn (ignored for mlp).")
+    ap.add_argument("--tri_heads", type=int, default=int(getattr(CFG, "tri_heads", 4)),
+                    help="Attention heads for tri_fusion_mode=attn (ignored for mlp).")
+
     args = ap.parse_args()
-
     TASK = args.task
-
     TASK_MAP = {"mort": 0, "pe": 1, "ph": 2}
     tidx = TASK_MAP[TASK]
 
-    def collate_fn(batch):
+    ROOT = os.path.join(CFG.data_root, "MIMIC-IV")
+    train_ds = ICUStayDataset(ROOT, split="train")
+    val_ds   = ICUStayDataset(ROOT, split="val")
+
+    def collate_fn_train(batch):
         T_len = CFG.structured_seq_len
         F_dim = CFG.structured_n_feats
-
         xL = torch.stack([pad_or_trim_struct(b["x_struct"], T_len, F_dim) for b in batch], dim=0)
-
-        notes = [
-            b["notes_list"] if isinstance(b["notes_list"], list) else [str(b["notes_list"])]
-            for b in batch
-        ]
-
-        imgs = torch.stack([_load_first_cxr(b["image_paths"]) for b in batch], dim=0)
-
+        notes = [b["notes_list"] if isinstance(b["notes_list"], list) else [str(b["notes_list"])] for b in batch]
+        imgs = torch.stack([load_cxr_tensor(b["image_paths"], train_ds.img_tfms) for b in batch], dim=0)
         y_all = torch.stack([b["y"] for b in batch], dim=0)
         y = y_all[:, tidx].unsqueeze(1).to(torch.float32)
-
-        sens = [{} for _ in batch]  
+        sens = [{} for _ in batch]  # placeholder unless you have sensitive attributes
         return xL, notes, imgs, y, sens
 
-    # Encoders
+    def collate_fn_val(batch):
+        T_len = CFG.structured_seq_len
+        F_dim = CFG.structured_n_feats
+        xL = torch.stack([pad_or_trim_struct(b["x_struct"], T_len, F_dim) for b in batch], dim=0)
+        notes = [b["notes_list"] if isinstance(b["notes_list"], list) else [str(b["notes_list"])] for b in batch]
+        imgs = torch.stack([load_cxr_tensor(b["image_paths"], val_ds.img_tfms) for b in batch], dim=0)
+        y_all = torch.stack([b["y"] for b in batch], dim=0)
+        y = y_all[:, tidx].unsqueeze(1).to(torch.float32)
+        sens = [{} for _ in batch]
+        return xL, notes, imgs, y, sens
+
+    from torch.utils.data import DataLoader
+    IS_CUDA = _is_cuda(DEVICE)
+    train_loader = DataLoader(train_ds, batch_size=CFG.batch_size, shuffle=True,
+                              num_workers=CFG.num_workers, collate_fn=collate_fn_train, pin_memory=IS_CUDA)
+    val_loader   = DataLoader(val_ds,   batch_size=CFG.batch_size, shuffle=False,
+                              num_workers=CFG.num_workers, collate_fn=collate_fn_val,   pin_memory=IS_CUDA)
+
+    # Class imbalance (pos_weight for the selected task)
+    try:
+        y_train_np = train_ds.labels[[TASK]].values.astype("float32").reshape(-1)
+        pos = float((y_train_np > 0.5).sum())
+        neg = float(len(y_train_np) - pos)
+        pos_weight = torch.tensor(neg / max(pos, 1.0), dtype=torch.float32, device=DEVICE)
+    except Exception:
+        pos_weight = None
+
     behrt, bbert, imgenc = build_encoders(
         EncoderConfig(
             d=CFG.d,
@@ -174,42 +216,32 @@ def main():
         )
     )
 
-    # Fusion blocks (bimodal + trimodal)
-    fusion = build_fusions(d=CFG.d, p_drop=CFG.dropout)
+    # Build all fusion blocks (bimodals + trimodal) with the chosen modes.
+    fusion = build_fusions(
+        d=CFG.d,
+        p_drop=CFG.dropout,
+        feature_mode=args.feature_mode,     
+        bi_fusion_mode=args.bi_fusion_mode,
+        tri_fusion_mode=args.tri_fusion_mode,  # "mlp" or "attn" 
+        bi_layers=args.bi_layers,
+        bi_heads=args.bi_heads,
+        tri_layers=args.tri_layers,
+        tri_heads=args.tri_heads,
+    )
 
-    # Route heads for all 7 routes (logits used only for: (a) aux train of LNI, (b) computing loss-based gates)
+    # Route heads for all 7 routes (L, N, I, LN, LI, NI, LNI)
     route_heads: Dict[str, RouteHead] = {
         r: RouteHead(d_in=CFG.d, n_tasks=1, p_drop=CFG.dropout).to(DEVICE) for r in ROUTES
     }
 
-    # Final concat head over 7 * d concat
+    # Final concat head over concatenated 7 * d weighted route embeddings
     final_head = FinalConcatHead(d=CFG.d, n_tasks=1, p_drop=CFG.dropout).to(DEVICE)
 
     gate_net = None
     if args.gate_mode == "learned":
         gate_net = RouteGateNet(d=CFG.d, hidden=4 * 256, p_drop=CFG.dropout, use_masks=True).to(DEVICE)
 
-    ROOT = os.path.join(CFG.data_root, "MIMIC-IV")
-    train_ds = ICUStayDataset(ROOT, split="train")
-    val_ds   = ICUStayDataset(ROOT, split="val")
-
-    from torch.utils.data import DataLoader
-    IS_CUDA = _is_cuda(DEVICE)
-    train_loader = DataLoader(train_ds, batch_size=CFG.batch_size, shuffle=True,
-                              num_workers=CFG.num_workers, collate_fn=collate_fn, pin_memory=IS_CUDA)
-    val_loader   = DataLoader(val_ds,   batch_size=CFG.batch_size, shuffle=False,
-                              num_workers=CFG.num_workers, collate_fn=collate_fn, pin_memory=IS_CUDA)
-
-    # Class imbalance (pos_weight)
-    try:
-        y_train_np = train_ds.labels[[TASK]].values.astype("float32").reshape(-1)
-        pos = float((y_train_np > 0.5).sum())
-        neg = float(len(y_train_np) - pos)
-        pos_weight = torch.tensor(neg / max(pos, 1.0), dtype=torch.float32, device=DEVICE)
-    except Exception:
-        pos_weight = None
-
-
+    # Load Step-1 & Step-2 ckpts 
     ckpt1_path = os.path.join(CFG.ckpt_root, f"{TASK}_step1_unimodal.pt")
     ckpt2_path = os.path.join(CFG.ckpt_root, f"{TASK}_step2_bimodal.pt")
     ckpt1 = torch.load(ckpt1_path, map_location=DEVICE)
@@ -227,23 +259,22 @@ def main():
     route_heads["LI"].load_state_dict(ckpt2["LI"], strict=False)
     route_heads["NI"].load_state_dict(ckpt2["NI"], strict=False)
 
-    # Load bimodal fusion blocks if available
+    # Load trained bimodal fusion blocks if present
     if "fusion_LN" in ckpt2: fusion["LN"].load_state_dict(ckpt2["fusion_LN"], strict=False)
     if "fusion_LI" in ckpt2: fusion["LI"].load_state_dict(ckpt2["fusion_LI"], strict=False)
     if "fusion_NI" in ckpt2: fusion["NI"].load_state_dict(ckpt2["fusion_NI"], strict=False)
 
     print(f"[{TASK}] Loaded encoders/heads/fusions from {ckpt1_path} & {ckpt2_path}")
 
-    for k in ["LN", "LI", "NI"]:
-        set_requires_grad(fusion[k], False)
-        fusion[k].eval()
-
-    # Encoders frozen
+    #  Freeze parts as needed 
     for m in (behrt, bbert, imgenc):
         set_requires_grad(m, False)
         m.eval()
 
-    # All existing route heads frozen (used to compute per-route BCE for gates)
+    # Bimodal fusions & their heads used only for per-route logits/losses; keep frozen
+    for k in ["LN", "LI", "NI"]:
+        set_requires_grad(fusion[k], False)
+        fusion[k].eval()
     for r in ["L", "N", "I", "LN", "LI", "NI"]:
         set_requires_grad(route_heads[r], False)
         route_heads[r].eval()
@@ -258,7 +289,6 @@ def main():
         route_heads["LNI"].eval()
 
     final_head.train()
-
     if gate_net is not None:
         gate_net.train()
 
@@ -283,7 +313,7 @@ def main():
 
     best_val = float("inf")
 
-
+    # Train 
     for epoch in range(CFG.max_epochs_tri):
         final_head.train()
         fusion["LNI"].train(args.train_lni_fusion)
@@ -292,7 +322,7 @@ def main():
         if gate_net is not None:
             gate_net.train()
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{CFG.max_epochs_tri} [TRI:{TASK}]", dynamic_ncols=True)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{CFG.max_epochs_tri} [TRI:{TASK}|{args.tri_fusion_mode}]", dynamic_ncols=True)
         running = 0.0; n_steps = 0
 
         for xL, notes_list, imgs, y, sens in pbar:
@@ -303,17 +333,17 @@ def main():
             opt.zero_grad(set_to_none=True)
 
             with torch.cuda.amp.autocast(enabled=amp_enabled):
-                # Frozen encoders -> unimodal embeddings
+                # 1. Frozen encoders -> unimodal embeddings
                 with torch.no_grad():
-                    zL = behrt(xL)               
-                    zN = bbert(notes_list)       
-                    zI = imgenc(imgs)            
+                    zL = behrt(xL)              
+                    zN = bbert(notes_list)      
+                    zI = imgenc(imgs)           
                 z_dict = {"L": zL, "N": zN, "I": zI}
 
-                # Build all 7 route embeddings (using fusion for LN/LI/NI/LNI)
-                routes_emb: Dict[str, torch.Tensor] = make_route_inputs(z_dict, fusion)  
+                # 2. Build all 7 route embeddings with fusion (LN/LI/NI from ckpt; LNI is trainable here)
+                routes_emb: Dict[str, torch.Tensor] = make_route_inputs(z_dict, fusion)
 
-                # Per-route logits (for loss-based gates); all heads frozen except optional LNI
+                # 3. Per-route logits (needed for loss-based gates). All frozen except LNI.
                 logits_per_route: Dict[str, torch.Tensor] = {
                     "L":  route_heads["L"](routes_emb["L"]),
                     "N":  route_heads["N"](routes_emb["N"]),
@@ -321,33 +351,35 @@ def main():
                     "LN": route_heads["LN"](routes_emb["LN"]),
                     "LI": route_heads["LI"](routes_emb["LI"]),
                     "NI": route_heads["NI"](routes_emb["NI"]),
+                    "LNI": route_heads["LNI"](routes_emb["LNI"]),
                 }
-                # Trimodal head (trainable only if aux enabled)
-                logits_per_route["LNI"] = route_heads["LNI"](routes_emb["LNI"])
 
-                # Modality availability mask -> route availability
+                # 4. Route availability mask from modality presence
                 masks = build_modality_masks(xL, notes_list, imgs)
-                avail = route_availability_mask(masks, batch_size=xL.size(0), device=xL.device) 
+                avail = route_availability_mask(masks, batch_size=xL.size(0), device=xL.device)
 
+                # 5. Gates
                 if args.gate_mode == "uniform":
-                    gates = avail / (avail.sum(dim=1, keepdim=True).clamp_min(1.0))  
+                    gates = avail / (avail.sum(dim=1, keepdim=True).clamp_min(1.0))
                 elif args.gate_mode == "learned":
-                    g_raw = gate_net({"L": zL, "N": zN, "I": zI}, masks=masks)  
+                    g_raw = gate_net({"L": zL, "N": zN, "I": zI}, masks=masks)
                     gates = g_raw / (g_raw.sum(dim=1, keepdim=True).clamp_min(1e-6))
-                else: 
+                else:  # loss_based
                     per_route_losses = []
                     for r in ROUTES:
-                        l_i = bce_logits(logits_per_route[r], y, reduction="none").squeeze(1)  
+                        l_i = bce_logits(logits_per_route[r], y, reduction="none").squeeze(1)
                         per_route_losses.append(l_i)
-                    Lmat = torch.stack(per_route_losses, dim=1) 
+                    Lmat = torch.stack(per_route_losses, dim=1)  
                     alpha = float(args.loss_gate_alpha)
+                    # mask by availability in the logit space (log(0) -> -inf)
                     masked_logits = (-alpha * Lmat) + torch.log(avail + 1e-12)
                     gates = torch.softmax(masked_logits, dim=1)  
 
+                # 6. Concatenate weighted route embeddings and predict final logit
                 x_cat, _ = concat_routes(routes_emb, gates=gates, l2norm=args.l2norm_each)  
+                ylogits = final_head(x_cat) 
 
-                ylogits = final_head(x_cat)  
-
+                # 7. Loss = BCE(final) + fairness  
                 bce_final  = bce_logits(ylogits, y, reduction="mean")
                 eddi_final = eddi_final_from_logits(ylogits, y, sens)
                 total = (float(args.gamma) * bce_final) + ((1.0 - float(args.gamma)) * (float(args.lambda_fair) * eddi_final))
@@ -371,7 +403,7 @@ def main():
                 aux_lni=f"{float(aux_lni):.4f}",
             )
 
-
+        # Validation 
         final_head.eval()
         fusion["LNI"].eval()
         route_heads["LNI"].eval()
@@ -388,7 +420,7 @@ def main():
                 zL = behrt(xL); zN = bbert(notes_list); zI = imgenc(imgs)
                 z_dict = {"L": zL, "N": zN, "I": zI}
 
-                routes_emb = make_route_inputs(z_dict, fusion)  
+                routes_emb = make_route_inputs(z_dict, fusion)
 
                 logits_per_route = {
                     "L":  route_heads["L"](routes_emb["L"]),
@@ -425,7 +457,6 @@ def main():
                 eddi_final = eddi_final_from_logits(ylogits, y, sens)
                 lval = (float(args.gamma) * bce_final) + ((1.0 - float(args.gamma)) * (float(args.lambda_fair) * eddi_final))
 
-
                 if args.train_lni_head_aux:
                     lval = lval + float(args.aux_lni_weight) * bce_logits(logits_per_route["LNI"], y, reduction="mean")
 
@@ -433,7 +464,6 @@ def main():
 
         val_loss /= max(n_val, 1)
         print(f"[TRI:{TASK}] Val loss: {val_loss:.4f}")
-
 
         if val_loss < best_val:
             best_val = val_loss
@@ -448,6 +478,9 @@ def main():
                 "l2norm_each": bool(args.l2norm_each),
                 "gamma": float(args.gamma),
                 "lambda_fair": float(args.lambda_fair),
+                "tri_fusion_mode": args.tri_fusion_mode,
+                "tri_layers": int(args.tri_layers),
+                "tri_heads": int(args.tri_heads),
             }
             if args.train_lni_fusion:
                 save_obj["fusion_LNI"] = fusion["LNI"].state_dict()
@@ -456,7 +489,6 @@ def main():
             if gate_net is not None:
                 save_obj["gate_net"] = gate_net.state_dict()
 
-      
             ckpt_out = os.path.join(CFG.ckpt_root, f"{TASK}_step3_concat_gate.pt")
             torch.save(save_obj, ckpt_out)
             print(f"Saved best model -> {ckpt_out}")
