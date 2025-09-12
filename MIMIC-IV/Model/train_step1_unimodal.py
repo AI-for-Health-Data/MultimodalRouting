@@ -15,6 +15,7 @@ import torchvision.transforms as TF
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import functional as VF  
+from torchvision import transforms as T
 
 from env_config import CFG, DEVICE, ensure_dir
 from encoders import EncoderConfig, build_encoders
@@ -25,9 +26,36 @@ TASK_MAP = {"mort": 0, "pe": 1, "ph": 2}
 COL_MAP  = {"mort": "mort", "pe": "pe", "ph": "ph"}
 
 
+from torchvision import transforms as T
+
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 
+def build_image_transform(split: str) -> T.Compose:
+    split = str(split).lower()
+    if split == "train":
+        return T.Compose([
+            T.Grayscale(num_output_channels=3),
+            T.Resize(256),
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomAffine(
+                degrees=10,          
+                translate=(0.05, 0.05),
+                scale=(0.95, 1.05),
+                shear=5,
+            ),
+            T.RandomCrop(224),
+            T.ToTensor(),
+            T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
+    else: 
+        return T.Compose([
+            T.Grayscale(num_output_channels=3),
+            T.Resize(256),
+            T.CenterCrop(224),
+            T.ToTensor(),
+            T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Step-1 Unimodal pretraining (L, N, I) for a single task")
@@ -52,11 +80,12 @@ def parse_args():
     )
     return ap.parse_args()
 
-
 class ICUStayDataset(Dataset):
     def __init__(self, root: str, split: str = "train"):
         super().__init__()
         self.root = root
+        self.split = split
+        self.img_tfms = build_image_transform(split) 
 
         with open(os.path.join(root, "splits.json")) as f:
             splits = json.load(f)
@@ -76,26 +105,28 @@ class ICUStayDataset(Dataset):
     def __getitem__(self, idx: int):
         stay_id = self.ids[idx]
 
-        # Structured: 24h time-series 
+        # Structured: 48h window binned into 24 rows (2h bins) 
         df_s = self.struct[self.struct.stay_id == stay_id].sort_values("hour")
         xs_np = df_s[self.feat_cols].to_numpy(dtype=np.float32)
         xs = torch.from_numpy(xs_np)  
 
-        # Notes: list of texts within first 24h
+        # Notes: list of pre-chunked texts (already restricted to 0–48h)
         notes_list = self.notes[self.notes.stay_id == stay_id].text.tolist()
 
-        # Images: list of image paths 
-        img_paths = self.images[self.images.stay_id == stay_id].image_path.tolist()
+        # Images: exporter already picked ONE selected path per stay
+        df_i = self.images[self.images.stay_id == stay_id]
+        img_paths = df_i.image_path.tolist()[-1:] 
+        
+        # Labels
+        row = (self.labels[self.labels.stay_id == stay_id][["mort","pe","ph"]]
+               .values[0].astype(np.float32))
+        y = torch.tensor(row, dtype=torch.float32)
 
-        row = self.labels[self.labels.stay_id == stay_id][["mort", "pe", "ph"]].values[0].astype(np.float32)
-        y = torch.tensor(row, dtype=torch.float32)  
-
-        return {
-            "stay_id": stay_id,
-            "x_struct": xs,
-            "notes_list": notes_list,
-            "image_paths": img_paths,
-            "y": y,  
+        return {"stay_id": stay_id,
+                "x_struct": xs,
+                "notes_list": notes_list,
+                "image_paths": img_paths,
+                "y": y}
         }
 
 
@@ -106,49 +137,35 @@ def pad_or_trim_struct(x: torch.Tensor, T: int, F: int) -> torch.Tensor:
     pad = torch.zeros(T - t, F, dtype=x.dtype)
     return torch.cat([pad, x], dim=0)
 
-IMG_TFMS = TF.Compose([
-    TF.Resize((224, 224)),
-    TF.ToTensor(),
-])
-
-def _cxr_to_tensor_medfuse(pil_img: Image.Image) -> torch.Tensor:
-    pil_img = pil_img.convert("L")
-    pil_img = VF.resize(pil_img, 256, antialias=True)
-    pil_img = VF.center_crop(pil_img, 224)
-    x = VF.to_tensor(pil_img)        
-    x = x.repeat(3, 1, 1)            
-    x = VF.normalize(x, IMAGENET_MEAN, IMAGENET_STD)
-    return x
-
-
-def load_cxr_tensor(paths: List[str]) -> torch.Tensor:
+def load_cxr_tensor(paths, tfms):
     if not paths:
         return torch.zeros(3, 224, 224)
-    p = paths[0]  
+    p = paths[-1]
     try:
-        img = Image.open(p)
-        return _cxr_to_tensor_medfuse(img)
+        with Image.open(p) as img:
+            return tfms(img)
     except Exception:
         return torch.zeros(3, 224, 224)
-        
-def collate_fn_factory(tidx: int):
-    def _collate(batch):
-        T_len = CFG.structured_seq_len
-        F_dim = CFG.structured_n_feats
 
-        xL_batch = torch.stack([pad_or_trim_struct(b["x_struct"], T_len, F_dim) for b in batch], dim=0)
+def collate_fn_factory(tidx: int, img_tfms):
+    def _collate(batch):
+        T_len, F_dim = CFG.structured_seq_len, CFG.structured_n_feats
+
+        xL_batch = torch.stack(
+            [pad_or_trim_struct(b["x_struct"], T_len, F_dim) for b in batch], dim=0
+        )
 
         notes_batch = [
             b["notes_list"] if isinstance(b["notes_list"], list) else [str(b["notes_list"])]
             for b in batch
         ]
 
-        # MedFuse: last CXR, grayscale->3ch, 256->224, ImageNet normalize
-        imgs_batch = torch.stack([load_cxr_tensor(b["image_paths"]) for b in batch], dim=0)  
+        imgs_batch = torch.stack(
+            [load_cxr_tensor(b["image_paths"], img_tfms) for b in batch], dim=0
+        )
 
-        # extract single task from y
-        y_all = torch.stack([b["y"] for b in batch], dim=0)  
-        y_batch = y_all[:, tidx].unsqueeze(1).to(torch.float32)  
+        y_all = torch.stack([b["y"] for b in batch], dim=0)
+        y_batch = y_all[:, tidx].unsqueeze(1).to(torch.float32)
 
         return xL_batch, notes_batch, imgs_batch, y_batch
     return _collate
@@ -204,7 +221,7 @@ def main():
         batch_size=CFG.batch_size,
         shuffle=True,
         num_workers=CFG.num_workers,
-        collate_fn=collate_fn_factory(TIDX),
+        collate_fn=collate_fn_factory(TIDX, img_tfms=train_ds.img_tfms),
         pin_memory=IS_CUDA,
         generator=gen,
         drop_last=False,
@@ -214,7 +231,7 @@ def main():
         batch_size=CFG.batch_size,
         shuffle=False,
         num_workers=CFG.num_workers,
-        collate_fn=collate_fn_factory(TIDX),
+        collate_fn=collate_fn_factory(TIDX, img_tfms=val_ds.img_tfms),
         pin_memory=IS_CUDA,
         generator=gen,
         drop_last=False,
