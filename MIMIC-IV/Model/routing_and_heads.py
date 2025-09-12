@@ -89,20 +89,90 @@ class TrimodalFusion(nn.Module):
         base = (zL + zN + zI) / 3.0
         return h + self.res_scale * base
 
+# Attention-based bimodal fusion (MulT-ish)
+class _CrossAttnBlock(nn.Module):
+    """One layer of bidirectional cross-attention with residuals + MLP."""
+    def __init__(self, d: int, n_heads: int = 4, p_drop: float = 0.1):
+        super().__init__()
+        self.a2b = nn.MultiheadAttention(embed_dim=d, num_heads=n_heads, dropout=p_drop, batch_first=True)
+        self.b2a = nn.MultiheadAttention(embed_dim=d, num_heads=n_heads, dropout=p_drop, batch_first=True)
+        self.norm_a1 = nn.LayerNorm(d)
+        self.norm_b1 = nn.LayerNorm(d)
+        self.ff_a = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 4*d), nn.GELU(), nn.Dropout(p_drop), nn.Linear(4*d, d))
+        self.ff_b = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 4*d), nn.GELU(), nn.Dropout(p_drop), nn.Linear(4*d, d))
+        self.drop = nn.Dropout(p_drop)
 
-def build_fusions(
-    d: int,
-    p_drop: float = 0.1,
-    feature_mode: str = "rich",
-    hidden: Optional[Sequence[int]] = None,
-) -> Dict[str, nn.Module]:
+    def forward(self, xa: torch.Tensor, xb: torch.Tensor):
+        q = self.norm_a1(xa); k = self.norm_b1(xb)
+        a_ctx, _ = self.a2b(query=q, key=k, value=k, need_weights=False)
+        xa = xa + self.drop(a_ctx)
+        xa = xa + self.drop(self.ff_a(xa))
+        q = self.norm_b1(xb); k = self.norm_a1(xa)
+        b_ctx, _ = self.b2a(query=q, key=k, value=k, need_weights=False)
+        xb = xb + self.drop(b_ctx)
+        xb = xb + self.drop(self.ff_b(xb))
+        return xa, xb
+
+
+class CrossModalEncoder(nn.Module):
+    """Tiny pairwise encoder producing a single d-dim vector via bidirectional cross-attn."""
+    def __init__(self, d: int, n_layers: int = 2, n_heads: int = 4, p_drop: float = 0.1):
+        super().__init__()
+        self.blocks = nn.ModuleList([_CrossAttnBlock(d, n_heads, p_drop) for _ in range(n_layers)])
+        self.pool = nn.Sequential(nn.LayerNorm(2*d), nn.Linear(2*d, d))
+
+    def forward(self, za: torch.Tensor, zb: torch.Tensor) -> torch.Tensor:
+        xa, xb = za.unsqueeze(1), zb.unsqueeze(1)  
+        for blk in self.blocks:
+            xa, xb = blk(xa, xb)
+        h = torch.cat([xa, xb], dim=-1)  
+        return self.pool(h.squeeze(1))   
+
+class TrimodalCrossEncoder(nn.Module):
+    def __init__(self, d: int, n_layers: int = 2, n_heads: int = 4, p_drop: float = 0.1):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            CrossAttnBlock(d, n_heads, p_drop) for _ in range(n_layers)
+        ])
+        # fuse the three tokens after attention
+        self.pool = nn.Sequential(
+            nn.LayerNorm(3*d),
+            nn.Linear(3*d, 4*d), nn.GELU(), nn.Dropout(p_drop),
+            nn.Linear(4*d, d)
+        )
+        self.res_scale = nn.Parameter(torch.tensor(0.5))
+
+    def forward(self, zL, zN, zI):
+        xL, xN, xI = zL.unsqueeze(1), zN.unsqueeze(1), zI.unsqueeze(1)  
+        for blk in self.blocks:
+            # round-robin: L↔N then L↔I then N↔I (order can be tuned)
+            xL, xN = blk(xL, xN)
+            xL, xI = blk(xL, xI)
+            xN, xI = blk(xN, xI)
+        h = torch.cat([xL, xN, xI], dim=-1).squeeze(1)  
+        base = (zL + zN + zI) / 3.0
+        return self.pool(h) + self.res_scale * base
+
+def build_fusions(d, p_drop=0.1, feature_mode="rich",
+                  bi_fusion_mode="mlp", tri_fusion_mode="mlp",
+                  bi_layers=2, bi_heads=4, tri_layers=2, tri_heads=4):
     dev = torch.device(DEVICE)
-    return {
-        "LN":  PairwiseFusion(d=d, hidden=hidden, p_drop=p_drop, feature_mode=feature_mode).to(dev),
-        "LI":  PairwiseFusion(d=d, hidden=hidden, p_drop=p_drop, feature_mode=feature_mode).to(dev),
-        "NI":  PairwiseFusion(d=d, hidden=hidden, p_drop=p_drop, feature_mode=feature_mode).to(dev),
-        "LNI": TrimodalFusion(d=d, hidden=hidden, p_drop=p_drop, feature_mode=feature_mode).to(dev),
-    }
+    if bi_fusion_mode == "attn":
+        LN = CrossModalEncoder(d, n_layers=bi_layers, n_heads=bi_heads, p_drop=p_drop).to(dev)
+        LI = CrossModalEncoder(d, n_layers=bi_layers, n_heads=bi_heads, p_drop=p_drop).to(dev)
+        NI = CrossModalEncoder(d, n_layers=bi_layers, n_heads=bi_heads, p_drop=p_drop).to(dev)
+    else:
+        LN = PairwiseFusion(d, p_drop=p_drop, feature_mode=feature_mode).to(dev)
+        LI = PairwiseFusion(d, p_drop=p_drop, feature_mode=feature_mode).to(dev)
+        NI = PairwiseFusion(d, p_drop=p_drop, feature_mode=feature_mode).to(dev)
+
+    if tri_fusion_mode == "attn":
+        LNI = TrimodalCrossEncoder(d, n_layers=tri_layers, n_heads=tri_heads, p_drop=p_drop).to(dev)
+    else:
+        LNI = TrimodalFusion(d, p_drop=p_drop, feature_mode=feature_mode).to(dev)
+
+    return {"LN": LN, "LI": LI, "NI": NI, "LNI": LNI}
+
 
 
 @torch.no_grad()
