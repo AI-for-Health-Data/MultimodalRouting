@@ -31,6 +31,9 @@ BLOCKS: Dict[str, List[str]] = {
 TASKS: List[str] = ["mort", "pe", "ph"]
 
 
+from dataclasses import dataclass, field
+from typing import List
+
 @dataclass
 class Config:
     d: int = 256
@@ -48,33 +51,49 @@ class Config:
     text_model_name: str = "emilyalsentzer/Bio_ClinicalBERT"
     max_text_len: int = 512
 
-    # Structured sequence (first 24h)
+    # Structured (tabular time series) 
     structured_seq_len: int = 24
     structured_n_feats: int = 128
-    # (optional if you want to expose)
     structured_layers: int = 2
     structured_heads: int = 8
 
-    # Image encoder
+    # Image encoder 
     image_model_name: str = "resnet34"
 
-    # Fairness
-    sensitive_keys: List[str] = field(default_factory=lambda: ["age_group", "race", "ethnicity", "insurance"])
+    # Fairness 
+    sensitive_keys: List[str] = field(
+        default_factory=lambda: ["age_group", "race", "ethnicity", "insurance"]
+    )
     lambda_fair: float = 0.0
 
-    # Routing / fusion
+    # Fusion / routing 
     routing_backend: str = "embedding_concat"
     use_gates: bool = True
-    gamma: float = 1.0
-    loss_gate_alpha: float = 4.0         
-    route_gate_mode: str = "loss_based" 
-    l2norm_each: bool = False           
+
+    # Gate computation and mixing
+    gamma: float = 1.0                 
+    loss_gate_alpha: float = 4.0       
+    route_gate_mode: str = "loss_based"  
+    l2norm_each: bool = False          
+
+    # fusion choices and hyperparams
+    bi_fusion_mode: str = "mlp"        # {"mlp","attn"} for LN/LI/NI (step-2)
+    tri_fusion_mode: str = "mlp"       # {"mlp","attn"} for LNI (step-3)
+    feature_mode: str = "rich"         # {"rich","concat"} (used only when *_fusion_mode=="mlp")
+
+    # Attention-only knobs (ignored when *_fusion_mode=="mlp")
+    bi_layers: int = 2                 # Cross-attn blocks for pairwise fusion
+    bi_heads: int = 4                  # Heads for pairwise cross-attn
+    tri_layers: int = 2                # Cross-attn blocks for trimodal fusion
+    tri_heads: int = 4                 # Heads for trimodal cross-attn
+
+    # Paths & misc 
     data_root: str = "./data"
     ckpt_root: str = "./checkpoints"
     task_name: str = "mort"
 
     use_cudnn_benchmark: bool = True
-    precision_amp: str = "auto"
+    precision_amp: str = "auto"       
     deterministic: bool = False
     seed: int = 42
     verbose: bool = True
@@ -180,7 +199,8 @@ def _coerce_types(d: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def load_cfg(yaml_path: Optional[str] = None, overrides: Optional[Dict[str, Any]] = None) -> Config:
+def load_cfg(yaml_path: Optional[str] = None,
+             overrides: Optional[Dict[str, Any]] = None) -> Config:
     global CFG, DEVICE, TASK2IDX, SELECTED_TASK_IDX
 
     cfg_dict = asdict(Config())
@@ -204,6 +224,7 @@ def load_cfg(yaml_path: Optional[str] = None, overrides: Optional[Dict[str, Any]
                 cfg_dict = _merge(cfg_dict, _coerce_types(blob))
         except Exception:
             pass
+
     if "MIMICIV_DATA_ROOT" in os.environ:
         cfg_dict["data_root"] = os.environ["MIMICIV_DATA_ROOT"]
     if "MIMICIV_CKPT_ROOT" in os.environ:
@@ -213,13 +234,27 @@ def load_cfg(yaml_path: Optional[str] = None, overrides: Optional[Dict[str, Any]
     if "MIMICIV_BACKEND" in os.environ:
         cfg_dict["routing_backend"] = os.environ["MIMICIV_BACKEND"]
 
+    if "MIMICIV_BI_FUSION" in os.environ:
+        cfg_dict["bi_fusion_mode"] = os.environ["MIMICIV_BI_FUSION"]
+    if "MIMICIV_TRI_FUSION" in os.environ:
+        cfg_dict["tri_fusion_mode"] = os.environ["MIMICIV_TRI_FUSION"]
+    if "MIMICIV_FEATURE_MODE" in os.environ:
+        cfg_dict["feature_mode"] = os.environ["MIMICIV_FEATURE_MODE"]
+    if "MIMICIV_BI_LAYERS" in os.environ:
+        cfg_dict["bi_layers"] = int(os.environ["MIMICIV_BI_LAYERS"])
+    if "MIMICIV_BI_HEADS" in os.environ:
+        cfg_dict["bi_heads"] = int(os.environ["MIMICIV_BI_HEADS"])
+    if "MIMICIV_TRI_LAYERS" in os.environ:
+        cfg_dict["tri_layers"] = int(os.environ["MIMICIV_TRI_LAYERS"])
+    if "MIMICIV_TRI_HEADS" in os.environ:
+        cfg_dict["tri_heads"] = int(os.environ["MIMICIV_TRI_HEADS"])
+
     CFG = Config(**cfg_dict)
 
     set_global_seed(int(CFG.seed))
     set_deterministic(bool(CFG.deterministic))
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
     torch.backends.cudnn.benchmark = bool(CFG.use_cudnn_benchmark and not CFG.deterministic)
 
     TASK2IDX = {name: i for i, name in enumerate(TASKS)}
@@ -234,15 +269,16 @@ def load_cfg(yaml_path: Optional[str] = None, overrides: Optional[Dict[str, Any]
 
     return CFG
 
-
 load_cfg(yaml_path=None, overrides=None)
 
 
 def get_device() -> torch.device:
+    """Return current torch.device matching global DEVICE string."""
     return torch.device(DEVICE)
 
 
 def bfloat16_supported() -> bool:
+    """Lightweight runtime check for bfloat16 tensor creation."""
     try:
         _ = torch.tensor([1.0], dtype=torch.bfloat16)
         return True
