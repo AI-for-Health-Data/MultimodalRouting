@@ -341,19 +341,18 @@ class BioClinBERTEncoder(nn.Module):
 
 
 class ImageEncoder(nn.Module):
-    def __init__(self, d: int, dropout: float = 0.0) -> None:
+    def __init__(self, d: int, dropout: float = 0.0, img_agg: Literal["last", "mean", "attention"] = "last") -> None:
         super().__init__()
         import torchvision
         backbone = torchvision.models.resnet34(weights=None)
-        modules = list(backbone.children())[:-2]   
+        modules = list(backbone.children())[:-2]
         self.backbone = nn.Sequential(*modules)
         self.gap = nn.AdaptiveAvgPool2d((1, 1))
         self.out_channels = 512
 
-        # MedFuse projection head: Linear 512 -> d 
         self.proj = nn.Linear(self.out_channels, d)
         self.drop = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
-
+        self.img_agg = img_agg  
 
     @torch.no_grad()
     def _encode_one_tensor(self, x: torch.Tensor) -> torch.Tensor:
