@@ -127,7 +127,7 @@ def loadmetadata(args):
 
     groups = cxr_merged_icustays_AP.groupby('stay_id')
     print("Final dicom_id in merge cxr:", len(cxr_merged_icustays_AP["dicom_id"]))
-    cxr_merged_icustays_AP.to_csv("cxr_debug_partial_pheno.csv", index=False)
+    cxr_merged_icustays_AP.to_csv("cxr_debug_pheno.csv", index=False)
 
     groups_selected = []
     for group in groups:
@@ -158,20 +158,31 @@ def load_cxr_ehr(args, ehr_train_ds, ehr_val_ds, cxr_train_ds, cxr_val_ds, ehr_t
     train_meta_with_labels = cxr_merged_icustays.merge(splits_labels_train, how='inner', on='stay_id')
     val_meta_with_labels = cxr_merged_icustays.merge(splits_labels_val, how='inner', on='stay_id')
     test_meta_with_labels = cxr_merged_icustays.merge(splits_labels_test, how='inner', on='stay_id')
-    
-    # Paired csv output
-    # train_meta_with_labels.to_csv("train_metadata_pheno.csv", index=False)
-    # val_meta_with_labels.to_csv("val_metadata_pheno.csv", index=False)
-    # test_meta_with_labels.to_csv("test_metadata_pheno.csv", index=False)
+
+    # Paired csv output    
+    if args.task == 'in-hospital-mortality':
+        train_meta_with_labels.to_csv("train_metadata_mortality.csv", index=False)
+        val_meta_with_labels.to_csv("val_metadata_mortality.csv", index=False)
+        test_meta_with_labels.to_csv("test_metadata_mortality.csv", index=False)
+        else:
+            train_meta_with_labels.to_csv("train_metadata_pheno.csv", index=False)
+            val_meta_with_labels.to_csv("val_metadata_pheno.csv", index=False)
+            test_meta_with_labels.to_csv("test_metadata_pheno.csv", index=False)
     
     train_ds = MIMIC_CXR_EHR(args, train_meta_with_labels, ehr_train_ds, cxr_train_ds)
     val_ds = MIMIC_CXR_EHR(args, val_meta_with_labels, ehr_val_ds, cxr_val_ds, split='val')
     test_ds = MIMIC_CXR_EHR(args, test_meta_with_labels, ehr_test_ds, cxr_test_ds, split='test')
     
     # Partial csv output
-    # manifest_partial_ehr_cxr(train_ds, "train", listfile_df=splits_labels_train)
-    # manifest_partial_ehr_cxr(val_ds,   "val",  listfile_df=splits_labels_val)
-    # manifest_partial_ehr_cxr(test_ds,  "test", listfile_df=splits_labels_test)
+    
+    if args.task == 'in-hospital-mortality':
+        manifest_partial_ehr_cxr(train_ds, "train", listfile_df=splits_labels_train, base="metadata_partial_mortality", all_name="partial_ehr_cxr_all_mortality.csv")
+        manifest_partial_ehr_cxr(val_ds,   "val",  listfile_df=splits_labels_val, base="metadata_partial_mortality", all_name="partial_ehr_cxr_all_mortality.csv")
+        manifest_partial_ehr_cxr(test_ds,  "test", listfile_df=splits_labels_test, base="metadata_partial_mortality", all_name="partial_ehr_cxr_all_mortality.csv")
+        else:
+            manifest_partial_ehr_cxr(train_ds, "train", listfile_df=splits_labels_train)
+            manifest_partial_ehr_cxr(val_ds,   "val",  listfile_df=splits_labels_val)
+            manifest_partial_ehr_cxr(test_ds,  "test", listfile_df=splits_labels_test)
 
 #     printPrevalence(train_meta_with_labels, args)
 #     printPrevalence(val_meta_with_labels, args)
