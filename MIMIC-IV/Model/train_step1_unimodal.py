@@ -11,22 +11,17 @@ from tqdm.auto import tqdm
 from PIL import Image
 
 import torch
-import torchvision.transforms as TF
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torchvision.transforms import functional as VF  
 from torchvision import transforms as T
 
 from env_config import CFG, DEVICE, ensure_dir
 from encoders import EncoderConfig, build_encoders
 from routing_and_heads import RouteHead
 
-
-TASK_MAP = {"mort": 0, "pe": 1, "ph": 2}
-COL_MAP  = {"mort": "mort", "pe": "pe", "ph": "ph"}
-
-
-from torchvision import transforms as T
+# Mortality-only 
+TASK_MAP = {"mort": 0}
+COL_MAP  = {"mort": "mort"}
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
@@ -39,7 +34,7 @@ def build_image_transform(split: str) -> T.Compose:
             T.Resize(256),
             T.RandomHorizontalFlip(p=0.5),
             T.RandomAffine(
-                degrees=10,          
+                degrees=10,
                 translate=(0.05, 0.05),
                 scale=(0.95, 1.05),
                 shear=5,
@@ -48,7 +43,7 @@ def build_image_transform(split: str) -> T.Compose:
             T.ToTensor(),
             T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ])
-    else: 
+    else:
         return T.Compose([
             T.Grayscale(num_output_channels=3),
             T.Resize(256),
@@ -58,7 +53,7 @@ def build_image_transform(split: str) -> T.Compose:
         ])
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Step-1 Unimodal pretraining (L, N, I) for a single task")
+    ap = argparse.ArgumentParser(description="Step-1 Unimodal pretraining (L, N, I) for mortality")
     ap.add_argument(
         "--task",
         type=str,
@@ -85,17 +80,30 @@ class ICUStayDataset(Dataset):
         super().__init__()
         self.root = root
         self.split = split
-        self.img_tfms = build_image_transform(split) 
+        self.img_tfms = build_image_transform(split)
 
         with open(os.path.join(root, "splits.json")) as f:
             splits = json.load(f)
         self.ids = list(splits[split])
 
-        self.struct = pd.read_parquet(os.path.join(root, "structured_24h.parquet"))
-        self.notes  = pd.read_parquet(os.path.join(root, "notes_24h.parquet"))
-        self.images = pd.read_parquet(os.path.join(root, "images_24h.parquet"))
-        self.labels = pd.read_parquet(os.path.join(root, "labels.parquet"))
+        # Required files
+        struct_fp = os.path.join(root, "structured_24h.parquet")
+        notes_fp  = os.path.join(root, "notes_24h.parquet")
+        images_fp = os.path.join(root, "images_24h.parquet")
+        labels_fp = os.path.join(root, "labels_mort.parquet") 
 
+        if not os.path.exists(labels_fp):
+            raise FileNotFoundError(
+                f"Missing {labels_fp}. Create it with ['stay_id','mort'] "
+                f"(use hospital_expire_flag)."
+            )
+
+        self.struct = pd.read_parquet(struct_fp)
+        self.notes  = pd.read_parquet(notes_fp) if os.path.exists(notes_fp) else pd.DataFrame(columns=["stay_id","text"])
+        self.images = pd.read_parquet(images_fp) if os.path.exists(images_fp) else pd.DataFrame(columns=["stay_id","image_path"])
+        self.labels = pd.read_parquet(labels_fp)
+
+        # Feature columns for structured time series
         base_cols = {"stay_id", "hour"}
         self.feat_cols = [c for c in self.struct.columns if c not in base_cols]
 
@@ -105,30 +113,37 @@ class ICUStayDataset(Dataset):
     def __getitem__(self, idx: int):
         stay_id = self.ids[idx]
 
-        # Structured: 48h window binned into 24 rows (2h bins) 
+        # Structured: 48h window binned into 24 rows (2h bins)
         df_s = self.struct[self.struct.stay_id == stay_id].sort_values("hour")
         xs_np = df_s[self.feat_cols].to_numpy(dtype=np.float32)
         xs = torch.from_numpy(xs_np)  
 
         # Notes: list of pre-chunked texts (already restricted to 0–48h)
-        notes_list = self.notes[self.notes.stay_id == stay_id].text.tolist()
+        notes_list = []
+        if not self.notes.empty:
+            notes_list = self.notes[self.notes.stay_id == stay_id].text.tolist()
 
-        # Images: exporter already picked ONE selected path per stay
-        df_i = self.images[self.images.stay_id == stay_id]
-        img_paths = df_i.image_path.tolist()[-1:] 
-        
-        # Labels
-        row = (self.labels[self.labels.stay_id == stay_id][["mort","pe","ph"]]
-               .values[0].astype(np.float32))
-        y = torch.tensor(row, dtype=torch.float32)
+        # Images: take last path if present, else empty -> zero image later
+        img_paths = []
+        if not self.images.empty:
+            df_i = self.images[self.images.stay_id == stay_id]
+            img_paths = df_i.image_path.tolist()[-1:]
 
-        return {"stay_id": stay_id,
-                "x_struct": xs,
-                "notes_list": notes_list,
-                "image_paths": img_paths,
-                "y": y}
+        # Mortality label
+        lab_row = self.labels.loc[self.labels.stay_id == stay_id, ["mort"]]
+        if lab_row.empty:
+            # Default to 0 if label missing 
+            y = torch.tensor([0.0], dtype=torch.float32)
+        else:
+            y = torch.tensor(lab_row.values[0].astype("float32"), dtype=torch.float32) 
+
+        return {
+            "stay_id": stay_id,
+            "x_struct": xs,
+            "notes_list": notes_list,
+            "image_paths": img_paths,
+            "y": y,
         }
-
 
 def pad_or_trim_struct(x: torch.Tensor, T: int, F: int) -> torch.Tensor:
     t = x.shape[0]
@@ -164,21 +179,21 @@ def collate_fn_factory(tidx: int, img_tfms):
             [load_cxr_tensor(b["image_paths"], img_tfms) for b in batch], dim=0
         )
 
-        y_all = torch.stack([b["y"] for b in batch], dim=0)
-        y_batch = y_all[:, tidx].unsqueeze(1).to(torch.float32)
+        # y is [1] per sample -> collate to [B,1]; TIDX==0 for 'mort'
+        y_all = torch.stack([b["y"] for b in batch], dim=0) 
+        y_batch = y_all[:, tidx].unsqueeze(1).to(torch.float32)  
 
         return xL_batch, notes_batch, imgs_batch, y_batch
     return _collate
 
-
 def main():
     args  = parse_args()
     TASK  = args.task
-    TIDX  = TASK_MAP[TASK]
-    TCOL  = COL_MAP[TASK]
+    TIDX  = TASK_MAP[TASK] 
+    TCOL  = COL_MAP[TASK]  
     ROOT  = os.path.join(args.data_root, "MIMIC-IV")
 
-    # Build encoders with CFG (shared d); ImageEncoder uses MedFuse-style head in encoders.py
+    # Encoders
     behrt, bbert, imgenc = build_encoders(
         EncoderConfig(
             d=CFG.d,
@@ -202,19 +217,24 @@ def main():
     train_ds = ICUStayDataset(ROOT, split="train")
     val_ds   = ICUStayDataset(ROOT, split="val")
 
-    # Compute scalar pos_weight for class imbalance on the selected task
+    # Class imbalance weighting
     try:
-        y_train_np = train_ds.labels[[TCOL]].values.astype("float32").reshape(-1)
+        lab_train = pd.read_parquet(os.path.join(ROOT, "labels_mort.parquet"))
+        with open(os.path.join(ROOT, "splits.json")) as f:
+            splits = json.load(f)
+        train_ids = set(splits["train"])
+        y_train_np = lab_train[lab_train.stay_id.isin(train_ids)][[TCOL]].values.astype("float32").reshape(-1)
         pos = float((y_train_np > 0.5).sum())
         neg = float(len(y_train_np) - pos)
         pos_weight = torch.tensor(neg / max(pos, 1.0), dtype=torch.float32, device=DEVICE)
     except Exception:
         pos_weight = None
 
-    IS_CUDA = torch.cuda.is_available() and (("cuda" in str(DEVICE)) or (isinstance(DEVICE, torch.device) and DEVICE.type == "cuda"))
+    IS_CUDA = torch.cuda.is_available() and (
+        ("cuda" in str(DEVICE)) or (isinstance(DEVICE, torch.device) and DEVICE.type == "cuda")
+    )
 
-    gen = torch.Generator()
-    gen.manual_seed(42)
+    gen = torch.Generator().manual_seed(42)
 
     train_loader = DataLoader(
         train_ds,
@@ -272,16 +292,15 @@ def main():
 
             with torch.cuda.amp.autocast(enabled=amp_enabled):
                 # Encoders -> embeddings
-                zL = behrt(xL)                 
-                zN = bbert(notes_list)         
-                zI = imgenc(imgs)              
+                zL = behrt(xL)
+                zN = bbert(notes_list)
+                zI = imgenc(imgs)
 
                 # Unimodal heads -> single-logit per sample
-                logits_L = route_heads["L"](zL)  
-                logits_N = route_heads["N"](zN)  
-                logits_I = route_heads["I"](zI)  
+                logits_L = route_heads["L"](zL)
+                logits_N = route_heads["N"](zN)
+                logits_I = route_heads["I"](zI)
 
-                # BCE over the three unimodal routes (mean)
                 bce_kwargs = {"pos_weight": pos_weight} if (pos_weight is not None) else {}
                 loss_L = F.binary_cross_entropy_with_logits(logits_L, y, **bce_kwargs)
                 loss_N = F.binary_cross_entropy_with_logits(logits_N, y, **bce_kwargs)
@@ -347,7 +366,6 @@ def main():
                 ckpt_path,
             )
             print(f"Saved best unimodal checkpoint -> {ckpt_path}")
-
 
 if __name__ == "__main__":
     main()
