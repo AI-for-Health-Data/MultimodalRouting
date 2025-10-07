@@ -11,14 +11,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Optional deps
 try:
     import lightning as L  
-except Exception:
+except Exception:  
     L = None
 
 try:
     import yaml  
-except Exception:
+except Exception:  
     yaml = None
 
 
@@ -36,6 +37,7 @@ from typing import List
 
 @dataclass
 class Config:
+    # Core dims / optimization
     d: int = 256
     dropout: float = 0.1
     lr: float = 2e-4
@@ -51,35 +53,35 @@ class Config:
     text_model_name: str = "emilyalsentzer/Bio_ClinicalBERT"
     max_text_len: int = 512
 
-    # Structured (tabular time series) 
+    # Structured (tabular time series)
     structured_seq_len: int = 24
     structured_n_feats: int = 128
     structured_layers: int = 2
     structured_heads: int = 8
 
-    # Image encoder 
+    # Image encoder
     image_model_name: str = "resnet34"
 
-    # Fairness 
+    # Fairness
     sensitive_keys: List[str] = field(
         default_factory=lambda: ["age_group", "race", "ethnicity", "insurance"]
     )
     lambda_fair: float = 0.0
 
-    # Fusion / routing 
+    # Fusion / routing
     routing_backend: str = "embedding_concat"
     use_gates: bool = True
 
     # Gate computation and mixing
-    gamma: float = 1.0                 
-    loss_gate_alpha: float = 4.0       
-    route_gate_mode: str = "loss_based"  
-    l2norm_each: bool = False          
+    gamma: float = 1.0                 # mix between BCE and fairness
+    loss_gate_alpha: float = 4.0       # alpha for loss-based gates
+    route_gate_mode: str = "loss_based"  # {"loss_based","learned","uniform"}
+    l2norm_each: bool = False
 
-    # fusion choices and hyperparams
+    # Fusion choices and hyperparams
     bi_fusion_mode: str = "mlp"        # {"mlp","attn"} for LN/LI/NI (step-2)
     tri_fusion_mode: str = "mlp"       # {"mlp","attn"} for LNI (step-3)
-    feature_mode: str = "rich"         # {"rich","concat"} (used only when *_fusion_mode=="mlp")
+    feature_mode: str = "rich"         # {"rich","concat"} when *_fusion_mode=="mlp"
 
     # Attention-only knobs (ignored when *_fusion_mode=="mlp")
     bi_layers: int = 2                 # Cross-attn blocks for pairwise fusion
@@ -87,25 +89,23 @@ class Config:
     tri_layers: int = 2                # Cross-attn blocks for trimodal fusion
     tri_heads: int = 4                 # Heads for trimodal cross-attn
 
-    # Paths & misc 
+    # Paths & misc
     data_root: str = "./data"
     ckpt_root: str = "./checkpoints"
     task_name: str = "mort"
 
     use_cudnn_benchmark: bool = True
-    precision_amp: str = "auto"       
+    precision_amp: str = "auto"        # {"auto","fp16","bf16","fp32","off"}
     deterministic: bool = False
     seed: int = 42
     verbose: bool = True
 
-    alpha: float = 4.0
 
-
+# Global state (populated by load_cfg at import)
 CFG: Config = Config()
 DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 TASK2IDX: Dict[str, int] = {name: i for i, name in enumerate(TASKS)}
 SELECTED_TASK_IDX: int = TASK2IDX.get(CFG.task_name, 0)
-
 
 def set_global_seed(seed: int) -> None:
     random.seed(seed)
@@ -120,26 +120,37 @@ def set_deterministic(enabled: bool) -> None:
     except Exception:
         pass
     torch.backends.cudnn.deterministic = bool(enabled)
-    if enabled:
-        torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.benchmark = bool(not enabled and CFG.use_cudnn_benchmark)
 
 
 def amp_autocast_dtype(precision_amp: str) -> Optional[torch.dtype]:
+    """
+    Pick an autocast dtype based on config. If 'off' or 'fp32', returns None.
+    If 'auto', prefers fp16 on CUDA, otherwise bf16 when available.
+    """
     p = (precision_amp or "auto").lower()
+    if p in {"fp32", "off"}:
+        return None
     if p == "fp16":
         return torch.float16
     if p == "bf16":
         return torch.bfloat16
-    if p == "fp32":
-        return None
+    # auto
     if torch.cuda.is_available():
         return torch.float16
     return torch.bfloat16 if hasattr(torch, "bfloat16") else None
 
 
 def autocast_context() -> torch.autocast:
+    """
+    Returns an autocast context manager with the right settings.
+    Use:
+        with autocast_context():
+            ...
+    """
     dtype = amp_autocast_dtype(CFG.precision_amp)
     if dtype is None:
+        # Disabled autocast (fp32)
         return torch.autocast(
             device_type="cuda" if DEVICE == "cuda" else "cpu",
             dtype=torch.float32,
@@ -190,7 +201,8 @@ def _coerce_types(d: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 return x
         return x
-    out = {}
+
+    out: Dict[str, Any] = {}
     for k, v in (d or {}).items():
         if isinstance(v, list):
             out[k] = [conv(e) for e in v]
@@ -201,10 +213,19 @@ def _coerce_types(d: Dict[str, Any]) -> Dict[str, Any]:
 
 def load_cfg(yaml_path: Optional[str] = None,
              overrides: Optional[Dict[str, Any]] = None) -> Config:
+    """
+    Loads CFG from (in priority order):
+      1) defaults in Config()
+      2) YAML file (if provided)
+      3) 'overrides' dict (if provided)
+      4) environment variables (MIMICIV_*)
+    Also initializes DEVICE, seeds, cuDNN flags, and ensures dirs exist.
+    """
     global CFG, DEVICE, TASK2IDX, SELECTED_TASK_IDX
 
-    cfg_dict = asdict(Config())
+    cfg_dict: Dict[str, Any] = asdict(Config())
 
+    # YAML
     if yaml_path and os.path.isfile(yaml_path):
         if yaml is None:
             raise RuntimeError("YAML path provided but PyYAML is not installed.")
@@ -214,9 +235,11 @@ def load_cfg(yaml_path: Optional[str] = None,
             raise ValueError(f"Config YAML at {yaml_path} must be a mapping.")
         cfg_dict = _merge(cfg_dict, _coerce_types(y))
 
+    # Overrides
     if overrides:
         cfg_dict = _merge(cfg_dict, _coerce_types(overrides))
 
+    # Env overrides
     if "MIMICIV_CFG_JSON" in os.environ:
         try:
             blob = json.loads(os.environ["MIMICIV_CFG_JSON"])
@@ -225,47 +248,52 @@ def load_cfg(yaml_path: Optional[str] = None,
         except Exception:
             pass
 
-    if "MIMICIV_DATA_ROOT" in os.environ:
-        cfg_dict["data_root"] = os.environ["MIMICIV_DATA_ROOT"]
-    if "MIMICIV_CKPT_ROOT" in os.environ:
-        cfg_dict["ckpt_root"] = os.environ["MIMICIV_CKPT_ROOT"]
-    if "MIMICIV_TASK" in os.environ:
-        cfg_dict["task_name"] = os.environ["MIMICIV_TASK"]
-    if "MIMICIV_BACKEND" in os.environ:
-        cfg_dict["routing_backend"] = os.environ["MIMICIV_BACKEND"]
+    env_map = {
+        "MIMICIV_DATA_ROOT": ("data_root", str),
+        "MIMICIV_CKPT_ROOT": ("ckpt_root", str),
+        "MIMICIV_TASK": ("task_name", str),
+        "MIMICIV_BACKEND": ("routing_backend", str),
+        "MIMICIV_BI_FUSION": ("bi_fusion_mode", str),
+        "MIMICIV_TRI_FUSION": ("tri_fusion_mode", str),
+        "MIMICIV_FEATURE_MODE": ("feature_mode", str),
+        "MIMICIV_BI_LAYERS": ("bi_layers", int),
+        "MIMICIV_BI_HEADS": ("bi_heads", int),
+        "MIMICIV_TRI_LAYERS": ("tri_layers", int),
+        "MIMICIV_TRI_HEADS": ("tri_heads", int),
+    }
+    for env_key, (cfg_key, caster) in env_map.items():
+        if env_key in os.environ:
+            try:
+                cfg_dict[cfg_key] = caster(os.environ[env_key])
+            except Exception:
+                cfg_dict[cfg_key] = os.environ[env_key]
 
-    if "MIMICIV_BI_FUSION" in os.environ:
-        cfg_dict["bi_fusion_mode"] = os.environ["MIMICIV_BI_FUSION"]
-    if "MIMICIV_TRI_FUSION" in os.environ:
-        cfg_dict["tri_fusion_mode"] = os.environ["MIMICIV_TRI_FUSION"]
-    if "MIMICIV_FEATURE_MODE" in os.environ:
-        cfg_dict["feature_mode"] = os.environ["MIMICIV_FEATURE_MODE"]
-    if "MIMICIV_BI_LAYERS" in os.environ:
-        cfg_dict["bi_layers"] = int(os.environ["MIMICIV_BI_LAYERS"])
-    if "MIMICIV_BI_HEADS" in os.environ:
-        cfg_dict["bi_heads"] = int(os.environ["MIMICIV_BI_HEADS"])
-    if "MIMICIV_TRI_LAYERS" in os.environ:
-        cfg_dict["tri_layers"] = int(os.environ["MIMICIV_TRI_LAYERS"])
-    if "MIMICIV_TRI_HEADS" in os.environ:
-        cfg_dict["tri_heads"] = int(os.environ["MIMICIV_TRI_HEADS"])
-
+    # Construct Config
     CFG = Config(**cfg_dict)
 
+    # Seed & determinism
     set_global_seed(int(CFG.seed))
     set_deterministic(bool(CFG.deterministic))
 
+    # Device / cuDNN flags
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     torch.backends.cudnn.benchmark = bool(CFG.use_cudnn_benchmark and not CFG.deterministic)
 
+    # Task mapping
     TASK2IDX = {name: i for i, name in enumerate(TASKS)}
     SELECTED_TASK_IDX = TASK2IDX.get(CFG.task_name, 0)
 
+    # Ensure paths exist
     ensure_dir(CFG.ckpt_root)
     ensure_dir(CFG.data_root)
 
     if CFG.verbose:
         print(f"[env_config] Device: {DEVICE}")
-        print(f"[env_config] CFG: {json.dumps(asdict(CFG), indent=2)}")
+        try:
+            print(f"[env_config] CFG: {json.dumps(asdict(CFG), indent=2)}")
+        except TypeError:
+            # In case something non-serializable sneaks in
+            print("[env_config] CFG loaded (json serialization skipped)")
 
     return CFG
 
