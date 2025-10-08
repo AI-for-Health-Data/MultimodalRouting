@@ -19,19 +19,11 @@ from torchvision import transforms as T
 from env_config import CFG, DEVICE, ROUTES
 from encoders import EncoderConfig, build_encoders
 from routing_and_heads import (
-    # existing (sample-level) pieces
     RouteHead,
     build_fusions,
-    FinalConcatHead,
     RouteGateNet,
     route_availability_mask,
     make_route_inputs,
-    concat_routes,
-    # classwise (per-phenotype) pieces
-    LearnedClasswiseGateNet,
-    compute_loss_based_classwise_gates,
-    FinalConcatHeadClasswise,
-    concat_routes_classwise,
 )
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
