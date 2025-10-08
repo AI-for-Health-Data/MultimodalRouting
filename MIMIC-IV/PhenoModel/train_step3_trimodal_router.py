@@ -24,7 +24,16 @@ from routing_and_heads import (
     RouteGateNet,
     route_availability_mask,
     make_route_inputs,
+    concat_routes,                
+    FinalConcatHead,               
+    LearnedClasswiseGateNet,      
+    compute_loss_based_classwise_gates,  
+    FinalConcatHeadClasswise,      
+    concat_routes_classwise,       
+    build_capsule_inputs,
 )
+from PhenoModel.capsule_layers import CapsuleFC   
+
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
