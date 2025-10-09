@@ -38,7 +38,7 @@ from typing import List
 @dataclass
 class Config:
     # Core dims / optimization
-    d: int = 256
+    d: int = 768
     dropout: float = 0.1
     lr: float = 2e-4
     batch_size: int = 16
