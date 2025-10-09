@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from env_config import CFG, ROUTES, DEVICE
-
+from encoders import EncoderConfig, build_encoders
 
 
 class _MLP(nn.Module):
