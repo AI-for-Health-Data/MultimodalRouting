@@ -7,16 +7,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from env_config import DEVICE  
-
-
+from env_config import DEVICE
 
 def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """
-    x:    [B, T, D]
-    mask: [B, T] (1=keep, 0=pad)
-    returns [B, D]
-    """
     denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
     return (x * mask.unsqueeze(-1)).sum(dim=1) / denom
 
@@ -30,6 +23,7 @@ def _ensure_2d_mask(mask: Optional[torch.Tensor], B: int, T: int, device) -> tor
     if mask.dim() == 1:
         return mask.unsqueeze(0).expand(B, -1).contiguous().float()
     return mask.float()
+
 
 class BEHRTLabEncoder(nn.Module):
     def __init__(self,
@@ -98,6 +92,7 @@ class BEHRTLabEncoder(nn.Module):
             z = _masked_mean(h, m)
         return z
 
+
 class BioClinBERTEncoder(nn.Module):
     def __init__(
         self,
@@ -124,7 +119,7 @@ class BioClinBERTEncoder(nn.Module):
         self.hf_available = False
         self.tokenizer = None
         self.bert = None
-        hidden = 768 
+        hidden = 768
 
         try:
             from transformers import AutoTokenizer, AutoModel
@@ -235,7 +230,7 @@ class BioClinBERTEncoder(nn.Module):
         with torch.inference_mode(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
             self.bert.eval()
             out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-            cls = out.last_hidden_state[:, 0]  
+            cls = out.last_hidden_state[:, 0]
         return cls
 
     @staticmethod
@@ -252,10 +247,6 @@ class BioClinBERTEncoder(nn.Module):
         max_total_chunks: int = 32,
         chunk_bs: int = 16,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns (Hpad:[B,Smax,D_out], M:[B,Smax])
-        S is the number of CLS chunks across truncated/overflowed notes per patient.
-        """
         device = self._device()
         patients = self._normalize_input(batch_notes)
 
@@ -283,9 +274,9 @@ class BioClinBERTEncoder(nn.Module):
                 cls_list: List[torch.Tensor] = []
                 for start in range(0, len(token_windows), chunk_bs):
                     end = min(start + chunk_bs, len(token_windows))
-                    cls_hidden = self._encode_token_windows_to_cls(token_windows[start:end])  
-                    # Project to out_dim 
-                    cls_proj = self.drop(self.proj(cls_hidden))  
+                    cls_hidden = self._encode_token_windows_to_cls(token_windows[start:end])
+                    # Project to out_dim
+                    cls_proj = self.drop(self.proj(cls_hidden))
                     cls_list.append(cls_proj)
 
                 cls_all = torch.cat(cls_list, dim=0) if cls_list else torch.zeros(0, self.out_dim, device=device)
@@ -355,8 +346,8 @@ class BioClinBERTEncoder(nn.Module):
                 cls_list: List[torch.Tensor] = []
                 for start in range(0, len(token_batches), chunk_bs):
                     end = min(start + chunk_bs, len(token_batches))
-                    cls_hidden = self._encode_token_windows_to_cls(token_batches[start:end])  
-                    cls_proj = self.drop(self.proj(cls_hidden)) 
+                    cls_hidden = self._encode_token_windows_to_cls(token_batches[start:end])
+                    cls_proj = self.drop(self.proj(cls_hidden))
                     cls_list.append(cls_proj)
 
                 cls_all = torch.cat(cls_list, dim=0) if cls_list else torch.zeros(0, self.out_dim, device=device)
@@ -379,9 +370,6 @@ class BioClinBERTEncoder(nn.Module):
         return Hpad, M
 
     def forward(self, notes_or_chunks: Union[List[str], List[List[str]]]) -> torch.Tensor:
-        """
-        Returns [B, out_dim] pooled over notes/chunks using mean or attention.
-        """
         is_prechunked = (
             isinstance(notes_or_chunks, list)
             and len(notes_or_chunks) > 0
@@ -395,10 +383,11 @@ class BioClinBERTEncoder(nn.Module):
         if self.attn is None or (M.sum(dim=1) == 0).any():
             return _masked_mean(H, M)
 
-        scores = self.attn(H).squeeze(-1)                                 
+        scores = self.attn(H).squeeze(-1)
         scores = scores.masked_fill(M < 0.5, torch.finfo(scores.dtype).min)
-        w = torch.softmax(scores, dim=1)                                   
-        return (w.unsqueeze(-1) * H).sum(dim=1)                           
+        w = torch.softmax(scores, dim=1)
+        return (w.unsqueeze(-1) * H).sum(dim=1)
+
 
 class ImageEncoder(nn.Module):
     def __init__(self, d: int, dropout: float = 0.0, img_agg: Literal["last", "mean", "attention"] = "last") -> None:
@@ -430,13 +419,6 @@ class ImageEncoder(nn.Module):
         self,
         x: Union[torch.Tensor, List[torch.Tensor], List[List[torch.Tensor]]]
     ) -> torch.Tensor:
-        """
-        Supports:
-          - x: [3,H,W]  -> [D]
-          - x: [B,3,H,W]-> [B,D]
-          - x: List[tensor] (len B, each [3,H,W]) -> [B,D]
-          - x: List[List[tensor]] -> last image per case -> [B,D]
-        """
         device = next(self.parameters()).device
 
         if isinstance(x, torch.Tensor):
@@ -454,7 +436,7 @@ class ImageEncoder(nn.Module):
             if len(x) == 0:
                 return torch.zeros(0, self.proj.out_features, device=device)
             # Stack and run in one pass
-            xs = torch.stack(x, dim=0).to(device)  # [B,3,H,W]
+            xs = torch.stack(x, dim=0).to(device)  
             h = self.backbone(xs)
             h = self.gap(h).flatten(1)
             return self.drop(self.proj(h))
@@ -498,45 +480,11 @@ class ImageEncoder(nn.Module):
 
     def unfreeze_backbone(self) -> None:
         for p in self.backbone.parameters():
-            p.requires_grad = True
-
-
-
-class CrossAttentionBlock(nn.Module):
-    def __init__(self, d: int, n_heads: int = 8, dropout: float = 0.1) -> None:
-        super().__init__()
-        self.attn = nn.MultiheadAttention(d, num_heads=n_heads, dropout=dropout, batch_first=True)
-        self.norm1 = nn.LayerNorm(d)
-        self.ff = nn.Sequential(
-            nn.Linear(d, 4 * d),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(4 * d, d),
-            nn.Dropout(dropout),
-        )
-        self.norm2 = nn.LayerNorm(d)
-
-    def forward(
-        self,
-        X: torch.Tensor,              
-        Y: torch.Tensor,              
-        key_mask: Optional[torch.Tensor] = None,   
-        query_mask: Optional[torch.Tensor] = None, 
-    ) -> torch.Tensor:
-        # MultiheadAttention expects True for pads
-        kpm = (key_mask < 0.5) if key_mask is not None else None  
-        # attn output
-        H, _ = self.attn(query=X, key=Y, value=Y, key_padding_mask=kpm, need_weights=False)
-        X = self.norm1(X + H)
-        X2 = self.ff(X)
-        X = self.norm2(X + X2)
-        if query_mask is not None:
-            X = X * query_mask.unsqueeze(-1)
-        return X
+        	p.requires_grad = True
 
 
 class PairwiseMulTHead(nn.Module):
-    def __init__(self, d: int, n_heads: int = 8, n_layers: int = 1, dropout: float = 0.1, feature_mode: str = "rich"):
+    def __init__(self, d: int, n_heads: int = 8, n_layers: int = 0, dropout: float = 0.1, feature_mode: str = "concat"):
         super().__init__()
         self.feature_mode = feature_mode
         self.layers_ab = nn.ModuleList([CrossAttentionBlock(d, n_heads, dropout) for _ in range(n_layers)])
@@ -553,18 +501,21 @@ class PairwiseMulTHead(nn.Module):
 
     def forward(
         self,
-        A: torch.Tensor, mA: torch.Tensor,   
-        B: torch.Tensor, mB: torch.Tensor,   
+        A: torch.Tensor, mA: torch.Tensor,
+        B: torch.Tensor, mB: torch.Tensor,
     ) -> torch.Tensor:
-        Ha = A
-        Hb = B
-        for blk in self.layers_ab:
-            Ha = blk(Ha, Hb, key_mask=mB, query_mask=mA)
-        for blk in self.layers_ba:
-            Hb = blk(Hb, Ha, key_mask=mA, query_mask=mB)
-
-        za = _masked_mean(Ha, mA)  
-        zb = _masked_mean(Hb, mB)  
+        if len(self.layers_ab) == 0 and len(self.layers_ba) == 0:
+            za = _masked_mean(A, mA)
+            zb = _masked_mean(B, mB)
+        else:
+            Ha = A
+            Hb = B
+            for blk in self.layers_ab:
+                Ha = blk(Ha, Hb, key_mask=mB, query_mask=mA)
+            for blk in self.layers_ba:
+                Hb = blk(Hb, Ha, key_mask=mA, query_mask=mB)
+            za = _masked_mean(Ha, mA)
+            zb = _masked_mean(Hb, mB)
 
         if self.feature_mode == "concat":
             x = torch.cat([za, zb], dim=-1)
@@ -575,11 +526,11 @@ class PairwiseMulTHead(nn.Module):
 
         h = self.fuse(x)
         base = 0.5 * (za + zb)
-        return h + self.res_scale * base  # [B, D]
+        return h + self.res_scale * base  
 
 
 class TrimodalMulTHead(nn.Module):
-    def __init__(self, d: int, n_heads: int = 8, n_layers: int = 1, dropout: float = 0.1, feature_mode: str = "rich"):
+    def __init__(self, d: int, n_heads: int = 8, n_layers: int = 0, dropout: float = 0.1, feature_mode: str = "concat"):
         super().__init__()
         self.feature_mode = feature_mode
         self.l_from_ni = nn.ModuleList([CrossAttentionBlock(d, n_heads, dropout) for _ in range(n_layers)])
@@ -598,27 +549,28 @@ class TrimodalMulTHead(nn.Module):
 
     def forward(
         self,
-        L: torch.Tensor, mL: torch.Tensor,  
-        N: torch.Tensor, mN: torch.Tensor,  
-        I: torch.Tensor, mI: torch.Tensor,  
+        L: torch.Tensor, mL: torch.Tensor,
+        N: torch.Tensor, mN: torch.Tensor,
+        I: torch.Tensor, mI: torch.Tensor,
     ) -> torch.Tensor:
-        # concat helper
-        def cat2(A, mA, B, mB):
-            return torch.cat([A, B], dim=1), torch.cat([mA, mB], dim=1)
+        if len(self.l_from_ni) == 0 and len(self.n_from_li) == 0 and len(self.i_from_ln) == 0:
+            HL, HN, HI = L, N, I
+        else:
+            def cat2(A, mA, B, mB):
+                return torch.cat([A, B], dim=1), torch.cat([mA, mB], dim=1)
+            NI, mNI = cat2(N, mN, I, mI)
+            LI, mLI = cat2(L, mL, I, mI)
+            LN, mLN = cat2(L, mL, N, mN)
 
-        NI, mNI = cat2(N, mN, I, mI)
-        LI, mLI = cat2(L, mL, I, mI)
-        LN, mLN = cat2(L, mL, N, mN)
-
-        HL = L
-        for blk in self.l_from_ni:
-            HL = blk(HL, NI, key_mask=mNI, query_mask=mL)
-        HN = N
-        for blk in self.n_from_li:
-            HN = blk(HN, LI, key_mask=mLI, query_mask=mN)
-        HI = I
-        for blk in self.i_from_ln:
-            HI = blk(HI, LN, key_mask=mLN, query_mask=mI)
+            HL = L
+            for blk in self.l_from_ni:
+                HL = blk(HL, NI, key_mask=mNI, query_mask=mL)
+            HN = N
+            for blk in self.n_from_li:
+                HN = blk(HN, LI, key_mask=mLI, query_mask=mN)
+            HI = I
+            for blk in self.i_from_ln:
+                HI = blk(HI, LN, key_mask=mLN, query_mask=mI)
 
         zL = _masked_mean(HL, mL)
         zN = _masked_mean(HN, mN)
@@ -635,7 +587,7 @@ class TrimodalMulTHead(nn.Module):
 
         h = self.fuse(x)
         base = (zL + zN + zI) / 3.0
-        return h + self.res_scale * base  
+        return h + self.res_scale * base
 
 
 class RouteActivation(nn.Module):
@@ -644,18 +596,19 @@ class RouteActivation(nn.Module):
         self.net = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.net(x))  
+        return torch.sigmoid(self.net(x))
 
 
+# Multimodal feature extractor (concat-only defaults)
 
 @dataclass
 class MulTConfig:
     d: int = 256
     dropout: float = 0.1
     n_heads: int = 8
-    n_layers_pair: int = 1
-    n_layers_tri: int = 1
-    feature_mode: str = "rich"  # "rich" | "concat"
+    n_layers_pair: int = 0            # concat-only by default
+    n_layers_tri: int = 0             # concat-only by default
+    feature_mode: str = "concat"      # "concat" 
     unimodal_pool: Literal["mean", "last"] = "mean"
 
 
@@ -678,7 +631,7 @@ class MultimodalFeatureExtractor(nn.Module):
         self.act_NI  = RouteActivation(d)
         self.act_LNI = RouteActivation(d)
 
-        self.unim_ln = nn.LayerNorm(d)  
+        self.unim_ln = nn.LayerNorm(d)
 
     def _pool_uni(self, X: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
         if self.cfg.unimodal_pool == "last":
@@ -692,17 +645,17 @@ class MultimodalFeatureExtractor(nn.Module):
         N_seq: torch.Tensor, mN: torch.Tensor,
         I_seq: torch.Tensor, mI: torch.Tensor,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        # Unimodal
+        # Unimodal pooled embeddings
         zL = self.unim_ln(self._pool_uni(L_seq, mL))
         zN = self.unim_ln(self._pool_uni(N_seq, mN))
         zI = self.unim_ln(self._pool_uni(I_seq, mI))
 
-        # Bimodal
+        # Bimodal (concat-only unless user enables attention via cfg)
         zLN = self.pair_LN(L_seq, mL, N_seq, mN)
         zLI = self.pair_LI(L_seq, mL, I_seq, mI)
         zNI = self.pair_NI(N_seq, mN, I_seq, mI)
 
-        # Trimodal
+        # Trimodal (concat-only unless user enables attention via cfg)
         zLNI = self.tri_LNI(L_seq, mL, N_seq, mN, I_seq, mI)
 
         route_embs: Dict[str, torch.Tensor] = {
@@ -718,7 +671,6 @@ class MultimodalFeatureExtractor(nn.Module):
             "LNI": self.act_LNI(zLNI),
         }
         return route_embs, route_act
-
 
 
 @dataclass
@@ -783,9 +735,9 @@ def build_multimodal_feature_extractor(
     d: int,
     dropout: float = 0.1,
     n_heads: int = 8,
-    n_layers_pair: int = 1,
-    n_layers_tri: int = 1,
-    feature_mode: str = "rich",
+    n_layers_pair: int = 0,            # concat-only by default
+    n_layers_tri: int = 0,             # concat-only by default
+    feature_mode: str = "concat",      # concat-only by default
     unimodal_pool: Literal["mean", "last"] = "mean",
 ) -> MultimodalFeatureExtractor:
     cfg = MulTConfig(
@@ -800,14 +752,13 @@ def build_multimodal_feature_extractor(
     dev = torch.device(DEVICE)
     return MultimodalFeatureExtractor(cfg).to(dev)
 
-
 @torch.no_grad()
 def encode_all_routes_from_batch(
     behrt: BEHRTLabEncoder,
     bbert: BioClinBERTEncoder,
     imgenc: ImageEncoder,
     extractor: MultimodalFeatureExtractor,
-    xL: torch.Tensor,                              
+    xL: torch.Tensor,                             
     notes_list: Union[List[str], List[List[str]]], 
     imgs: Union[List[torch.Tensor], List[List[torch.Tensor]]],
     mL: Optional[torch.Tensor] = None,
