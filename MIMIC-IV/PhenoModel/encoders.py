@@ -1,3 +1,4 @@
+# MIMIC-IV/PhenoModel/encoders.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -25,6 +26,10 @@ def _ensure_2d_mask(mask: Optional[torch.Tensor], B: int, T: int, device: torch.
 
 
 class BEHRTLabEncoder(nn.Module):
+    """
+    Simple transformer encoder over structured time series (labs/vitals), with
+    sinusoidal positional encodings and 'last'/'mean' pooling.
+    """
     def __init__(
         self,
         n_feats: int,
@@ -33,7 +38,7 @@ class BEHRTLabEncoder(nn.Module):
         n_heads: int = 8,
         dropout: float = 0.1,
         pool: Literal["last", "mean"] = "last",
-        max_len_pos: int = 512,   
+        max_len_pos: int = 512,
         use_input_layernorm: bool = False,
     ) -> None:
         super().__init__()
@@ -61,9 +66,8 @@ class BEHRTLabEncoder(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # sinusoidal table (expanded if needed)
-        pos = self._build_sinusoidal_pos(max_len_pos, d)         
-        self.register_buffer("pos_table", pos, persistent=False)  
+        pos = self._build_sinusoidal_pos(max_len_pos, d)
+        self.register_buffer("pos_table", pos, persistent=False)
 
     @staticmethod
     def _build_sinusoidal_pos(L: int, d: int) -> torch.Tensor:
@@ -78,7 +82,7 @@ class BEHRTLabEncoder(nn.Module):
         if self.pos_table is None or self.pos_table.size(0) < T or self.pos_table.device != device:
             L = max(T, 2 * T, 512)
             self.pos_table = self._build_sinusoidal_pos(L, self.d).to(device)
-        return self.pos_table[:T]  
+        return self.pos_table[:T]
 
     def _ensure_mask(self, mask: Optional[torch.Tensor], B: int, T: int, device: torch.device) -> torch.Tensor:
         if mask is None:
@@ -95,7 +99,7 @@ class BEHRTLabEncoder(nn.Module):
         x = self.in_norm(x)
         h = self.input_proj(x)                                      # [B, T, d]
         pos = self._ensure_pos_len(T, dev).unsqueeze(0)             # [1, T, d]
-        h = h + pos                                                 
+        h = h + pos
         src_key_padding_mask = (M < 0.5)                            # True = pad
         h = self.enc(h, src_key_padding_mask=src_key_padding_mask)  # [B, T, d]
         h = self.out(h)                                             # [B, T, d]
@@ -118,7 +122,11 @@ class BEHRTLabEncoder(nn.Module):
             z = (H * M.unsqueeze(-1)).sum(dim=1) / denom            # [B, d]
         return z
 
+
 class BioClinBERTEncoder(nn.Module):
+    """
+    Clinical note encoder with optional attention pooling across note/chunk CLS vectors.
+    """
     def __init__(
         self,
         model_name: str,
@@ -130,7 +138,7 @@ class BioClinBERTEncoder(nn.Module):
         attn_hidden: int = 256,
         device: Optional[torch.device] = None,
         project_to_d: bool = True,
-        chunk_stride: int = 64, 
+        chunk_stride: int = 64,
     ) -> None:
         super().__init__()
         self.model_name = model_name
@@ -235,7 +243,7 @@ class BioClinBERTEncoder(nn.Module):
 
         self.bert.eval()
         out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        return out.last_hidden_state[:, 0]  
+        return out.last_hidden_state[:, 0]  # CLS
 
     @staticmethod
     def _normalize_input(batch_notes: Union[Sequence[str], Sequence[Sequence[str]]]) -> List[List[str]]:
@@ -379,13 +387,18 @@ class BioClinBERTEncoder(nn.Module):
         if self.attn is None or (M.sum(dim=1) == 0).any():
             return _masked_mean(H, M)
 
-        scores = self.attn(H).squeeze(-1)                          # [B, S]
+        scores = self.attn(H).squeeze(-1)                           # [B, S]
         scores = scores.masked_fill(M < 0.5, torch.finfo(scores.dtype).min)
-        w = torch.softmax(scores, dim=1)                            # [B, S]
-        return (w.unsqueeze(-1) * H).sum(dim=1)                     # [B, out_dim]
+        w = torch.softmax(scores, dim=1)                             # [B, S]
+        return (w.unsqueeze(-1) * H).sum(dim=1)                      # [B, out_dim]
 
 
 class ImageEncoder(nn.Module):
+    """
+    ResNet34 feature extractor with GAP + linear projection to dimension d.
+    Accepts a single image tensor [3,H,W], a batch [B,3,H,W], a list of tensors,
+    or a list-of-lists (sequence per sample). Default aggregation is 'last'.
+    """
     def __init__(self, d: int, dropout: float = 0.0, img_agg: Literal["last", "mean", "attention"] = "last") -> None:
         super().__init__()
         import torchvision
@@ -420,7 +433,7 @@ class ImageEncoder(nn.Module):
         if isinstance(x, torch.Tensor):
             if x.dim() == 3:
                 return self._encode_one_tensor(x)
-            elif x.dim() == 4:  
+            elif x.dim() == 4:
                 x = x.to(device)
                 h = self.backbone(x)
                 h = self.gap(h).flatten(1)
@@ -431,7 +444,6 @@ class ImageEncoder(nn.Module):
         if isinstance(x, list) and (len(x) == 0 or isinstance(x[0], torch.Tensor)):
             if len(x) == 0:
                 return torch.zeros(0, self.proj.out_features, device=device)
-            # Stack and run in one pass
             xs = torch.stack(x, dim=0).to(device)
             h = self.backbone(xs)
             h = self.gap(h).flatten(1)
@@ -473,13 +485,14 @@ class ImageEncoder(nn.Module):
         for p in self.backbone.parameters():
             p.requires_grad = True
 
+
 @dataclass
 class EncoderConfig:
     d: int = 256
     dropout: float = 0.1
     # structured
-    structured_seq_len: int = 24         
-    structured_n_feats: int = 128        
+    structured_seq_len: int = 24          # kept for config parity; not required by BEHRT
+    structured_n_feats: int = 128
     structured_layers: int = 2
     structured_heads: int = 8
     structured_pool: Literal["last", "mean"] = "last"
@@ -501,7 +514,6 @@ def build_encoders(
     behrt = BEHRTLabEncoder(
         n_feats=cfg.structured_n_feats,
         d=cfg.d,
-        seq_len=cfg.structured_seq_len,
         n_layers=cfg.structured_layers,
         n_heads=cfg.structured_heads,
         dropout=cfg.dropout,
