@@ -101,7 +101,7 @@ class PhenoCapsuleHead(nn.Module):
             primary_pose = self.primary_squash(primary_pose)
             primary_act = self.primary_act(z).clamp_(0.0, 1.0)  # [B, 7]
 
-        # ---- Capsule routing (returns interactions too) ----
+        # Capsule routing 
         # class_pose:      [B, K, d_class]
         # class_act:       [B, K]
         # q:               [B, 7, K]
