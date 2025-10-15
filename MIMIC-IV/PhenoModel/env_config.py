@@ -9,8 +9,7 @@ from typing import List, Dict, Optional, Any
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
+import torch.nn.functional as F 
 try:
     import lightning as L  
 except Exception:
@@ -29,111 +28,113 @@ BLOCKS: Dict[str, List[str]] = {
     "tri": ["LNI"],
 }
 
+# Single task (phenotyping)
 task = "ph"
 
 @dataclass
 class Config:
     d: int = 256
     dropout: float = 0.1
+
     lr: float = 2e-4
     weight_decay: float = 1e-2
-    optimizer: str = "adamw" 
+    optimizer: str = "adamw"
     grad_clip_norm: float = 1.0
+
     task_name: str = "ph"
 
     batch_size: int = 16
     num_workers: int = 4
+
     max_epochs_uni: int = 5
     max_epochs_bi: int = 5
     max_epochs_tri: int = 5
-    steps_per_epoch_hint: int = 500 
+    steps_per_epoch_hint: int = 500
     ema_decay: float = 0.98
 
-    precision_amp: str = "auto"       
+    precision_amp: str = "auto"        
     deterministic: bool = False
     use_cudnn_benchmark: bool = True
     seed: int = 42
     verbose: bool = True
     use_compile: bool = False          
 
- 
     # Text
     text_model_name: str = "emilyalsentzer/Bio_ClinicalBERT"
     max_text_len: int = 512
-    text_note_agg: str = "mean"       # {"mean"} -> BioClinBERTEncoder.note_agg
-    max_notes_concat: int = 8         # #notes per patient before chunking
+    text_note_agg: str = "mean"        
+    max_notes_concat: int = 8         
 
-    # Structured time series (labs/vitals)
-    structured_seq_len: int = 24
-    structured_n_feats: int = 128
+    # Structured EHR (2h bins, dynamic length)
+    structured_seq_len: int = 24       
+    structured_n_feats: int = 128      
     structured_layers: int = 2
     structured_heads: int = 8
-    structured_pool: str = "last"    
+    structured_pool: str = "last"      
 
     # Image
-    image_model_name: str = "resnet34"         
-    image_agg: str = "last"                    
+    image_model_name: str = "resnet34" 
+    image_agg: str = "last"            
 
-    # Routing / fusion (concat + MLP by default)
     routing_backend: str = "embedding_concat"  
     use_gates: bool = True
 
     # Gate computation & mixing
-    route_gate_mode: str = "loss_based" 
-    gamma: float = 1.0                  
+    route_gate_mode: str = "loss_based"  
+    gamma: float = 1.0                   
     loss_gate_alpha: float = 4.0         
     l2norm_each: bool = False            
 
-    # Fusion choices (used by routing_and_heads.py)
-    bi_fusion_mode: str = "mlp"         
-    tri_fusion_mode: str = "mlp"        
-    feature_mode: str = "concat"          
+    # Fusion choices
+    bi_fusion_mode: str = "mlp"
+    tri_fusion_mode: str = "mlp"
+    feature_mode: str = "concat"         
 
-    # Per-route head MLP hidden size(s) (concat+MLP)
+    # Per-route head MLP hidden dims
     route_head_hidden: int = 256
     final_head_hidden: int = 256
 
-    # Capsule phenotyping head
 
     num_phenotypes: int = 25
-    capsule_in_n_capsules: int = 7           # matches 7 routes (L,N,I,LN,LI,NI,LNI)
-    capsule_in_d_capsules: int = 256         # usually = d (route embed dim)
-    capsule_out_n_capsules: int = 25         # = num_phenotypes
-    capsule_out_d_capsules: int = 16         # pose dimension per phenotype capsule
-    capsule_iters: int = 3                   # routing iterations
-    capsule_dp: float = 0.1                  # dropout within capsule layer
-    capsule_act_type: str = "EM"             # {"EM","ONES"}; EM for routing activations
-    capsule_uniform_routing: bool = False    # force uniform routing (debug/ablation)
-    capsule_small_std: bool = True           # keep identity nonlinearity for interpretability
-    capsule_dim_pose_to_vote: int = 0        # reserved for alternative votes (kept for API)
+    capsule_in_n_capsules: int = 7            # 7 routes
+    capsule_in_d_capsules: int = 256          # = d (route embed size)
+    capsule_out_n_capsules: int = 25          # = num_phenotypes
+    capsule_out_d_capsules: int = 16          # phenotype pose dim
+    capsule_iters: int = 3                    # routing iterations
+    capsule_dp: float = 0.1                   # dropout inside capsule
+    capsule_act_type: str = "EM"              
+    capsule_uniform_routing: bool = False     # hard-uniform for ablation/debug
+    capsule_small_std: bool = True            # identity nonlinearity for interpretability
+    capsule_dim_pose_to_vote: int = 0         # API placeholder
     capsule_uniform_routing_coefficient: bool = False
-
 
     sensitive_keys: List[str] = field(
         default_factory=lambda: ["age_group", "race", "ethnicity", "insurance"]
     )
     lambda_fair: float = 0.0
 
+
     data_root: str = "./data"
     ckpt_root: str = "./checkpoints"
     cache_root: str = "./.cache"
 
-    # Logging / checkpoints
     log_every_n_steps: int = 50
     save_every_n_epochs: int = 1
     monitor_metric: str = "val_auroc"
     monitor_mode: str = "max"
 
-    # Compat alias 
+    # Legacy alias (kept for env compat)
     alpha: float = 4.0
 
-
-# Global live config & device
 CFG: Config = Config()
 DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 TASK2IDX: Dict[str, int] = {"ph": 0}
+
+
 def get_selected_task_idx() -> int:
-    return 0
+    return TASK2IDX["ph"]
+
+
 SELECTED_TASK_IDX: int = get_selected_task_idx()
 
 
@@ -146,7 +147,7 @@ def set_global_seed(seed: int) -> None:
 
 def set_deterministic(enabled: bool) -> None:
     try:
-        torch.use_deterministic_algorithms(bool(enabled))  
+        torch.use_deterministic_algorithms(bool(enabled))
     except Exception:
         pass
     torch.backends.cudnn.deterministic = bool(enabled)
@@ -169,17 +170,10 @@ def amp_autocast_dtype(precision_amp: str) -> Optional[torch.dtype]:
 
 def autocast_context() -> torch.autocast:
     dtype = amp_autocast_dtype(CFG.precision_amp)
+    dev_type = "cuda" if DEVICE == "cuda" else "cpu"
     if dtype is None:
-        return torch.autocast(
-            device_type="cuda" if DEVICE == "cuda" else "cpu",
-            dtype=torch.float32,
-            enabled=False,
-        )
-    return torch.autocast(
-        device_type="cuda" if DEVICE == "cuda" else "cpu",
-        dtype=dtype,
-        enabled=True,
-    )
+        return torch.autocast(device_type=dev_type, dtype=torch.float32, enabled=False)
+    return torch.autocast(device_type=dev_type, dtype=dtype, enabled=True)
 
 
 def is_cuda_device(dev) -> bool:
@@ -220,6 +214,7 @@ def _coerce_types(d: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 return x
         return x
+
     out: Dict[str, Any] = {}
     for k, v in (d or {}).items():
         if isinstance(v, list):
@@ -231,10 +226,6 @@ def _coerce_types(d: Dict[str, Any]) -> Dict[str, Any]:
 
 def load_cfg(yaml_path: Optional[str] = None,
              overrides: Optional[Dict[str, Any]] = None) -> Config:
-    """
-    Create the process-wide CFG from defaults + YAML + overrides + env.
-    Also sets DEVICE, seeds, and cudnn options.
-    """
     global CFG, DEVICE, TASK2IDX, SELECTED_TASK_IDX
 
     cfg_dict = asdict(Config())
@@ -259,7 +250,6 @@ def load_cfg(yaml_path: Optional[str] = None,
         except Exception:
             pass
 
-    # Common discrete env overrides
     env_map_simple = {
         "MIMICIV_DATA_ROOT": "data_root",
         "MIMICIV_CKPT_ROOT": "ckpt_root",
@@ -287,11 +277,13 @@ def load_cfg(yaml_path: Optional[str] = None,
     if "MIMICIV_TRI_HEADS" in os.environ:
         cfg_dict["tri_heads"] = int(os.environ["MIMICIV_TRI_HEADS"])
 
+    # Phenotype count override
     if "MIMICIV_PHENO_K" in os.environ:
         k = int(os.environ["MIMICIV_PHENO_K"])
         cfg_dict["num_phenotypes"] = k
         cfg_dict["capsule_out_n_capsules"] = k
 
+    # Lock to phenotyping task
     if cfg_dict.get("task_name") != "ph":
         if cfg_dict.get("task_name") is not None:
             print(f"[env_config] Only 'ph' is supported; overriding task_name='{cfg_dict['task_name']}' -> 'ph'")
@@ -314,18 +306,24 @@ def load_cfg(yaml_path: Optional[str] = None,
 
     if CFG.verbose:
         print(f"[env_config] Device: {DEVICE}")
-        print(f"[env_config] CFG: {json.dumps(asdict(CFG), indent=2)}")
+        try:
+            cfg_json = json.dumps(asdict(CFG), indent=2)
+        except Exception:
+            cfg_json = str(CFG)
+        print(f"[env_config] CFG: {cfg_json}")
 
     return CFG
 
+
 load_cfg(yaml_path=None, overrides=None)
+
 
 def get_device() -> torch.device:
     return torch.device(DEVICE)
 
 
 def bfloat16_supported() -> bool:
-    """Lightweight runtime check for bfloat16 tensor creation."""
+    """Best-effort runtime check for bfloat16 tensor creation."""
     try:
         _ = torch.tensor([1.0], dtype=torch.bfloat16)
         return True
