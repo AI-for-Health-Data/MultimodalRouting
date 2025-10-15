@@ -35,17 +35,20 @@ class _MLP(nn.Module):
 
 
 class PairwiseFusion(nn.Module):
+    """
+    z_ab = MLP([z_a || z_b]) (+ small residual)
+    """
     def __init__(
         self,
         d: int,
         hidden: Optional[Sequence[int]] = None,
         p_drop: float = 0.1,
-        feature_mode: str = "concat", 
+        feature_mode: str = "concat",  # {"concat","rich"}; project uses "concat"
     ):
         super().__init__()
         assert feature_mode in {"concat", "rich"}
         self.feature_mode = feature_mode
-        in_dim = 2 * d if feature_mode == "concat" else 4 * d  
+        in_dim = 2 * d if feature_mode == "concat" else 4 * d
         self.mlp = _MLP(in_dim, d, hidden=hidden, p_drop=p_drop)
         self.res_scale = nn.Parameter(torch.tensor(0.5))
 
@@ -62,17 +65,20 @@ class PairwiseFusion(nn.Module):
 
 
 class TrimodalFusion(nn.Module):
+    """
+    z_abc = MLP([z_a || z_b || z_c]) (+ small residual)
+    """
     def __init__(
         self,
         d: int,
         hidden: Optional[Sequence[int]] = None,
         p_drop: float = 0.1,
-        feature_mode: str = "concat",  
+        feature_mode: str = "concat",  # {"concat","rich"}; project uses "concat"
     ):
         super().__init__()
         assert feature_mode in {"concat", "rich"}
         self.feature_mode = feature_mode
-        in_dim = 3 * d if feature_mode == "concat" else 7 * d 
+        in_dim = 3 * d if feature_mode == "concat" else 7 * d
         self.mlp = _MLP(in_dim, d, hidden=hidden, p_drop=p_drop)
         self.res_scale = nn.Parameter(torch.tensor(0.5))
 
@@ -88,7 +94,6 @@ class TrimodalFusion(nn.Module):
         h = self.mlp(x)
         base = (zL + zN + zI) / 3.0
         return h + self.res_scale * base
-
 
 def build_fusions(
     d: int,
@@ -118,7 +123,10 @@ def make_route_inputs(
     z: Dict[str, torch.Tensor],
     fusion: Dict[str, nn.Module],
 ) -> Dict[str, torch.Tensor]:
-
+    """
+    Build the 7 route embeddings from unimodal z = {"L","N","I"} via concat-fusion:
+      returns dict with keys in ROUTES order: "L","N","I","LN","LI","NI","LNI"
+    """
     zL, zN, zI = z["L"], z["N"], z["I"]
     return {
         "L":   _safe_clone(zL),
@@ -157,7 +165,7 @@ def compute_route_logits(
 ) -> Dict[str, torch.Tensor]:
     out: Dict[str, torch.Tensor] = {}
     for r, z in route_embs.items():
-        out[r] = route_heads[r](z)
+        out[r] = route_heads[r](z)  # [B,K]
     return out
 
 
@@ -166,6 +174,10 @@ def route_availability_mask(
     batch_size: int,
     device: torch.device | str,
 ) -> torch.Tensor:
+    """
+    Derive availability per route from modality masks {"L","N","I"} (each [B,1]).
+    Returns [B,7] in ROUTES order.
+    """
     if masks is None:
         return torch.ones(batch_size, len(ROUTES), device=device)
 
@@ -242,6 +254,10 @@ def concat_routes(
     gates: torch.Tensor,
     l2norm: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply sample-wise gates to the 7 route embeddings and concatenate:
+      returns (x_cat [B,7*d], Zw [B,7,d])
+    """
     order = ROUTES
     Z_list = [route_embs[r] for r in order]
 
@@ -274,27 +290,27 @@ def forward_emb_concat(
     """
     Build 7 route embeddings, compute gates, create weighted concat, and
     return logits plus useful intermediates.
+      returns logits [B,K], gates [B,7], route_embs dict, routes_weighted dict
     """
-    # 7 route embeddings from unimodal + fusion
-    route_embs = make_route_inputs(z_unimodal, fusion)      # {r: [B,d]}
-    # learned gates (respecting masks if provided)
-    gates = gate_net(z_unimodal, masks=masks)               # [B,7]
-    # concat weighted
-    x_cat, Zw = concat_routes(route_embs, gates=gates, l2norm=l2norm_each)  # [B,7*d], [B,7,d]
-    # final logits
-    logits = final_head(x_cat)                              # [B, K] (K tasks)
-    # map weighted back to dict
-    routes_weighted = {r: Zw[:, i, :] for i, r in enumerate(ROUTES)}  # each [B,d]
+    route_embs = make_route_inputs(z_unimodal, fusion)                          # {r: [B,d]}
+    gates = gate_net(z_unimodal, masks=masks)                                   # [B,7]
+    x_cat, Zw = concat_routes(route_embs, gates=gates, l2norm=l2norm_each)      # [B,7*d], [B,7,d]
+    logits = final_head(x_cat)                                                  # [B, K]
+    routes_weighted = {r: Zw[:, i, :] for i, r in enumerate(ROUTES)}            # each [B,d]
     return logits, gates, route_embs, routes_weighted
 
 
 # Class-wise gates and head 
 class LearnedClasswiseGateNet(nn.Module):
+    """
+    Produces per-sample, per-class route weights (gates): [B,7,K].
+    Softmax across routes for each class. Honors route masks if provided.
+    """
     def __init__(self, d: int, n_tasks: int, hidden: int = 1024, p_drop: float = 0.1, use_masks: bool = True):
         super().__init__()
         self.use_masks = use_masks
         self.K = int(n_tasks)
-        in_dim = 3 * d  
+        in_dim = 3 * d  # concat of zL, zN, zI
         self.net = nn.Sequential(
             nn.LayerNorm(in_dim),
             nn.Linear(in_dim, hidden),
@@ -306,8 +322,8 @@ class LearnedClasswiseGateNet(nn.Module):
     def forward(self, z: Dict[str, torch.Tensor], masks: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
         x = torch.cat([z["L"], z["N"], z["I"]], dim=1)
         logits = self.net(x)
-        gates = logits.view(x.size(0), len(ROUTES), self.K)
-        gates = torch.softmax(gates, dim=1)  # softmax over routes per class
+        gates = logits.view(x.size(0), len(ROUTES), self.K)  # [B,7,K]
+        gates = torch.softmax(gates, dim=1)                 # softmax over routes per class
         if self.use_masks and masks is not None:
             avail = route_availability_mask(masks, batch_size=x.size(0), device=x.device)  # [B,7]
             avail = avail.unsqueeze(-1)  # [B,7,1]
@@ -324,6 +340,10 @@ def compute_loss_based_classwise_gates(
     alpha: float = 4.0,
     pos_weight: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """
+    For each class k, routes r are weighted by softmax_r( -alpha * BCE_r,k + log(avail_r) ).
+    Returns [B,7,K].
+    """
     B, K = y.shape
     losses: List[torch.Tensor] = []
     for r in ROUTES:
@@ -344,6 +364,10 @@ def concat_routes_classwise(
     gates_classwise: torch.Tensor,        # [B,7,K]
     l2norm: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply class-wise gates to the 7 route embeddings and concatenate per class:
+      returns (X_flat [B*K,7*d], Zw_cls [B,7,K,d])
+    """
     order = ROUTES
     Z_list = [route_embs[r] for r in order]
     B = Z_list[0].size(0)
@@ -362,14 +386,17 @@ def concat_routes_classwise(
     # Weighted per class: [B,7,K] * [B,7,d] -> [B,7,K,d]
     Zw_cls = gates_classwise.unsqueeze(-1) * Z.unsqueeze(2)  # [B,7,K,d]
 
-    # Concat 7*d per class -> [B,K,7*d]
+    # Concat 7*d per class -> [B,K,7*d], then flatten for a single MLP
     X = Zw_cls.permute(0, 2, 1, 3).contiguous().view(B, K, R * d)  # [B,K,7*d]
-    # Flatten batch*class for a single MLP
-    X_flat = X.view(B * K, R * d)                                   # [B*K,7*d]
+    X_flat = X.view(B * K, R * d)                                  # [B*K,7*d]
     return X_flat, Zw_cls
 
 
 class FinalConcatHeadClasswise(nn.Module):
+    """
+    Per-class MLP over concatenated, classwise gate-weighted 7*d route features.
+    Implemented by flattening [B,K,7*d] -> [B*K,7*d] -> mlp -> [B*K,1] -> reshape [B,K].
+    """
     def __init__(self, d: int, hidden: Optional[Sequence[int]] = None, p_drop: float = 0.1):
         super().__init__()
         in_dim = 7 * d
@@ -387,16 +414,23 @@ class FinalConcatHeadClasswise(nn.Module):
         self.mlp = nn.Sequential(*layers)
 
     def forward(self, x_flat: torch.Tensor, B: int, K: int) -> torch.Tensor:
-        y = self.mlp(x_flat)      # [B*K,1]
-        y = y.view(B, K)          # [B,K]
+        y = self.mlp(x_flat)  # [B*K,1]
+        y = y.view(B, K)      # [B,K]
         return y
 
 
+# ---------------------------
+# Capsule inputs
+# ---------------------------
 @torch.no_grad()
 def build_capsule_inputs(
     route_embs: Dict[str, torch.Tensor],
     masks: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convert route_embs dict -> capsule (pose, act):
+      pose: [B,7,d], act: [B,7] (1 if route available else 0)
+    """
     order = ROUTES
     Z_list = [route_embs[r] for r in order]
     pose = torch.stack(Z_list, dim=1)  # [B,7,d]
@@ -410,16 +444,81 @@ def build_capsule_inputs(
     return pose, act
 
 
+# Convenience wrappers: per-class embeddings
+def per_class_route_embeddings_learned(
+    z_unimodal: Dict[str, torch.Tensor],            # {"L": [B,d], "N":[B,d], "I":[B,d]}
+    fusion: Dict[str, nn.Module],                   # {"LN","LI","NI","LNI"}
+    gate_net_classwise: nn.Module,                  # LearnedClasswiseGateNet(d, K)
+    masks: Optional[Dict[str, torch.Tensor]] = None,# optional {"L","N","I"} each [B,1]
+    l2norm_each: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    """
+    Returns:
+      Zw_cls:   [B, 7, K, d]  (per-phenotype, per-route embeddings)
+      gates_cls:[B, 7, K]     (softmax over routes per class)
+      route_embs: dict of 7 route embeddings (each [B,d])
+    """
+    route_embs = make_route_inputs(z_unimodal, fusion)         
+    Z_routes = torch.stack([route_embs[r] for r in ROUTES], dim=1)  # [B,7,d]
+    if l2norm_each:
+        Z_routes = F.normalize(Z_routes, dim=2)
+
+    gates_cls = gate_net_classwise(z_unimodal, masks=masks)    # [B,7,K]
+    Zw_cls = gates_cls.unsqueeze(-1) * Z_routes.unsqueeze(2)   # [B,7,K,d]
+    return Zw_cls, gates_cls, route_embs
+
+
+def per_class_route_embeddings_loss_based(
+    z_unimodal: Dict[str, torch.Tensor],            # {"L","N","I"} each [B,d]
+    fusion: Dict[str, nn.Module],                   # {"LN","LI","NI","LNI"}
+    route_heads: Dict[str, nn.Module],              # per-route heads, each outputs [B,K] logits
+    y: torch.Tensor,                                 # labels [B,K]
+    masks: Optional[Dict[str, torch.Tensor]] = None,
+    alpha: float = 4.0,
+    pos_weight: Optional[torch.Tensor] = None,
+    l2norm_each: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    """
+    Returns:
+      Zw_cls:        [B, 7, K, d]
+      gates_cls:     [B, 7, K]
+      route_embs:    dict of 7 route embeddings ([B,d])
+      logits_routes: dict of 7 route logits ([B,K])
+    """
+    route_embs = make_route_inputs(z_unimodal, fusion)                 
+    Z_routes = torch.stack([route_embs[r] for r in ROUTES], dim=1)     
+    if l2norm_each:
+        Z_routes = F.normalize(Z_routes, dim=2)
+
+    logits_routes = compute_route_logits(route_embs, route_heads)     
+
+    B = Z_routes.size(0)
+    device = Z_routes.device
+    avail = route_availability_mask(masks, batch_size=B, device=device)  
+
+    gates_cls = compute_loss_based_classwise_gates(
+        logits_per_route=logits_routes,
+        y=y,
+        avail=avail,
+        alpha=alpha,
+        pos_weight=pos_weight,
+    )  # [B,7,K]
+
+    Zw_cls = gates_cls.unsqueeze(-1) * Z_routes.unsqueeze(2)            # [B,7,K,d]
+    return Zw_cls, gates_cls, route_embs, logits_routes
+
+
 __all__ = [
     # fusion
     "PairwiseFusion", "TrimodalFusion", "build_fusions", "make_route_inputs",
     # per-route heads
     "RouteHead", "build_route_heads", "compute_route_logits",
-    # gating + final head
+    # gating + final head (sample-wise)
     "RouteGateNet", "FinalConcatHead", "forward_emb_concat",
     # classwise gating + head
     "LearnedClasswiseGateNet", "compute_loss_based_classwise_gates",
     "concat_routes_classwise", "FinalConcatHeadClasswise",
+    "per_class_route_embeddings_learned", "per_class_route_embeddings_loss_based",
     # capsule inputs
     "build_capsule_inputs",
     # utils
