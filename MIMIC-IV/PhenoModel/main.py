@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -63,7 +62,6 @@ PHENO_25 = [
     "Other upper respiratory disease",
 ]
 
-# Utilities
 def try_torch_bincount_weight(y: torch.Tensor) -> Optional[torch.Tensor]:
     """
     Compute positive class weights per label: (N - pos) / max(pos,1).
@@ -72,12 +70,10 @@ def try_torch_bincount_weight(y: torch.Tensor) -> Optional[torch.Tensor]:
     with torch.no_grad():
         if y.numel() == 0:
             return None
-        K = y.size(1)
         pos = y.sum(dim=0).clamp(min=0.0)
         N = y.size(0)
-        # Avoid div by zero; if pos==0 -> weight=N (very large), cap mildly
         w = (N - pos) / (pos.clamp(min=1.0))
-        # Make sure it's >=1 and finite
+        # ensure finite and >=1
         w = torch.where(torch.isfinite(w), w, torch.ones_like(w))
         w = torch.clamp(w, min=1.0, max=100.0)
         if (w <= 0).any():
@@ -86,8 +82,7 @@ def try_torch_bincount_weight(y: torch.Tensor) -> Optional[torch.Tensor]:
 
 def sigmoid_metrics(logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
     """
-    Basic multilabel metrics (macro AUROC is optional without sklearn).
-    Returns macro-averaged precision-at-0.5 and recall-at-0.5 and F1.
+    Basic multilabel metrics (macro precision/recall/F1 @ 0.5).
     """
     with torch.no_grad():
         probs = torch.sigmoid(logits)
@@ -96,25 +91,24 @@ def sigmoid_metrics(logits: torch.Tensor, targets: torch.Tensor) -> Dict[str, fl
         tp = (preds * targets).sum(0)
         fp = ((preds == 1) & (targets == 0)).float().sum(0)
         fn = ((preds == 0) & (targets == 1)).float().sum(0)
-
         prec_k = tp / (tp + fp + eps)
         rec_k = tp / (tp + fn + eps)
         f1_k = 2 * prec_k * rec_k / (prec_k + rec_k + eps)
-
         return {
             "macro_precision@0.5": prec_k.mean().item(),
             "macro_recall@0.5": rec_k.mean().item(),
             "macro_f1@0.5": f1_k.mean().item(),
         }
-
+        
 # Image utilities
 def default_img_transform(img: Image.Image) -> torch.Tensor:
     # Minimal transform to 224x224 and to tensor [0,1]
     img = img.convert("RGB")
     img = img.resize((224, 224), Image.BILINEAR)
     arr = np.array(img, dtype=np.float32) / 255.0
-    arr = np.transpose(arr, (2, 0, 1)) 
+    arr = np.transpose(arr, (2, 0, 1))
     return torch.from_numpy(arr)
+
 
 class DicomToJpgIndex:
 
@@ -122,7 +116,7 @@ class DicomToJpgIndex:
         p = Path(image_filenames)
         self.map: Dict[str, str] = {}
         if not p.exists():
-            print(f"[warn] IMAGE_FILENAMES '{p}' not found. Will expect 'jpg_path' in dataset.")
+            print(f"[warn] IMAGE_FILENAMES '{p}' not found. Will expect 'resolved_path' or 'jpg_path' in dataset.")
             return
         if p.suffix.lower() in {".parquet", ".pq"}:
             df = pd.read_parquet(p)
@@ -140,14 +134,24 @@ class DicomToJpgIndex:
     def get(self, dicom_id: Union[str, int]) -> Optional[str]:
         return self.map.get(str(dicom_id), None)
 
-
 class PhenoTriplesDataset(tud.Dataset):
+    """
+    Triples dataset:
+      - labels: 25 phenotypes
+      - image: uses 'resolved_path' (preferred), fallback to 'jpg_path' or dicom->jpg index
+      - notes: 'note_chunks' or 'note_text'
+      - EHR:   from structured_24h.parquet (24×2 Rows/Columns) by matching stay/stay_id
+               (fallback to ehr_tensor/ehr_mask if provided)
+    """
+
     def __init__(
         self,
         parquet_path: Union[str, Path],
         img_root: Union[str, Path],
         image_filenames: Optional[Union[str, Path]] = None,
         pheno_names: Optional[List[str]] = None,
+        structured_path: Optional[Union[str, Path]] = None,
+        id_col: str = "stay",
     ):
         super().__init__()
         self.df = pd.read_parquet(parquet_path)
@@ -161,32 +165,66 @@ class PhenoTriplesDataset(tud.Dataset):
         if len(self.label_cols) == 0:
             raise RuntimeError(f"No phenotype columns found in {parquet_path}.")
 
-        # heuristic columns
+        # present columns / hints
         self.has_dicom = "dicom_id" in all_cols
         self.has_jpg_path = "jpg_path" in all_cols
+        self.has_resolved_path = "resolved_path" in all_cols
         self.has_notes_chunks = "note_chunks" in all_cols
         self.has_note_text = "note_text" in all_cols
         self.has_ehr_tensor = "ehr_tensor" in all_cols
         self.has_ehr_mask = "ehr_mask" in all_cols
 
+        # structured 24×2 Rows/Columns per stay
+        self.struct: Optional[Dict[int, np.ndarray]] = None
+        self.struct_ready: bool = False
+        self.id_col = id_col  # your split parquet uses 'stay' (string-ish IDs)
+
+        if structured_path is not None and Path(structured_path).exists():
+            sdf = pd.read_parquet(structured_path)
+            stay_col = "stay_id" if "stay_id" in sdf.columns else ("stay" if "stay" in sdf.columns else None)
+            if stay_col is None:
+                raise RuntimeError("structured_24h.parquet must include 'stay_id' or 'stay'")
+
+            need = {"hour", "Rows", "Columns"}
+            if not need.issubset(sdf.columns):
+                raise RuntimeError("structured_24h.parquet must have columns {'hour','Rows','Columns'}")
+
+            # Keep only complete 24-row stays
+            counts = sdf.groupby(stay_col).size()
+            keep_ids = set(counts[counts == 24].index)
+            sdf = sdf[sdf[stay_col].isin(keep_ids)].sort_values([stay_col, "hour"])
+
+            # pack into memory map
+            self.struct = {
+                int(k): sdf.loc[sdf[stay_col] == k, ["Rows", "Columns"]].to_numpy(dtype=np.float32)
+                for k in keep_ids
+            }
+            self.struct_ready = True
+
     def __len__(self) -> int:
         return len(self.df)
 
+    # ---- loaders ----
     def _load_image(self, row) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Returns (img_tensor [3,224,224], mask [1])
-        If missing, returns zeros and mask=0.
+        Returns (img_tensor [3,224,224], mask [1]); if missing -> zeros and mask=0.
         """
         path: Optional[str] = None
-        if self.has_jpg_path and isinstance(row["jpg_path"], str) and row["jpg_path"]:
+        # prefer resolved_path
+        if self.has_resolved_path and isinstance(row.get("resolved_path"), str) and row["resolved_path"]:
+            path = row["resolved_path"]
+        elif self.has_jpg_path and isinstance(row.get("jpg_path"), str) and row["jpg_path"]:
             path = row["jpg_path"]
         elif self.has_dicom and self.idx:
             path = self.idx.get(row["dicom_id"])
+
         if path is None:
             return torch.zeros(3, 224, 224), torch.zeros(1)
+
         p = self.img_root / path if not Path(path).is_absolute() else Path(path)
         if not p.exists():
             return torch.zeros(3, 224, 224), torch.zeros(1)
+
         try:
             img = Image.open(p)
             x = default_img_transform(img)
@@ -194,24 +232,42 @@ class PhenoTriplesDataset(tud.Dataset):
         except Exception:
             return torch.zeros(3, 224, 224), torch.zeros(1)
 
+    def _norm_stay_id(self, v) -> Optional[int]:
+        try:
+            return int(str(v).split("_")[0])
+        except Exception:
+            return None
+
     def _load_notes(self, row) -> Tuple[List[str], torch.Tensor]:
-        if self.has_notes_chunks and isinstance(row["note_chunks"], list) and len(row["note_chunks"]) > 0:
+        if self.has_notes_chunks and isinstance(row.get("note_chunks"), list) and len(row["note_chunks"]) > 0:
             return list(map(str, row["note_chunks"])), torch.ones(1)
-        if self.has_note_text and isinstance(row["note_text"], str) and row["note_text"].strip():
+        if self.has_note_text and isinstance(row.get("note_text"), str) and row["note_text"].strip():
             return [row["note_text"]], torch.ones(1)
         return [], torch.zeros(1)
 
     def _load_ehr(self, row) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.has_ehr_tensor and isinstance(row["ehr_tensor"], (list, np.ndarray)):
+        # Prefer 24x2 from structured_24h.parquet
+        if self.struct_ready and self.struct is not None:
+            sid_raw = row[self.id_col] if self.id_col in row else row.get("stay_id", None)
+            sid = self._norm_stay_id(sid_raw)
+            if sid is not None and sid in self.struct:
+                arr = self.struct[sid]  # (24,2)
+                xL = torch.from_numpy(arr)  # [24,2]
+                m = torch.ones(xL.size(0), dtype=torch.float32)  # [24]
+                return xL, m
+
+        if self.has_ehr_tensor and isinstance(row.get("ehr_tensor"), (list, np.ndarray)):
             arr = np.asarray(row["ehr_tensor"], dtype=np.float32)
             if arr.ndim == 1:
                 arr = arr[None, :]
             xL = torch.from_numpy(arr)  # [T,F]
-            if self.has_ehr_mask and isinstance(row["ehr_mask"], (list, np.ndarray)):
+            if self.has_ehr_mask and isinstance(row.get("ehr_mask"), (list, np.ndarray)):
                 m = torch.from_numpy(np.asarray(row["ehr_mask"], dtype=np.float32))
             else:
                 m = torch.ones(xL.size(0), dtype=torch.float32)
             return xL, m
+
+        # Missing -> zeros
         Fdim = CFG.structured_n_feats
         xL = torch.zeros(1, Fdim)
         m = torch.zeros(1)
@@ -228,7 +284,7 @@ class PhenoTriplesDataset(tud.Dataset):
         xL, mL = self._load_ehr(row)             # [T,F], [T]
 
         masks = {
-            "L": mL.max().view(1),  
+            "L": mL.max().view(1),  # route-availability mask per modality
             "N": mN.view(1),
             "I": mI.view(1),
         }
@@ -242,6 +298,7 @@ class PhenoTriplesDataset(tud.Dataset):
         }
         return sample
 
+
 def pad_collate(batch: List[Dict]):
     B = len(batch)
     # EHR pad
@@ -254,7 +311,7 @@ def pad_collate(batch: List[Dict]):
         xL[i, :t] = item["xL"]
         mL[i, :t] = item["mL"]
 
-    # Notes as list-of-lists
+    # Notes as list-of-lists (text encoder handles [] as empty)
     notes = [item["notes"] for item in batch]
 
     # Images -> [B,3,224,224]
