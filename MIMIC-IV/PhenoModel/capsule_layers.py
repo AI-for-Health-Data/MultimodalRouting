@@ -13,10 +13,10 @@ class CapsuleFC(nn.Module):
         out_d_capsules: int,
         n_rank: int | None = None,
         dp: float = 0.0,
-        dim_pose_to_vote: int = 0, 
+        dim_pose_to_vote: int = 0,
         uniform_routing_coefficient: bool = False,
-        act_type: str = "EM",       
-        small_std: bool = True,      
+        act_type: str = "EM",
+        small_std: bool = True,
         eps: float = 1e-10,
     ):
         super().__init__()
@@ -73,63 +73,67 @@ class CapsuleFC(nn.Module):
         return current_act
 
     def _pose_to_act(self, pose: torch.Tensor) -> torch.Tensor:
-        """
-        Derive activations from pose (vector length). Returns [B, N_out].
-        """
-        act = torch.linalg.vector_norm(pose, ord=2, dim=-1)  
+        act = torch.linalg.vector_norm(pose, ord=2, dim=-1)
         return act
 
     def forward(
         self,
         input_pose: torch.Tensor,        
-        current_act: torch.Tensor,      
+        current_act: torch.Tensor,       
         num_iter: int,
-        next_capsule_value: torch.Tensor | None = None,  
+        next_capsule_value: torch.Tensor | None = None, 
         next_act: torch.Tensor | None = None,            
         uniform_routing: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+          next_capsule_value: [B, N_out, D_out]   (class poses)
+          next_act:           [B, N_out]          (class activations)
+          query_key:          [B, N_in, N_out]    (routing coeffs over routes per class)
+          route_class_emb:    [B, N_in, N_out, D_out]  (per-route × per-class interaction embeddings)
+        """
         B, Nin, Din = input_pose.shape
         assert Nin == self.in_n_capsules and Din == self.in_d_capsules, \
             f"Expected input_pose [B,{self.in_n_capsules},{self.in_d_capsules}], got {list(input_pose.shape)}"
         device = input_pose.device
 
-        current_act = self._ensure_act_shape(current_act) 
-        W = self.w 
+        current_act = self._ensure_act_shape(current_act)  
+        W = self.w  # [N_in, D_in, N_out, D_out]
 
         if next_capsule_value is None:
-            q0 = torch.zeros(self.in_n_capsules, self.out_n_capsules, device=device)
-            q0 = F.softmax(q0, dim=1)                               
-            next_capsule_value = torch.einsum('nm, bna, namd -> bmd', q0, input_pose, W)
-            query_key = q0.unsqueeze(0).expand(B, -1, -1)           
+            q0 = torch.zeros(self.in_n_capsules, self.out_n_capsules, device=device)  
+            q0 = F.softmax(q0, dim=1)
+            next_capsule_value = torch.einsum('nm, bna, namd -> bmd', q0, input_pose, W)  
+            query_key = q0.unsqueeze(0).expand(B, -1, -1)  
         else:
             if uniform_routing or self.uniform_routing_coefficient:
-                query_key = self._init_uniform(B, device)
+                query_key = self._init_uniform(B, device)  
             else:
                 logits0 = torch.einsum('bna, namd, bmd -> bnm', input_pose, W, next_capsule_value)  
                 logits0.mul_(self.scale)
-                query_key = F.softmax(logits0, dim=2)
+                query_key = F.softmax(logits0, dim=2)  
 
-        # Routing iterations 
+        # Routing iterations
         for _ in range(max(1, num_iter)):
             if uniform_routing or self.uniform_routing_coefficient:
-                query_key = self._init_uniform(B, device)                        
+                query_key = self._init_uniform(B, device)
             else:
                 logits = torch.einsum('bna, namd, bmd -> bnm', input_pose, W, next_capsule_value)  
                 logits.mul_(self.scale)
-                query_key = F.softmax(logits, dim=2)                            
-
+                query_key = F.softmax(logits, dim=2)
                 if next_act is not None:
-                    query_key = query_key * next_act.unsqueeze(1)
+                    query_key = query_key * next_act.unsqueeze(1) 
                     denom = query_key.sum(dim=2, keepdim=True).clamp_min(self.eps)
                     query_key = query_key / denom
 
             next_capsule_value = torch.einsum(
                 'bnm, bna, namd, bn -> bmd',
                 query_key, input_pose, W, current_act
-            )
+            )  # [B, N_out, D_out]
 
+        # Class activations
         if self.act_type == "ONES":
-            next_act = torch.ones(next_capsule_value.shape[:2], device=device)
+            next_act = torch.ones(next_capsule_value.shape[:2], device=device)  
         else:
             if next_act is None:
                 next_act = self._pose_to_act(next_capsule_value)  
@@ -138,4 +142,9 @@ class CapsuleFC(nn.Module):
         if next_capsule_value.shape[-1] != 1:
             next_capsule_value = self.nonlinear_act(next_capsule_value)
 
-        return next_capsule_value, next_act, query_key
+        # Per-route × class interaction embeddings 
+        votes = torch.einsum('bna, namd -> bnkd', input_pose, W)
+        weights = query_key * current_act.unsqueeze(-1)
+        route_class_emb = weights.unsqueeze(-1) * votes  
+
+        return next_capsule_value, next_act, query_key, route_class_emb
