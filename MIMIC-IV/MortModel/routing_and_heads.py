@@ -4,10 +4,14 @@ from typing import Dict, Tuple, Sequence, Optional
 import torch
 import torch.nn as nn
 
-from env_config import ROUTES, DEVICE
+from env_config import ROUTES, DEVICE, CFG
+from . import capsule_layers
 
+def _dbg(msg: str) -> None:
+    if getattr(CFG, "verbose", False):
+        print(msg)
 
-lass _MLP(nn.Module):
+class _MLP(nn.Module):
     def __init__(
         self,
         in_dim: int,
@@ -139,7 +143,6 @@ def make_route_inputs(
         "LNI": fusion["LNI"](zL, zN, zI),
     }
 
-import capsule_layers  
 
 class RoutePrimaryProjector(nn.Module):
     """
@@ -167,6 +170,14 @@ class RoutePrimaryProjector(nn.Module):
         pc_all = torch.stack(pcs, dim=1).to(device)            # [B, 7, pc_dim+1]
         poses = pc_all[:, :, :self.pc_dim]                     # [B, 7, pc_dim]
         acts  = torch.sigmoid(pc_all[:, :, self.pc_dim:])      # [B, 7, 1]
+        # SANITY PRINT
+        if not hasattr(self, "_printed_once"):
+            self._printed_once = True
+            _dbg(f"[projector] pc_all:{tuple(pc_all.shape)} poses:{tuple(poses.shape)} acts:{tuple(acts.shape)}")
+            with torch.no_grad():
+                a = acts.detach()
+                _dbg(f"[projector] acts stats -> min:{a.min().item():.4f} max:{a.max().item():.4f} mean:{a.mean().item():.4f}")
+
         return poses, acts
 
 
@@ -194,7 +205,6 @@ class CapsuleMortalityHead(nn.Module):
         # Single decision capsule (binary mortality)
         self.mc_num_caps = 1
 
-        # EXACT CapsuleFC from your notebook
         self.mc = capsule_layers.CapsuleFC(
             in_n_capsules=7,
             in_d_capsules=self.pc_dim,
@@ -221,6 +231,12 @@ class CapsuleMortalityHead(nn.Module):
         device = torch.device(DEVICE)
         poses = poses.to(device)
         acts  = acts.to(device)
+       
+        # SANITY PRINT (once) 
+        if not hasattr(self, "_printed_once"):
+            self._printed_once = True
+            _dbg(f"[cap-head] input poses:{tuple(poses.shape)} acts:{tuple(acts.shape)} "
+                 f"(pc_dim={self.pc_dim}, mc_caps_dim={self.mc_caps_dim}, out_caps={self.mc_num_caps}, iters={self.num_routing})")
 
         # First routing (no prior)
         decision_pose, decision_act, _ = self.mc(poses, acts, 0)
@@ -231,21 +247,38 @@ class CapsuleMortalityHead(nn.Module):
                 poses, acts, n, decision_pose, decision_act
             )
 
-        # Project decision pose -> single mortality logit
-        # decision_pose: [B, mc_num_caps, mc_caps_dim] ; embedding: [mc_num_caps, mc_caps_dim]
-        # einsum -> [B, mc_num_caps] == [B,1] → unsqueeze to [B,1] for clarity
         decision_logit = torch.einsum('bcd,cd->bc', decision_pose, self.embedding).unsqueeze(1)  # [B,1]
+        # SANITY PRINT (once) 
+        if not hasattr(self, "_printed_done"):
+            self._printed_done = True
+            _dbg(f"[cap-head] decision_pose:{tuple(decision_pose.shape)} -> logit:{tuple(decision_logit.shape)}")
+            with torch.no_grad():
+                _dbg(f"[cap-head] logit stats -> "
+                     f"min:{decision_logit.min().item():.4f} max:{decision_logit.max().item():.4f} mean:{decision_logit.mean().item():.4f}")
+
         return decision_logit, routing_coef
+
+
 def forward_capsule_from_routes(
     z_unimodal: Dict[str, torch.Tensor],          
     fusion: Dict[str, nn.Module],                   
     projector: RoutePrimaryProjector,               # d -> (pc_dim+1) per route
     capsule_head: CapsuleMortalityHead,             # CapsuleFC wrapper -> [B,1]
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-
+    
+    # SANITY PRINT 
+    if not hasattr(forward_capsule_from_routes, "_printed_once"):
+        forward_capsule_from_routes._printed_once = True
+        sizes = ", ".join(f"{k}:{tuple(v.shape)}" for k, v in z_unimodal.items())
+        _dbg(f"[caps-bridge] unimodal -> {sizes}")
     # Build 7 route embeddings
     route_embs = make_route_inputs(z_unimodal, fusion)       # dict of 7 -> [B,d]
-
+    
+    if not hasattr(forward_capsule_from_routes, "_printed_routes"):
+        forward_capsule_from_routes._printed_routes = True
+        sizes = ", ".join(f"{k}:{tuple(v.shape)}" for k, v in route_embs.items())
+        _dbg(f"[caps-bridge] routes -> {sizes}")
+        
     # Project to primary capsules (pose + act)
     poses, acts = projector(route_embs)                      # [B,7,pc_dim], [B,7,1]
 
@@ -253,6 +286,14 @@ def forward_capsule_from_routes(
     final_logit, routing_coef = capsule_head(poses, acts)    # [B,1], [B,7,1]
 
     prim_acts = acts.squeeze(-1).detach()                    # [B,7] (for monitoring)
+    
+    # optional once-only peek at primary acts
+    if not hasattr(forward_capsule_from_routes, "_printed_acts"):
+        forward_capsule_from_routes._printed_acts = True
+        with torch.no_grad():
+            _dbg(f"[caps-bridge] prim_acts:{tuple(prim_acts.shape)} "
+                 f"mean:{prim_acts.mean().item():.4f} min:{prim_acts.min().item():.4f} max:{prim_acts.max().item():.4f}")
+
     return final_logit, prim_acts, route_embs
 
 
