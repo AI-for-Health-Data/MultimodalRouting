@@ -1,14 +1,13 @@
 from __future__ import annotations
-from typing import Dict, List, Tuple, Sequence, Optional
+from typing import Dict, Tuple, Sequence, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from env_config import ROUTES, DEVICE
 
 
-class _MLP(nn.Module):
+lass _MLP(nn.Module):
     def __init__(
         self,
         in_dim: int,
@@ -19,21 +18,25 @@ class _MLP(nn.Module):
         super().__init__()
         hidden = list(hidden) if hidden is not None else [4 * out_dim, 2 * out_dim]
         dims = [in_dim] + hidden + [out_dim]
-        layers: List[nn.Module] = []
+        layers = []
         for i in range(len(dims) - 2):
-            layers += [
+            layers.extend([
                 nn.LayerNorm(dims[i]),
                 nn.Linear(dims[i], dims[i + 1]),
                 nn.GELU(),
                 nn.Dropout(p_drop),
-            ]
-        layers += [nn.LayerNorm(dims[-2]), nn.Linear(dims[-2], dims[-1])]
+            ])
+        layers.extend([nn.LayerNorm(dims[-2]), nn.Linear(dims[-2], dims[-1])])
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 class PairwiseFusion(nn.Module):
+    """
+    Given two unimodal embeddings za, zb (both [B, d]), build a pairwise route embedding.
+    Mode 'concat': [za, zb] -> MLP -> d (+ residual to 0.5*(za+zb))
+    """
     def __init__(
         self,
         d: int,
@@ -60,7 +63,12 @@ class PairwiseFusion(nn.Module):
         return h + self.res_scale * base
 
 
+
 class TrimodalFusion(nn.Module):
+    """
+    Given three unimodal embeddings zL,zN,zI (all [B, d]), build the trimodal route embedding.
+    Mode 'concat': [zL, zN, zI] -> MLP -> d (+ residual to average)
+    """
     def __init__(
         self,
         d: int,
@@ -87,16 +95,21 @@ class TrimodalFusion(nn.Module):
         h = self.mlp(x)
         base = (zL + zN + zI) / 3.0
         return h + self.res_scale * base
-        
+
+
 def build_fusions(
     d: int,
     p_drop: float = 0.1,
     feature_mode: str = "concat",
 ) -> Dict[str, nn.Module]:
+    """
+    Create the fusion blocks used to build the interaction routes from unimodal embeddings.
+    Returns a dict with keys {"LN","LI","NI","LNI"}.
+    """
     dev = torch.device(DEVICE)
-    LN = PairwiseFusion(d, p_drop=p_drop, feature_mode=feature_mode).to(dev)
-    LI = PairwiseFusion(d, p_drop=p_drop, feature_mode=feature_mode).to(dev)
-    NI = PairwiseFusion(d, p_drop=p_drop, feature_mode=feature_mode).to(dev)
+    LN  = PairwiseFusion(d, p_drop=p_drop, feature_mode=feature_mode).to(dev)
+    LI  = PairwiseFusion(d, p_drop=p_drop, feature_mode=feature_mode).to(dev)
+    NI  = PairwiseFusion(d, p_drop=p_drop, feature_mode=feature_mode).to(dev)
     LNI = TrimodalFusion(d, p_drop=p_drop, feature_mode=feature_mode).to(dev)
     return {"LN": LN, "LI": LI, "NI": NI, "LNI": LNI}
 
@@ -107,12 +120,13 @@ def _safe_clone(x: torch.Tensor) -> torch.Tensor:
 
 
 def make_route_inputs(
-    z: Dict[str, torch.Tensor],
-    fusion: Dict[str, nn.Module],
+    z: Dict[str, torch.Tensor],        
+    fusion: Dict[str, nn.Module],       
 ) -> Dict[str, torch.Tensor]:
     """
-    Build embeddings for all 7 routes from unimodal z and fusion blocks.
-    z keys: {"L","N","I"} → outputs {"L","N","I","LN","LI","NI","LNI"} each [B,d]
+    Build embeddings for all 7 routes from unimodal pooled embeddings.
+    Output:
+        {"L","N","I","LN","LI","NI","LNI"} with each tensor [B, d]
     """
     zL, zN, zI = z["L"], z["N"], z["I"]
     return {
@@ -125,255 +139,131 @@ def make_route_inputs(
         "LNI": fusion["LNI"](zL, zN, zI),
     }
 
+import capsule_layers  
 
-# Per-route mortality logits (classifiers)
-class RouteHead(nn.Module):
+class RoutePrimaryProjector(nn.Module):
     """
-    Maps a d-dim route embedding to a mortality logit (binary).
+    Per-route projection: d_in -> (pc_dim + 1)
+    Split into:
+      - pose: [B, pc_dim]
+      - act:  sigmoid([B,1])
+    Applied independently for each of the 7 routes.
     """
-    def __init__(self, d_in: int, p_drop: float = 0.1):
+    def __init__(self, d_in: int, pc_dim: int):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(d_in),
-            nn.Linear(d_in, 2 * d_in),
-            nn.GELU(),
-            nn.Dropout(p_drop),
-            nn.Linear(2 * d_in, 1),  # 1 logit per route
+        self.pc_dim = int(pc_dim)
+        self.proj = nn.ModuleDict({r: nn.Linear(d_in, self.pc_dim + 1) for r in ROUTES})
+
+    def forward(self, route_embs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            route_embs: dict(route -> [B, d_in]) for all 7 routes
+        Returns:
+            poses: [B, 7, pc_dim]
+            acts:  [B, 7, 1]   (sigmoid activations)
+        """
+        device = next(self.parameters()).device
+        pcs = [self.proj[r](route_embs[r]) for r in ROUTES]   
+        pc_all = torch.stack(pcs, dim=1).to(device)            # [B, 7, pc_dim+1]
+        poses = pc_all[:, :, :self.pc_dim]                     # [B, 7, pc_dim]
+        acts  = torch.sigmoid(pc_all[:, :, self.pc_dim:])      # [B, 7, 1]
+        return poses, acts
+
+
+class CapsuleMortalityHead(nn.Module):
+    """
+    Wraps CapsuleFC to route the 7 primary capsules (poses + acts)
+    and produce a single mortality logit per sample.
+    - Uses ONE decision capsule (binary task).
+    """
+    def __init__(
+        self,
+        pc_dim: int,              
+        mc_caps_dim: int,         
+        num_routing: int = 3,
+        dp: float = 0.1,
+        act_type: str = "EM",
+        layer_norm: bool = False,    
+        dim_pose_to_vote: int = 0,
+    ):
+        super().__init__()
+        self.pc_dim = int(pc_dim)
+        self.mc_caps_dim = int(mc_caps_dim)
+        self.num_routing = int(num_routing)
+
+        # Single decision capsule (binary mortality)
+        self.mc_num_caps = 1
+
+        # EXACT CapsuleFC from your notebook
+        self.mc = capsule_layers.CapsuleFC(
+            in_n_capsules=7,
+            in_d_capsules=self.pc_dim,
+            out_n_capsules=self.mc_num_caps,
+            out_d_capsules=self.mc_caps_dim,
+            n_rank=None,
+            dp=dp,
+            act_type=act_type,
+            small_std=not layer_norm,        
+            dim_pose_to_vote=dim_pose_to_vote,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        self.embedding = nn.Parameter(torch.zeros(self.mc_num_caps, self.mc_caps_dim))
 
-
-def build_route_heads(d: int, p_drop: float = 0.1) -> Dict[str, RouteHead]:
-    dev = torch.device(DEVICE)
-    return {r: RouteHead(d_in=d, p_drop=p_drop).to(dev) for r in ROUTES}
-
-
-def _assert_same_dim(route_embs: Dict[str, torch.Tensor]) -> int:
-    d_set = {t.size(1) for t in route_embs.values()}
-    assert len(d_set) == 1, f"Route embedding dims differ: {d_set}"
-    return next(iter(d_set))
-
-
-def compute_route_logits(
-    route_embs: Dict[str, torch.Tensor],
-    route_heads: Dict[str, RouteHead],
-) -> torch.Tensor:
-    """
-    Returns per-route mortality logits: [B, 7]
-    """
-    _ = _assert_same_dim(route_embs)
-    logits = []
-    for r in ROUTES:
-        lr = route_heads[r](route_embs[r])
-        logits.append(lr)
-    return torch.cat(logits, dim=1)  # [B,7]
-
-
-def route_availability_mask(
-    masks: Optional[Dict[str, torch.Tensor]],
-    batch_size: int,
-    device: torch.device | str,
-) -> torch.Tensor:
-    if masks is None:
-        return torch.ones(batch_size, len(ROUTES), device=device)
-
-    mL, mN, mI = masks["L"], masks["N"], masks["I"]
-    req = {
-        "L":   mL,
-        "N":   mN,
-        "I":   mI,
-        "LN":  mL * mN,
-        "LI":  mL * mI,
-        "NI":  mN * mI,
-        "LNI": mL * mN * mI,
-    }
-    return torch.cat([req[r] for r in ROUTES], dim=1).clamp(0, 1)
-
-
-def route_weights_from_logits(
-    route_logits: torch.Tensor,
-    masks: Optional[Dict[str, torch.Tensor]] = None,
-) -> torch.Tensor:
-    """
-    Legacy data-driven gating: masked softmax over per-route logits (no EMA).
-    """
-    B, R = route_logits.shape
-    device = route_logits.device
-    if masks is None:
-        return torch.softmax(route_logits, dim=1)
-
-    avail = route_availability_mask(masks, batch_size=B, device=device)  # [B,7]
-    masked_scores = route_logits.masked_fill(avail < 0.5, float("-inf"))
-    all_neg_inf = ~torch.isfinite(masked_scores).any(dim=1)
-    if all_neg_inf.any():
-        masked_scores[all_neg_inf] = 0.0
-    w = torch.softmax(masked_scores, dim=1)
-    w_sum = w.sum(dim=1, keepdim=True).clamp_min(1e-6)
-    return w / w_sum
-
-class FinalConcatHead(nn.Module):
-    def __init__(self, d: int, hidden: Optional[Sequence[int]] = None, p_drop: float = 0.1):
-        super().__init__()
-        in_dim = 7 * d
-        hidden = list(hidden) if hidden is not None else [4 * in_dim, 2 * in_dim]
-        dims = [in_dim] + hidden + [1]
-        layers: List[nn.Module] = []
-        for i in range(len(dims) - 2):
-            layers += [
-                nn.LayerNorm(dims[i]),
-                nn.Linear(dims[i], dims[i + 1]),
-                nn.GELU(),
-                nn.Dropout(p_drop),
-            ]
-        layers += [nn.LayerNorm(dims[-2]), nn.Linear(dims[-2], dims[-1])]
-        self.mlp = nn.Sequential(*layers)
-
-    def forward(self, x_cat: torch.Tensor) -> torch.Tensor:
-        if x_cat.dim() == 3:
-            B, C, _ = x_cat.shape
-            y = self.mlp(x_cat.reshape(B * C, -1))
-            return y.view(B, C)
-        return self.mlp(x_cat)
-
-def concat_routes(
-    route_embs: Dict[str, torch.Tensor],
-    gates: torch.Tensor,  # [B,7]
-    l2norm: bool = False,  # IGNORED BY DESIGN (you asked to ignore L2 norm)
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Stack route embeddings and apply gates. Any L2 normalization is intentionally ignored.
-    """
-    order = ROUTES
-    Z_list = [route_embs[r] for r in order]
-
-    B = Z_list[0].size(0)
-    d_set = {z.size(1) for z in Z_list}
-    assert len(d_set) == 1, f"Route embedding dims differ: {d_set}"
-    d = next(iter(d_set))
-
-    Z = torch.stack(Z_list, dim=1)  # [B,7,d]
-    # if l2norm:  # <— intentionally disabled
-    #     Z = F.normalize(Z, dim=2)
-
-    R = len(order)
-    assert gates.shape == (B, R), f"gates shape {tuple(gates.shape)} != {(B, R)}"
-    Zw = gates.to(Z.dtype).unsqueeze(-1) * Z  # [B,7,d]
-
-    x_cat = Zw.reshape(B, R * d)  # [B, 7*d]
-    return x_cat, Zw
-
-
-@torch.no_grad()
-def forward_mixture_of_logits(
-    z_unimodal: Dict[str, torch.Tensor],
-    fusion: Dict[str, nn.Module],
-    route_heads: Dict[str, RouteHead],
-    masks: Optional[Dict[str, torch.Tensor]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
-    """
-      gates = softmax(route_logits) with availability mask.
-    """
-    # Build all 7 route embeddings
-    route_embs = make_route_inputs(z_unimodal, fusion)
-    _assert_same_dim(route_embs)
-
-    # Per-route mortality logits
-    route_logits = compute_route_logits(route_embs, route_heads)  # [B,7]
-
-    # Weights from logits (masked softmax)
-    gates = route_weights_from_logits(route_logits, masks=masks)  # [B,7]
-
-    # Final mortality logit = weighted sum of per-route logits
-    final_logit = (gates * route_logits).sum(dim=1, keepdim=True)  # [B,1]
-    return final_logit, gates, route_embs, route_logits
-
-class LossBasedGater(nn.Module):
-    """
-    Maintains an EMA of **per-route BCE losses** and produces global gates via:
-        g = softmax(-alpha * EMA_loss)
-    EMA is updated in training only; eval/test read the frozen EMA.
-    """
-    def __init__(self, num_routes: int, gamma: float, alpha: float):
-        super().__init__()
-        self.gamma = float(gamma)   # EMA rate
-        self.alpha = float(alpha)   # sharpness
-        self.num_routes = int(num_routes)
-        self.register_buffer("ema_loss", torch.zeros(self.num_routes))
-        self.register_buffer("initialized", torch.tensor(False))
-
-    @torch.no_grad()
-    def update_ema(self, per_route_loss_mean: torch.Tensor, do_update: bool) -> None:
+    def forward(self, poses: torch.Tensor, acts: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        per_route_loss_mean: [R] current batch mean loss per route (masked).
+        Args:
+            poses: [B, 7, pc_dim]
+            acts:  [B, 7, 1]
+        Returns:
+            final_logit:   [B, 1]
+            routing_coef:  [B, 7, mc_num_caps] (softmax over output capsules; with 1 capsule this is degenerate)
         """
-        if per_route_loss_mean.numel() != self.num_routes:
-            raise ValueError(f"Expected {self.num_routes} route losses, got {tuple(per_route_loss_mean.shape)}")
-        if not bool(self.initialized):
-            self.ema_loss.copy_(per_route_loss_mean)
-            self.initialized.fill_(True)
-            return
-        if do_update:
-            g = self.gamma
-            self.ema_loss.mul_(1.0 - g).add_(g * per_route_loss_mean)
+        device = torch.device(DEVICE)
+        poses = poses.to(device)
+        acts  = acts.to(device)
 
-    @torch.no_grad()
-    def gates(self) -> torch.Tensor:
-        return torch.softmax(-self.alpha * self.ema_loss, dim=0)  # [R]
+        # First routing (no prior)
+        decision_pose, decision_act, _ = self.mc(poses, acts, 0)
+
+        routing_coef = None
+        for n in range(self.num_routing):
+            decision_pose, decision_act, routing_coef = self.mc(
+                poses, acts, n, decision_pose, decision_act
+            )
+
+        # Project decision pose -> single mortality logit
+        # decision_pose: [B, mc_num_caps, mc_caps_dim] ; embedding: [mc_num_caps, mc_caps_dim]
+        # einsum -> [B, mc_num_caps] == [B,1] → unsqueeze to [B,1] for clarity
+        decision_logit = torch.einsum('bcd,cd->bc', decision_pose, self.embedding).unsqueeze(1)  # [B,1]
+        return decision_logit, routing_coef
+def forward_capsule_from_routes(
+    z_unimodal: Dict[str, torch.Tensor],          
+    fusion: Dict[str, nn.Module],                   
+    projector: RoutePrimaryProjector,               # d -> (pc_dim+1) per route
+    capsule_head: CapsuleMortalityHead,             # CapsuleFC wrapper -> [B,1]
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+
+    # Build 7 route embeddings
+    route_embs = make_route_inputs(z_unimodal, fusion)       # dict of 7 -> [B,d]
+
+    # Project to primary capsules (pose + act)
+    poses, acts = projector(route_embs)                      # [B,7,pc_dim], [B,7,1]
+
+    # Capsule routing → final logit
+    final_logit, routing_coef = capsule_head(poses, acts)    # [B,1], [B,7,1]
+
+    prim_acts = acts.squeeze(-1).detach()                    # [B,7] (for monitoring)
+    return final_logit, prim_acts, route_embs
 
 
-def _masked_mean_per_route(x: torch.Tensor, avail: torch.Tensor) -> torch.Tensor:
-    B, R = x.shape
-    denom = avail.sum(dim=0)  # [R]
-    safe_avail = avail.clone()
-    zero_routes = (denom < 0.5)
-    if zero_routes.any():
-        safe_avail[:, zero_routes] = 1.0
-        denom = denom.masked_fill(zero_routes, float(B))
-    num = (x * safe_avail).sum(dim=0)
-    return num / denom.clamp_min(1.0)
-
-
-def forward_mixture_of_logits_loss_based(
-    z_unimodal: Dict[str, torch.Tensor],
-    fusion: Dict[str, nn.Module],
-    route_heads: Dict[str, RouteHead],
-    masks: Optional[Dict[str, torch.Tensor]],
-    y: torch.Tensor,                 # [B,1] target
-    gater: LossBasedGater,
-    update_ema: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
-    device = next(iter(z_unimodal.values())).device
-
-    route_embs = make_route_inputs(z_unimodal, fusion)
-    route_logits = compute_route_logits(route_embs, route_heads)  # [B,7]
-
-    # per-sample per-route BCE loss
-    y_rep = y.to(route_logits.dtype).expand_as(route_logits)      # [B,7]
-    per_elem_bce = F.binary_cross_entropy_with_logits(route_logits, y_rep, reduction="none")  # [B,7]
-
-    # availability mask [B,7]
-    B, R = route_logits.shape
-    avail = route_availability_mask(masks, batch_size=B, device=device)  # [B,7]
-
-    # mean loss per route over available samples
-    per_route_mean_loss = _masked_mean_per_route(per_elem_bce, avail)    # [7]
-
-    # 4) EMA update (train only) and global gates
-    gater.update_ema(per_route_mean_loss.detach(), do_update=bool(update_ema))
-    base_gates = gater.gates()  # [7]
-
-    # 5) apply availability per-sample and renormalize
-    gates = base_gates.unsqueeze(0).expand(B, R) * avail.to(base_gates.dtype)  # [B,7]
-    sums = gates.sum(dim=1, keepdim=True)
-    need_uniform = (sums.squeeze(-1) < 1e-8)
-    if need_uniform.any():
-        uniform = torch.full((B, R), 1.0 / R, device=device, dtype=gates.dtype)
-        gates = torch.where(need_uniform.unsqueeze(-1), uniform, gates)
-        sums = gates.sum(dim=1, keepdim=True)
-    gates = gates / sums.clamp_min(1e-6)
-
-    # 6) final mixture
-    final_logit = (gates * route_logits).sum(dim=1, keepdim=True)  # [B,1]
-    return final_logit, gates, route_embs, route_logits
+__all__ = [
+    # Fusion builders
+    "PairwiseFusion",
+    "TrimodalFusion",
+    "build_fusions",
+    "make_route_inputs",
+    # Capsule bridge
+    "RoutePrimaryProjector",
+    "CapsuleMortalityHead",
+    "forward_capsule_from_routes",
+]
