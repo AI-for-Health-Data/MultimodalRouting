@@ -1,4 +1,3 @@
-# MIMIC-IV/MortModel/encoders.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,7 +12,8 @@ from env_config import DEVICE, CFG
 def _dbg(msg: str) -> None:
     if getattr(CFG, "verbose", False):
         print(msg)
-        
+
+
 def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
     return (x * mask.unsqueeze(-1)).sum(dim=1) / denom
@@ -26,8 +26,16 @@ def _ensure_2d_mask(mask: Optional[torch.Tensor], B: int, T: int, device) -> tor
         return mask.unsqueeze(0).expand(B, -1).contiguous().float()
     return mask.float()
 
-
 class BEHRTLabEncoder(nn.Module):
+    """
+    Transformer encoder over structured sequences.
+    Inputs: x [B, T, F] where F = number of variables (e.g., 17),
+            mask [B, T] where 1=valid timestep.
+    Pooling:
+      - "mean": masked mean over time
+      - "last": last valid timestep
+      - "cls" : learnable CLS token (not included in returned sequence; used only for pooled output)
+    """
     def __init__(
         self,
         n_feats: int,
@@ -36,14 +44,17 @@ class BEHRTLabEncoder(nn.Module):
         n_layers: int = 2,
         n_heads: int = 8,
         dropout: float = 0.1,
-        pool: Literal["last", "mean"] = "mean",
+        pool: Literal["last", "mean", "cls"] = "mean",
         activation: Literal["relu", "gelu"] = "relu",
     ) -> None:
         super().__init__()
         self.pool = pool
         self.out_dim = d
         self.input_proj = nn.Linear(n_feats, d)
+        # positional encoding for T steps (structured timesteps)
         self.pos = nn.Parameter(torch.randn(1, seq_len, d) * 0.02)
+        # learnable CLS (used only if pool="cls")
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d))
 
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d,
@@ -54,6 +65,7 @@ class BEHRTLabEncoder(nn.Module):
             batch_first=True,
         )
         self.enc = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+
         self.out = nn.Sequential(
             nn.LayerNorm(d),
             nn.Linear(d, d),
@@ -61,7 +73,11 @@ class BEHRTLabEncoder(nn.Module):
             nn.Dropout(dropout),
         )
 
+        # init CLS a bit
+        nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
+
     def _pos(self, T: int, std: float = 0.02) -> torch.Tensor:
+        """Expand positional embeddings if sequence longer than current cache."""
         if self.pos.size(1) < T:
             extra = torch.randn(
                 1, T - self.pos.size(1), self.pos.size(-1),
@@ -70,37 +86,89 @@ class BEHRTLabEncoder(nn.Module):
             self.pos = nn.Parameter(torch.cat([self.pos, extra], dim=1))
         return self.pos[:, :T, :]
 
+    def _encode_with_optional_cls(
+        self, x: torch.Tensor, mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Run transformer. If pool='cls', prepend CLS and return:
+          - seq_out_no_cls: [B,T,D] (timesteps only)
+          - mask_out:       [B,T]   (unchanged mask)
+          - cls_vec:        [B,D]   (pooled cls), else None
+        If pool!='cls', cls_vec=None and output is just seq-out.
+        """
+        B, T, F = x.shape
+        dev = x.device
+        assert self.input_proj.in_features == F, \
+            f"Expected F={self.input_proj.in_features}, got F={F}"
+
+        H_in = self.input_proj(x) + self._pos(T)  # [B,T,D]
+
+        if self.pool == "cls":
+            cls_tok = self.cls_token.expand(B, 1, -1)  # [B,1,D]
+            H_in = torch.cat([cls_tok, H_in], dim=1)   # [B,T+1,D]
+            pad_mask = torch.cat([torch.zeros(B, 1, device=dev, dtype=torch.bool), (mask < 0.5)], dim=1)  # [B,T+1]
+        else:
+            pad_mask = (mask < 0.5)  # [B,T]
+
+        H = self.enc(H_in, src_key_padding_mask=pad_mask)  # [B,T(+1),D]
+        H = self.out(H)
+
+        if self.pool == "cls":
+            cls_vec = H[:, 0, :]                 # [B,D]
+            seq_out = H[:, 1:, :]                # [B,T,D]
+            return seq_out, mask, cls_vec
+        else:
+            return H, mask, None
+
     def encode_seq(
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns per-timestep sequence representations (without CLS) and mask:
+          - h: [B,T,D]
+          - mask: [B,T] float
+        """
+        if x.dim() == 2:
+            # Allow [B,T] only when n_feats == 1
+            x = x.unsqueeze(-1)
+        B, T, _ = x.shape
+        dev = next(self.parameters()).device
+        m = _ensure_2d_mask(mask, B, T, dev)
+
+        h, m_out, _ = self._encode_with_optional_cls(x.to(dev), m.to(dev))
+        return h, m_out
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         if x.dim() == 2:
             x = x.unsqueeze(-1)
         B, T, _ = x.shape
         dev = next(self.parameters()).device
-        mask = _ensure_2d_mask(mask, B, T, dev)
+        m = _ensure_2d_mask(mask, B, T, dev)
 
-        h = self.input_proj(x) + self._pos(T)
-        pad_mask = (mask < 0.5)
-        h = self.enc(h, src_key_padding_mask=pad_mask)
-        h = self.out(h)
-        return h, mask
+        # If cls pooling, compute cls inside; otherwise use seq + masked pool
+        seq_h, m_out, cls_vec = self._encode_with_optional_cls(x.to(dev), m.to(dev))
+        if self.pool == "cls":
+            return cls_vec  # [B,D]
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        h, m = self.encode_seq(x, mask=mask)
         if self.pool == "last":
-            if (m.sum(dim=1) != m.size(1)).any():
-                idx = (m.sum(dim=1) - 1).clamp_min(0).long()
-                z = h[torch.arange(h.size(0), device=h.device), idx]
+            if (m_out.sum(dim=1) != m_out.size(1)).any():
+                idx = (m_out.sum(dim=1) - 1).clamp_min(0).long()
+                z = seq_h[torch.arange(seq_h.size(0), device=seq_h.device), idx]
             else:
-                z = h[:, -1]
-        else:
-            z = _masked_mean(h, m)
+                z = seq_h[:, -1]
+        else:  # mean
+            z = _masked_mean(seq_h, m_out)
         return z
 
 
 class BioClinBERTEncoder(nn.Module):
+    """
+    Aggregates CLS embeddings across chunked notes per patient.
+    - encode_seq: accepts List[str] or List[List[str]] (per-patient)
+    - forward   : masked mean over chunk-CLS (or attention if enabled)
+    """
     def __init__(
         self,
         model_name: str,
@@ -249,6 +317,7 @@ class BioClinBERTEncoder(nn.Module):
         max_total_chunks: int = 32,
         chunk_bs: int = 16,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return [B,S,D] chunk-CLS sequence and [B,S] mask."""
         device = self._device()
         patients = self._normalize_input(batch_notes)
 
@@ -305,6 +374,7 @@ class BioClinBERTEncoder(nn.Module):
         max_total_chunks: Optional[int] = None,
         chunk_bs: int = 16,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Same as encode_seq, but when notes are already pre-chunked."""
         device = self._device()
         seqs: List[torch.Tensor] = []
         lengths: List[int] = []
@@ -368,6 +438,7 @@ class BioClinBERTEncoder(nn.Module):
         return Hpad, M
 
     def forward(self, notes_or_chunks: Union[List[str], List[List[str]]]) -> torch.Tensor:
+        """Return pooled note embedding [B,D] (mean or attention over chunk CLS)."""
         is_prechunked = (
             isinstance(notes_or_chunks, list)
             and len(notes_or_chunks) > 0
@@ -385,7 +456,6 @@ class BioClinBERTEncoder(nn.Module):
         scores = scores.masked_fill(M < 0.5, torch.finfo(scores.dtype).min)
         w = torch.softmax(scores, dim=1)
         return (w.unsqueeze(-1) * H).sum(dim=1)
-
 
 class ImageEncoder(nn.Module):
     def __init__(self, d: int, dropout: float = 0.0, img_agg: Literal["last", "mean", "attention"] = "last") -> None:
@@ -496,7 +566,7 @@ class _MLP(nn.Module):
 
 
 class PairwiseConcatFusion(nn.Module):
-    """(za, zb) -> concat -> MLP -> d, with small residual to average(za, zb)."""
+    """(za, zb) -> concat/rich -> MLP -> d, with residual to average(za, zb)."""
     def __init__(self, d: int, p_drop: float = 0.1, feature_mode: str = "concat"):
         super().__init__()
         assert feature_mode in {"concat", "rich"}
@@ -520,7 +590,7 @@ class PairwiseConcatFusion(nn.Module):
 
 
 class TrimodalConcatFusion(nn.Module):
-    """(zL, zN, zI) -> concat -> MLP -> d, with residual to their average."""
+    """(zL, zN, zI) -> concat/rich -> MLP -> d, with residual to their average."""
     def __init__(self, d: int, p_drop: float = 0.1, feature_mode: str = "concat"):
         super().__init__()
         assert feature_mode in {"concat", "rich"}
@@ -640,11 +710,11 @@ class EncoderConfig:
     d: int = 256
     dropout: float = 0.1
     # structured
-    structured_seq_len: int = 24
-    structured_n_feats: int = 128
+    structured_seq_len: int = 24            # 48h @ 2h bins
+    structured_n_feats: int = 128           # set to 17 in CFG for your setup
     structured_layers: int = 2
     structured_heads: int = 8
-    structured_pool: Literal["last", "mean"] = "mean"
+    structured_pool: Literal["last", "mean", "cls"] = "mean"
     # notes
     text_model_name: str = "emilyalsentzer/Bio_ClinicalBERT"
     text_max_len: int = 512
@@ -735,18 +805,19 @@ def encode_all_routes_from_batch(
         N_seq, mN_seq = bbert.encode_seq(notes_list)
 
     I_seq, mI_seq = imgenc.encode_seq(imgs)
-    
+
     route_embs, route_act = extractor(L_seq, mL_seq, N_seq, mN_seq, I_seq, mI_seq)
 
-    # SANITY PRINT 
+    # One-time sanity print
     if not hasattr(extractor, "_printed_once"):
         extractor._printed_once = True
         keys = ", ".join(f"{k}:{tuple(v.shape)}" for k, v in route_embs.items())
         acts = ", ".join(f"{k}:{tuple(v.shape)}" for k, v in route_act.items())
         _dbg(f"[encoders] routes -> {keys}")
         _dbg(f"[encoders] route_acts (sigmoid) -> {acts}")
-        
+
     return route_embs, route_act
+
 
 @torch.no_grad()
 def encode_unimodal_pooled(
