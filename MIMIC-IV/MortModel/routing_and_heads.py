@@ -42,7 +42,7 @@ class PairwiseFusion(nn.Module):
         d: int,
         hidden: Optional[Sequence[int]] = None,
         p_drop: float = 0.1,
-        feature_mode: str = "concat",  # or "rich"
+        feature_mode: str = "concat",  
     ):
         super().__init__()
         assert feature_mode in {"concat", "rich"}
@@ -74,7 +74,7 @@ class TrimodalFusion(nn.Module):
         d: int,
         hidden: Optional[Sequence[int]] = None,
         p_drop: float = 0.1,
-        feature_mode: str = "concat",  # or "rich"
+        feature_mode: str = "concat",  
     ):
         super().__init__()
         assert feature_mode in {"concat", "rich"}
