@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    import lightning as L
+    import lightning as L 
 except Exception:
     L = None
 
@@ -21,18 +21,16 @@ try:
 except Exception:
     yaml = None
 
-
 ROUTES: List[str] = ["L", "N", "I", "LN", "LI", "NI", "LNI"]
 BLOCKS: Dict[str, List[str]] = {
     "uni": ["L", "N", "I"],
     "bi":  ["LN", "LI", "NI"],
     "tri": ["LNI"],
 }
-TASKS: List[str] = ["mort", "pe", "ph"]
+TASKS: List[str] = ["mort"]
 
 @dataclass
 class Config:
-    # Core dims / optimization
     d: int = 768
     dropout: float = 0.1
     lr: float = 2e-4
@@ -41,14 +39,13 @@ class Config:
     max_epochs_bi: int = 5
     max_epochs_tri: int = 5
     num_workers: int = 4
-    ema_decay: float = 0.98
     steps_per_epoch_hint: int = 500
 
     # Text encoder
     text_model_name: str = "emilyalsentzer/Bio_ClinicalBERT"
     max_text_len: int = 512
 
-    # Structured (tabular time series)
+    # Structured 
     structured_seq_len: int = 24
     structured_n_feats: int = 128
     structured_layers: int = 2
@@ -57,37 +54,33 @@ class Config:
     # Image encoder
     image_model_name: str = "resnet34"
 
-    # Fairness
-    sensitive_keys: List[str] = field(
-        default_factory=lambda: ["age_group", "race", "ethnicity", "insurance"]
-    )
-    lambda_fair: float = 0.0
+    # Fusion / routing
+    feature_mode: str = "concat"             
+    routing_backend: str = "capsule"         
+    use_gates: bool = True                    
 
-    # Routing (concat-only MLP fusions)
-    routing_backend: str = "embedding_concat"
-    use_gates: bool = True  
-
-    # Gate computation and mixing 
-    gamma: float = 1.0
-    loss_gate_alpha: float = 4.0
-    route_gate_mode: str = "loss_based" 
-    l2norm_each: bool = False
-
-    bi_fusion_mode: str = "mlp"        
-    tri_fusion_mode: str = "mlp"       
-    feature_mode: str = "concat"       
+    # Capsule head hyperparams 
+    capsule_pc_dim: int = 32                 
+    capsule_mc_caps_dim: int = 64             
+    capsule_num_routing: int = 3
+    capsule_act_type: str = "EM"             
+    capsule_layer_norm: bool = False          
+    capsule_dim_pose_to_vote: int = 0       
 
     # Paths & misc
     data_root: str = "./data"
     ckpt_root: str = "./checkpoints"
-    task_name: str = "mort"            
+    task_name: str = "mort"
 
+    # System
     use_cudnn_benchmark: bool = True
-    precision_amp: str = "auto"       
+    precision_amp: str = "auto"              
     deterministic: bool = False
     seed: int = 42
     verbose: bool = True
 
+
+# Global singletons
 CFG: Config = Config()
 DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 TASK2IDX: Dict[str, int] = {name: i for i, name in enumerate(TASKS)}
@@ -97,12 +90,13 @@ def set_global_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def set_deterministic(enabled: bool) -> None:
     try:
-        torch.use_deterministic_algorithms(bool(enabled))  
+        torch.use_deterministic_algorithms(bool(enabled)) 
     except Exception:
         pass
     torch.backends.cudnn.deterministic = bool(enabled)
@@ -148,7 +142,8 @@ def is_cuda_device(dev) -> bool:
 
 
 def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
+    if path and not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
 
 
 def set_requires_grad(module: nn.Module, flag: bool) -> None:
@@ -215,14 +210,26 @@ def load_cfg(yaml_path: Optional[str] = None,
         "MIMICIV_DATA_ROOT": ("data_root", str),
         "MIMICIV_CKPT_ROOT": ("ckpt_root", str),
         "MIMICIV_TASK": ("task_name", str),
-        "MIMICIV_BACKEND": ("routing_backend", str),
-        "MIMICIV_BI_FUSION": ("bi_fusion_mode", str),
-        "MIMICIV_TRI_FUSION": ("tri_fusion_mode", str),
+        "MIMICIV_TEXT_MODEL": ("text_model_name", str),
+        "MIMICIV_MAX_TEXT_LEN": ("max_text_len", int),
+        "MIMICIV_STRUCT_SEQ_LEN": ("structured_seq_len", int),
+        "MIMICIV_STRUCT_N_FEATS": ("structured_n_feats", int),
         "MIMICIV_FEATURE_MODE": ("feature_mode", str),
-        "MIMICIV_BI_LAYERS": ("bi_layers", int),
-        "MIMICIV_BI_HEADS": ("bi_heads", int),
-        "MIMICIV_TRI_LAYERS": ("tri_layers", int),
-        "MIMICIV_TRI_HEADS": ("tri_heads", int),
+        "MIMICIV_ROUTING_BACKEND": ("routing_backend", str),
+        "MIMICIV_CAP_PC_DIM": ("capsule_pc_dim", int),
+        "MIMICIV_CAP_MC_DIM": ("capsule_mc_caps_dim", int),
+        "MIMICIV_CAP_ITERS": ("capsule_num_routing", int),
+        "MIMICIV_CAP_ACT": ("capsule_act_type", str),
+        "MIMICIV_CAP_LN": ("capsule_layer_norm", lambda s: str(s).lower() in {"1","true","yes"}),
+        "MIMICIV_CAP_DPOSE2VOTE": ("capsule_dim_pose_to_vote", int),
+        "MIMICIV_LR": ("lr", float),
+        "MIMICIV_BS": ("batch_size", int),
+        "MIMICIV_DROPOUT": ("dropout", float),
+        "MIMICIV_NUM_WORKERS": ("num_workers", int),
+        "MIMICIV_PRECISION": ("precision_amp", str),
+        "MIMICIV_DETERMINISTIC": ("deterministic", lambda s: str(s).lower() in {"1","true","yes"}),
+        "MIMICIV_SEED": ("seed", int),
+        "MIMICIV_VERBOSE": ("verbose", lambda s: str(s).lower() in {"1","true","yes"}),
     }
     for env_key, (cfg_key, caster) in env_map.items():
         if env_key in os.environ:
