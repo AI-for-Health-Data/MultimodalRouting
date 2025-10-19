@@ -8,9 +8,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from env_config import DEVICE
+from env_config import DEVICE, CFG
 
-
+def _dbg(msg: str) -> None:
+    if getattr(CFG, "verbose", False):
+        print(msg)
+        
 def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
     return (x * mask.unsqueeze(-1)).sum(dim=1) / denom
@@ -732,9 +735,18 @@ def encode_all_routes_from_batch(
         N_seq, mN_seq = bbert.encode_seq(notes_list)
 
     I_seq, mI_seq = imgenc.encode_seq(imgs)
+    
+    route_embs, route_act = extractor(L_seq, mL_seq, N_seq, mN_seq, I_seq, mI_seq)
 
-    return extractor(L_seq, mL_seq, N_seq, mN_seq, I_seq, mI_seq)
-
+    # SANITY PRINT 
+    if not hasattr(extractor, "_printed_once"):
+        extractor._printed_once = True
+        keys = ", ".join(f"{k}:{tuple(v.shape)}" for k, v in route_embs.items())
+        acts = ", ".join(f"{k}:{tuple(v.shape)}" for k, v in route_act.items())
+        _dbg(f"[encoders] routes -> {keys}")
+        _dbg(f"[encoders] route_acts (sigmoid) -> {acts}")
+        
+    return route_embs, route_act
 
 @torch.no_grad()
 def encode_unimodal_pooled(
