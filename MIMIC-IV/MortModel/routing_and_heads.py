@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from env_config import ROUTES, DEVICE, CFG
-from . import capsule_layers
+import capsule_layers
 
 def _dbg(msg: str) -> None:
     if getattr(CFG, "verbose", False):
@@ -247,7 +247,9 @@ class CapsuleMortalityHead(nn.Module):
                 poses, acts, n, decision_pose, decision_act
             )
 
-        decision_logit = torch.einsum('bcd,cd->bc', decision_pose, self.embedding).unsqueeze(1)  # [B,1]
+        # decision_logit = torch.einsum('bcd,cd->bc', decision_pose, self.embedding).unsqueeze(1)  # [B,1]
+        decision_logit = torch.einsum('bcd,cd->bc', decision_pose, self.embedding)  # [B,1]
+
         # SANITY PRINT (once) 
         if not hasattr(self, "_printed_done"):
             self._printed_done = True
@@ -285,9 +287,9 @@ def forward_capsule_from_routes(
     # Capsule routing → final logit
     final_logit, routing_coef = capsule_head(poses, acts)    # [B,1], [B,7,1]
 
-    prim_acts = acts.squeeze(-1).detach()                    # [B,7] (for monitoring)
+    prim_acts = acts.squeeze(-1).detach()                    # [B,7] 
     
-    # optional once-only peek at primary acts
+    # once-only peek at primary acts
     if not hasattr(forward_capsule_from_routes, "_printed_acts"):
         forward_capsule_from_routes._printed_acts = True
         with torch.no_grad():
