@@ -178,7 +178,7 @@ class CapsuleMortalityHead(nn.Module):
     """
     Wraps CapsuleFC to route 7 primary capsules (poses + acts)
     and produce a single mortality logit per sample.
-    Matches legacy routing behavior; the number of decision capsules here is 1 (binary).
+    the number of decision capsules here is 1 (binary).
     """
     def __init__(
         self,
