@@ -6,8 +6,7 @@ from typing import List, Optional, Literal, Tuple, Sequence, Union, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from env_config import DEVICE, CFG
+from env_config import DEVICE, CFG, amp_autocast_dtype
 
 def _dbg(msg: str) -> None:
     if getattr(CFG, "verbose", False):
@@ -297,7 +296,13 @@ class BioClinBERTEncoder(nn.Module):
             input_ids[i, :L] = tw["input_ids"]
             attention_mask[i, :L] = tw["attention_mask"]
 
-        with torch.inference_mode(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+        ac_dtype = amp_autocast_dtype(CFG.precision_amp)
+        ac_enabled = ac_dtype is not None
+        with torch.inference_mode(), torch.autocast(
+            device_type="cuda" if torch.cuda.is_available() else "cpu",
+            dtype=ac_dtype if ac_enabled else torch.float32,
+            enabled=ac_enabled,
+        ):
             self.bert.eval()
             out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
             cls = out.last_hidden_state[:, 0]
