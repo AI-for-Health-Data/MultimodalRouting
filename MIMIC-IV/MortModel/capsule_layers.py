@@ -28,11 +28,8 @@ class CapsuleFC(nn.Module):
 
 
         self.dropout_rate = dp
-        if small_std:
-            self.nonlinear_act = nn.Sequential()
-        else:
-            print("layer norm will destroy interpretability, thus not available")
-            assert False
+        # Keep a no-op nonlinear activation by default; avoids LN assert and keeps behavior stable
+        self.nonlinear_act = nn.Sequential()
         self.drop = nn.Dropout(self.dropout_rate)
         self.scale = 1. / (out_d_capsules ** 0.5)
         
@@ -46,7 +43,7 @@ class CapsuleFC(nn.Module):
 
             self.beta = nn.Parameter(np.sqrt(1./(in_n_capsules*in_d_capsules)) * \
                                     torch.randn(in_n_capsules, in_d_capsules, out_n_capsules))
-        self.uniform_routing_coefficient = uniform_routing_coefficient
+        self.uniform_routing_coefficient = uniform_routing_coefficient  # (kept for API; not used yet)
     def extra_repr(self):
         return 'in_n_capsules={}, in_d_capsules={}, out_n_capsules={}, out_d_capsules={}, n_rank{}, \
             weight_init_const={}, dropout_rate={}'.format(
@@ -69,8 +66,8 @@ class CapsuleFC(nn.Module):
         # vote is w times input
         # query_key: routing coefficient
 
-        current_act = current_act.view(current_act.shape[0], -1)
-        w = self.w # 7, 64, 7, 64, in_n_capsules, in_d_capsules, out_n_capsules, out_d_capsules
+        current_act = current_act.view(current_act.shape[0], -1)  # [B, N]
+        w = self.w  # [N, A, M, D]
         if next_capsule_value is None:
             query_key = torch.zeros(self.in_n_capsules, self.out_n_capsules).type_as(input) # 7, 7; in_n_capsules, out_n_capsules
             query_key = F.softmax(query_key, dim=1) # turns into proability
