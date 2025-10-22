@@ -13,7 +13,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 
-from env_config import CFG, DEVICE, load_cfg, autocast_context, ensure_dir
+from env_config import CFG, DEVICE, load_cfg, autocast_context, ensure_dir, amp_autocast_dtype
 from encoders import (
     BEHRTLabEncoder, BioClinBERTEncoder, ImageEncoder,
     EncoderConfig, build_encoders,
@@ -347,7 +347,9 @@ def main():
         print(f"[main] Resuming from {args.resume}")
         start_epoch = load_checkpoint(args.resume, behrt, bbert, imgenc, fusion, projector, cap_head, optimizer)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE == "cuda"))
+    # scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE == "cuda"))
+    use_fp16_scaler = (DEVICE == "cuda") and (amp_autocast_dtype(CFG.precision_amp) == torch.float16)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_fp16_scaler)
     bce = nn.BCEWithLogitsLoss(reduction="mean")
 
     printed_once = False
