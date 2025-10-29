@@ -11,6 +11,30 @@ def _dbg(msg: str) -> None:
     if getattr(CFG, "verbose", False):
         print(msg)
 
+def _peek_tensor(name: str, x: torch.Tensor, k: int = 3) -> None:
+    """One-time compact peek at a tensor: shape + a few values."""
+    if not getattr(CFG, "verbose", False):
+        return
+    if not hasattr(_peek_tensor, "_printed"):
+        _peek_tensor._printed = set()
+    key = f"{name}_shape"
+    if key in _peek_tensor._printed:
+        return
+    _peek_tensor._printed.add(key)
+    try:
+        with torch.no_grad():
+            flat = x.reshape(-1)
+            vals = flat[:k].detach().cpu().tolist()
+        print(f"[peek] {name}: shape={tuple(x.shape)} sample={vals}")
+    except Exception:
+        print(f"[peek] {name}: shape={tuple(x.shape)} sample=<unavailable>")
+
+@torch.no_grad()
+def _nan_guard(tag: str, x: torch.Tensor) -> None:
+    if torch.isnan(x).any() or torch.isinf(x).any():
+        _dbg(f"[NaN/Inf WARNING] {tag}: nan={torch.isnan(x).any().item()} inf={torch.isinf(x).any().item()}")
+
+
 class _MLP(nn.Module):
     def __init__(
         self,
@@ -34,19 +58,23 @@ class _MLP(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        y = self.net(x)
+        _nan_guard("_MLP.out", y)
+        return y
+
 
 class PairwiseFusion(nn.Module):
     """
     Given two unimodal embeddings za, zb (both [B, d]), build a pairwise route embedding.
-    Mode 'concat': [za, zb] -> MLP -> d (+ residual to 0.5*(za+zb))
+    feature_mode='concat': [za, zb] -> MLP -> d (+ residual to 0.5*(za+zb))
+    feature_mode='rich'  : [za, zb, za*zb, |za-zb|] -> MLP -> d (+ residual)
     """
     def __init__(
         self,
         d: int,
         hidden: Optional[Sequence[int]] = None,
         p_drop: float = 0.1,
-        feature_mode: str = "concat",  
+        feature_mode: str = "concat",
     ):
         super().__init__()
         assert feature_mode in {"concat", "rich"}
@@ -64,21 +92,24 @@ class PairwiseFusion(nn.Module):
             x = torch.cat([za, zb, had, diff], dim=-1)
         h = self.mlp(x)
         base = 0.5 * (za + zb)
-        return h + self.res_scale * base
-
+        z = h + self.res_scale * base
+        _peek_tensor("fusion.pair_z", z)
+        _nan_guard("fusion.pair_z", z)
+        return z
 
 
 class TrimodalFusion(nn.Module):
     """
-    Given three unimodal embeddings zL,zN,zI (all [B, d]), build the trimodal route embedding.
-    Mode 'concat': [zL, zN, zI] -> MLP -> d (+ residual to average)
+    Given three unimodal embeddings zL, zN, zI (all [B, d]), build the trimodal route embedding.
+    feature_mode='concat': [zL, zN, zI] -> MLP -> d (+ residual to mean)
+    feature_mode='rich'  : [zL, zN, zI, zL*zN, zL*zI, zN*zI, zL*zN*zI] -> MLP -> d (+ residual)
     """
     def __init__(
         self,
         d: int,
         hidden: Optional[Sequence[int]] = None,
         p_drop: float = 0.1,
-        feature_mode: str = "concat",  
+        feature_mode: str = "concat",
     ):
         super().__init__()
         assert feature_mode in {"concat", "rich"}
@@ -98,7 +129,10 @@ class TrimodalFusion(nn.Module):
             x = torch.cat([zL, zN, zI, zLN, zLI, zNI, zLNI], dim=-1)
         h = self.mlp(x)
         base = (zL + zN + zI) / 3.0
-        return h + self.res_scale * base
+        z = h + self.res_scale * base
+        _peek_tensor("fusion.tri_z", z)
+        _nan_guard("fusion.tri_z", z)
+        return z
 
 
 def build_fusions(
@@ -115,6 +149,7 @@ def build_fusions(
     LI  = PairwiseFusion(d, p_drop=p_drop, feature_mode=feature_mode).to(dev)
     NI  = PairwiseFusion(d, p_drop=p_drop, feature_mode=feature_mode).to(dev)
     LNI = TrimodalFusion(d, p_drop=p_drop, feature_mode=feature_mode).to(dev)
+    _dbg(f"[build_fusions] feature_mode={feature_mode} -> LN,LI,NI:Pairwise / LNI:Trimodal @ d={d}")
     return {"LN": LN, "LI": LI, "NI": NI, "LNI": LNI}
 
 
@@ -124,16 +159,19 @@ def _safe_clone(x: torch.Tensor) -> torch.Tensor:
 
 
 def make_route_inputs(
-    z: Dict[str, torch.Tensor],        
-    fusion: Dict[str, nn.Module],       
+    z: Dict[str, torch.Tensor],
+    fusion: Dict[str, nn.Module],
 ) -> Dict[str, torch.Tensor]:
     """
     Build embeddings for all 7 routes from unimodal pooled embeddings.
+    Input:
+        z: {"L","N","I"} each [B, d]
+        fusion: {"LN","LI","NI","LNI"}
     Output:
-        {"L","N","I","LN","LI","NI","LNI"} with each tensor [B, d]
+        {"L","N","I","LN","LI","NI","LNI"} each [B, d]
     """
     zL, zN, zI = z["L"], z["N"], z["I"]
-    return {
+    routes = {
         "L":   _safe_clone(zL),
         "N":   _safe_clone(zN),
         "I":   _safe_clone(zI),
@@ -142,16 +180,24 @@ def make_route_inputs(
         "NI":  fusion["NI"](zN, zI),
         "LNI": fusion["LNI"](zL, zN, zI),
     }
+    # One-time sanity
+    if not hasattr(make_route_inputs, "_printed_once"):
+        make_route_inputs._printed_once = True
+        sizes = ", ".join(f"{k}:{tuple(v.shape)}" for k, v in routes.items())
+        _dbg(f"[make_route_inputs] routes -> {sizes}")
+        for k, v in routes.items():
+            _nan_guard(f"route.{k}", v)
+            _peek_tensor(f"route.{k}", v)
+    return routes
 
 
-# Primary capsule projection (pc heads)
 class RoutePrimaryProjector(nn.Module):
     """
-    Legacy-equivalent behavior:
-      For each route r in {L,N,I,LN,LI,NI,LNI}, apply a dedicated Linear(d_in -> pc_dim+1),
-      then split into:
-        - pose: [B, 7, pc_dim]
-        - act : sigmoid([B, 7, 1])
+    Per-route projection: d_in -> (pc_dim + 1)
+    Split into:
+      - pose: [B, pc_dim]
+      - act:  sigmoid([B,1])
+    Applied independently for each of the 7 routes in ROUTES.
     """
     def __init__(self, d_in: int, pc_dim: int):
         super().__init__()
@@ -159,35 +205,47 @@ class RoutePrimaryProjector(nn.Module):
         self.proj = nn.ModuleDict({r: nn.Linear(d_in, self.pc_dim + 1) for r in ROUTES})
 
     def forward(self, route_embs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            route_embs: dict(route -> [B, d_in]) for all 7 routes
+        Returns:
+            poses: [B, 7, pc_dim]
+            acts:  [B, 7, 1]   (sigmoid activations)
+        """
         device = next(self.parameters()).device
-        pcs = [self.proj[r](route_embs[r]) for r in ROUTES]          # list of [B, pc_dim+1]
-        pc_all = torch.stack(pcs, dim=1).to(device)                  # [B, 7, pc_dim+1]
-        poses = pc_all[:, :, :self.pc_dim]                           # [B, 7, pc_dim]
-        acts  = torch.sigmoid(pc_all[:, :, self.pc_dim:])            # [B, 7, 1]
+        dtype  = next(self.parameters()).dtype
+        pcs = [ self.proj[r]( route_embs[r].to(device=device, dtype=dtype) ) for r in ROUTES ]
+        pc_all = torch.stack(pcs, dim=1)            # [B, 7, pc_dim+1], already correct dtype/device
+        poses = pc_all[:, :, :self.pc_dim]
+        acts  = torch.sigmoid(pc_all[:, :, self.pc_dim:])
+        
+    
+        # SANITY PRINT
         if not hasattr(self, "_printed_once"):
             self._printed_once = True
             _dbg(f"[projector] pc_all:{tuple(pc_all.shape)} poses:{tuple(poses.shape)} acts:{tuple(acts.shape)}")
             with torch.no_grad():
                 a = acts.detach()
                 _dbg(f"[projector] acts stats -> min:{a.min().item():.4f} max:{a.max().item():.4f} mean:{a.mean().item():.4f}")
+                _peek_tensor("projector.poses", poses)
+                _peek_tensor("projector.acts", acts)
+        _nan_guard("projector.poses", poses)
+        _nan_guard("projector.acts", acts)
         return poses, acts
 
-
-# Capsule head wrapper (binary mortality -> one decision capsule)
 class CapsuleMortalityHead(nn.Module):
     """
-    Wraps CapsuleFC to route 7 primary capsules (poses + acts)
-    and produce a single mortality logit per sample.
-    the number of decision capsules here is 1 (binary).
+    Routes the 7 primary capsules (poses + acts) into TWO decision capsules
+    (class 0=survive, class 1=expire) and returns 2-class logits.
     """
     def __init__(
         self,
-        pc_dim: int,
-        mc_caps_dim: int,
+        pc_dim: int,              # primary capsule pose dim
+        mc_caps_dim: int,         # decision capsule pose dim
         num_routing: int = 3,
         dp: float = 0.1,
         act_type: str = "EM",
-        layer_norm: bool = False,
+        layer_norm: bool = False,     # toggles CapsuleFC init (small_std)
         dim_pose_to_vote: int = 0,
     ):
         super().__init__()
@@ -195,8 +253,8 @@ class CapsuleMortalityHead(nn.Module):
         self.mc_caps_dim = int(mc_caps_dim)
         self.num_routing = int(num_routing)
 
-        # Single decision capsule (binary task)
-        self.mc_num_caps = 1
+        # TWO decision capsules (binary 2-class CE)
+        self.mc_num_caps = 2
 
         self.mc = capsule_layers.CapsuleFC(
             in_n_capsules=7,
@@ -210,7 +268,11 @@ class CapsuleMortalityHead(nn.Module):
             dim_pose_to_vote=dim_pose_to_vote,
         )
 
-        self.embedding = nn.Parameter(torch.zeros(self.mc_num_caps, self.mc_caps_dim))
+        # Map each decision capsule pose -> one scalar logit
+        self.cls0 = nn.Linear(self.mc_caps_dim, 1)
+        self.cls1 = nn.Linear(self.mc_caps_dim, 1)
+        nn.init.normal_(self.cls0.weight, std=0.02); nn.init.zeros_(self.cls0.bias)
+        nn.init.normal_(self.cls1.weight, std=0.02); nn.init.zeros_(self.cls1.bias)
 
     def forward(self, poses: torch.Tensor, acts: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -218,79 +280,119 @@ class CapsuleMortalityHead(nn.Module):
             poses: [B, 7, pc_dim]
             acts:  [B, 7, 1]
         Returns:
-            final_logit:   [B, 1]
-            routing_coef:  [B, 7, mc_num_caps]
+            logits:        [B, 2]  (class-0, class-1)
+            routing_coef:  [B, 7, 2]
         """
         device = torch.device(DEVICE)
-        poses = poses.to(device)
-        acts  = acts.to(device)
+        dtype  = next(self.cls0.parameters()).dtype  # or next(self.parameters()).dtype
+        poses = poses.to(device=device, dtype=dtype)
+        acts  = acts.to(device=device, dtype=dtype)
 
+        # One-time debug
         if not hasattr(self, "_printed_once"):
             self._printed_once = True
-            _dbg(f"[cap-head] input poses:{tuple(poses.shape)} acts:{tuple(acts.shape)} "
-                 f"(pc_dim={self.pc_dim}, mc_caps_dim={self.mc_caps_dim}, out_caps={self.mc_num_caps}, iters={self.num_routing})")
-
-        # First routing (no prior)
-        decision_pose, decision_act, _ = self.mc(poses, acts, 0)
-
-        routing_coef = None
-        for n in range(self.num_routing):
-            decision_pose, decision_act, routing_coef = self.mc(
-                poses, acts, n, decision_pose, decision_act
+            _dbg(
+                f"[cap-head] input poses:{tuple(poses.shape)} acts:{tuple(acts.shape)} "
+                f"(pc_dim={self.pc_dim}, mc_caps_dim={self.mc_caps_dim}, out_caps={self.mc_num_caps}, iters={self.num_routing})"
             )
+            _peek_tensor("cap-head.poses.in", poses)
+            _peek_tensor("cap-head.acts.in", acts)
 
-        decision_logit = torch.einsum('bcd,cd->bc', decision_pose, self.embedding)  # [B,1]
+        # Initial routing (iter 0) without priors
+        decision_pose, decision_act, routing_coef = self.mc(poses, acts, 0)  # pose:[B,2,D], act:[B,2] or None
+
+        # Ensure valid activations for next iterations
+        B = poses.size(0)
+        if decision_act is None:
+            _dbg("[cap-head] warning: initial decision_act is None; initializing to 0.5.")
+            decision_act = torch.full((B, self.mc_num_caps), 0.5, device=device)
+
+        prev_act = decision_act
+        for n in range(1, self.num_routing):
+            decision_pose, maybe_act, routing_coef = self.mc(poses, acts, n, decision_pose, prev_act)
+            if maybe_act is not None:
+                prev_act = maybe_act  # keep updated
+            else:
+                _dbg(f"[cap-head] iter {n}: mc returned None next_act; reusing previous activations.")
+        
+        # --- FIX: match device/dtype of classifier weights before matmul ---
+        wdev  = self.cls0.weight.device
+        wdtyp = self.cls0.weight.dtype
+        decision_pose = decision_pose.to(device=wdev, dtype=wdtyp)
+        
+        # Map poses from the TWO decision capsules to TWO logits
+        log0 = self.cls0(decision_pose[:, 0, :]).squeeze(1)  # [B]
+        log1 = self.cls1(decision_pose[:, 1, :]).squeeze(1)  # [B]
+        logits = torch.stack([log0, log1], dim=1)            # [B,2]
 
         if not hasattr(self, "_printed_done"):
             self._printed_done = True
-            _dbg(f"[cap-head] decision_pose:{tuple(decision_pose.shape)} -> logit:{tuple(decision_logit.shape)}")
+            _dbg(f"[cap-head] decision_pose:{tuple(decision_pose.shape)} -> logits:{tuple(logits.shape)}")
             with torch.no_grad():
-                _dbg(f"[cap-head] logit stats -> "
-                     f"min:{decision_logit.min().item():.4f} max:{decision_logit.max().item():.4f} mean:{decision_logit.mean().item():.4f}")
+                _dbg(
+                    f"[cap-head] logit stats -> "
+                    f"min:{logits.min().item():.4f} "
+                    f"max:{logits.max().item():.4f} "
+                    f"mean:{logits.mean().item():.4f}"
+                )
 
-        return decision_logit, routing_coef
+        return logits, routing_coef
 
 
 def forward_capsule_from_routes(
-    z_unimodal: Dict[str, torch.Tensor],
-    fusion: Dict[str, nn.Module],
-    projector: RoutePrimaryProjector,
-    capsule_head: CapsuleMortalityHead,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    z_unimodal: Dict[str, torch.Tensor],          # {"L","N","I"} each [B,d]
+    fusion: Dict[str, nn.Module],                 # {"LN","LI","NI","LNI"}
+    projector: RoutePrimaryProjector,             # d -> (pc_dim+1) per route
+    capsule_head: CapsuleMortalityHead,           # CapsuleFC wrapper -> [B,2] logits
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
     """
-    Args:
-        z_unimodal: {"L":[B,d], "N":[B,d], "I":[B,d]}
-        fusion    : dict of fusion modules {"LN","LI","NI","LNI"}
-        projector : per-route Linear -> (pc_dim+1) with sigmoid act (legacy-equivalent)
-        capsule_head: CapsuleMortalityHead
+    1) Build 7 route embeddings from unimodal pooled embeddings.
+    2) Project each route -> primary capsule (pose + act).
+    3) Run capsule routing -> 2-class logits.
+
     Returns:
-        final_logit       : [B,1]
-        primary_acts      : [B,7]         
-        routing_coefficient: [B,7,1]      
+        logits:       [B, 2]
+        prim_acts:    [B, 7]       (primary capsule activations)
+        route_embs:   dict of 7 -> [B, d] (for inspection/aux losses)
+        routing_coef: [B, 7, 2]    (interaction weights per route -> per class)
     """
-    # Build 7 route embeddings
-    route_embs = make_route_inputs(z_unimodal, fusion)  # dict of 7 -> [B,d]
+    if not hasattr(forward_capsule_from_routes, "_printed_once"):
+        forward_capsule_from_routes._printed_once = True
+        sizes = ", ".join(f"{k}:{tuple(v.shape)}" for k, v in z_unimodal.items())
+        _dbg(f"[caps-bridge] unimodal -> {sizes}")
+        for k, v in z_unimodal.items():
+            _peek_tensor(f"caps-bridge.uni.{k}", v)
+            _nan_guard(f"caps-bridge.uni.{k}", v)
+
+    # 1) Build 7 routes
+    route_embs = make_route_inputs(z_unimodal, fusion)
+    # --- ensure route_embs tensors are on same device as projector ---
+    #dev = next(projector.parameters()).device
+    #route_embs = {k: v.to(dev, non_blocking=True) for k, v in route_embs.items()}
+    
+    dev   = next(projector.parameters()).device
+    dtype = next(projector.parameters()).dtype
+    route_embs = {k: v.to(device=dev, dtype=dtype, non_blocking=True) for k, v in route_embs.items()}
+
+
+    # 2) Project to primary capsules
+    poses, acts = projector(route_embs)                        # [B,7,pc_dim], [B,7,1]
+
+    # 3) Capsule routing -> logits + routing coefficients
+    logits, routing_coef = capsule_head(poses, acts)           # [B,2], [B,7,2]
+
+    # Primary activations for inspection
+    prim_acts = acts.squeeze(-1).detach()                      # [B,7]
+    _peek_tensor("caps-bridge.prim_acts", prim_acts)
+    _nan_guard("caps-bridge.prim_acts", prim_acts)
+
     if not hasattr(forward_capsule_from_routes, "_printed_routes"):
         forward_capsule_from_routes._printed_routes = True
         sizes = ", ".join(f"{k}:{tuple(v.shape)}" for k, v in route_embs.items())
         _dbg(f"[caps-bridge] routes -> {sizes}")
 
-    # Project to primary capsules (pose + act)
-    poses, acts = projector(route_embs)                 # [B,7,pc_dim], [B,7,1]
+    return logits, prim_acts, route_embs, routing_coef
 
-    # Capsule routing → final logit (+ routing coef)
-    final_logit, routing_coef = capsule_head(poses, acts)  # [B,1], [B,7,1]
-
-    primary_acts = acts.squeeze(-1).detach()            # [B,7] 
-
-    # Once-only peek at primary acts
-    if not hasattr(forward_capsule_from_routes, "_printed_acts"):
-        forward_capsule_from_routes._printed_acts = True
-        with torch.no_grad():
-            _dbg(f"[caps-bridge] prim_acts:{tuple(primary_acts.shape)} "
-                 f"mean:{primary_acts.mean().item():.4f} min:{primary_acts.min().item():.4f} max:{primary_acts.max().item():.4f}")
-
-    return final_logit, primary_acts, routing_coef
 
 
 __all__ = [
