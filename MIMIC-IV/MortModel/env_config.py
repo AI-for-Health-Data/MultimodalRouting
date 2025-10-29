@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import json
 import random
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Any
 
 import numpy as np
@@ -17,9 +17,10 @@ except Exception:
     L = None
 
 try:
-    import yaml
+    import yaml  
 except Exception:
     yaml = None
+
 
 ROUTES: List[str] = ["L", "N", "I", "LN", "LI", "NI", "LNI"]
 BLOCKS: Dict[str, List[str]] = {
@@ -47,7 +48,7 @@ class Config:
 
     # Structured 
     structured_seq_len: int = 24
-    structured_n_feats: int = 128
+    structured_n_feats: int = 17
     structured_layers: int = 2
     structured_heads: int = 8
 
@@ -65,7 +66,10 @@ class Config:
     capsule_num_routing: int = 3
     capsule_act_type: str = "EM"             
     capsule_layer_norm: bool = False          
-    capsule_dim_pose_to_vote: int = 0       
+    capsule_dim_pose_to_vote: int = 0 
+    capsule_out_caps: int = 2                
+    loss_type: str = "ce"                     
+      
 
     # Paths & misc
     data_root: str = "./data"
@@ -79,6 +83,9 @@ class Config:
     seed: int = 42
     verbose: bool = True
 
+    # Debug / logging helpers
+    debug_samples: int = 3                    # how many sample rows to pretty-print
+    routing_print_every: int = 50             # print routing stats every N steps
 
 # Global singletons
 CFG: Config = Config()
@@ -96,7 +103,7 @@ def set_global_seed(seed: int) -> None:
 
 def set_deterministic(enabled: bool) -> None:
     try:
-        torch.use_deterministic_algorithms(bool(enabled)) 
+        torch.use_deterministic_algorithms(bool(enabled))
     except Exception:
         pass
     torch.backends.cudnn.deterministic = bool(enabled)
@@ -116,9 +123,10 @@ def amp_autocast_dtype(precision_amp: str) -> Optional[torch.dtype]:
     return torch.bfloat16 if hasattr(torch, "bfloat16") else None
 
 
+
 def autocast_context() -> torch.autocast:
-    dtype = amp_autocast_dtype(CFG.precision_amp)
-    if dtype is None:
+    dt = amp_autocast_dtype(CFG.precision_amp)
+    if dt is None:
         return torch.autocast(
             device_type="cuda" if DEVICE == "cuda" else "cpu",
             dtype=torch.float32,
@@ -126,7 +134,7 @@ def autocast_context() -> torch.autocast:
         )
     return torch.autocast(
         device_type="cuda" if DEVICE == "cuda" else "cpu",
-        dtype=dtype,
+        dtype=dt,
         enabled=True,
     )
 
@@ -182,6 +190,7 @@ def _coerce_types(d: Dict[str, Any]) -> Dict[str, Any]:
 
 def load_cfg(yaml_path: Optional[str] = None,
              overrides: Optional[Dict[str, Any]] = None) -> Config:
+    """Load defaults, then YAML (optional), then overrides/env, and finalize globals."""
     global CFG, DEVICE, TASK2IDX, SELECTED_TASK_IDX
 
     cfg_dict: Dict[str, Any] = asdict(Config())
@@ -220,16 +229,20 @@ def load_cfg(yaml_path: Optional[str] = None,
         "MIMICIV_CAP_MC_DIM": ("capsule_mc_caps_dim", int),
         "MIMICIV_CAP_ITERS": ("capsule_num_routing", int),
         "MIMICIV_CAP_ACT": ("capsule_act_type", str),
-        "MIMICIV_CAP_LN": ("capsule_layer_norm", lambda s: str(s).lower() in {"1","true","yes"}),
+        "MIMICIV_CAP_LN": ("capsule_layer_norm", lambda s: str(s).lower() in {"1", "true", "yes"}),
         "MIMICIV_CAP_DPOSE2VOTE": ("capsule_dim_pose_to_vote", int),
+        "MIMICIV_CAP_OUT": ("capsule_out_caps", int),            
+        "MIMICIV_LOSS": ("loss_type", str),                       
         "MIMICIV_LR": ("lr", float),
         "MIMICIV_BS": ("batch_size", int),
         "MIMICIV_DROPOUT": ("dropout", float),
         "MIMICIV_NUM_WORKERS": ("num_workers", int),
         "MIMICIV_PRECISION": ("precision_amp", str),
-        "MIMICIV_DETERMINISTIC": ("deterministic", lambda s: str(s).lower() in {"1","true","yes"}),
+        "MIMICIV_DETERMINISTIC": ("deterministic", lambda s: str(s).lower() in {"1", "true", "yes"}),
         "MIMICIV_SEED": ("seed", int),
-        "MIMICIV_VERBOSE": ("verbose", lambda s: str(s).lower() in {"1","true","yes"}),
+        "MIMICIV_VERBOSE": ("verbose", lambda s: str(s).lower() in {"1", "true", "yes"}),
+        "MIMICIV_DEBUG_SAMPLES": ("debug_samples", int),          
+        "MIMICIV_ROUTING_PRINT_EVERY": ("routing_print_every", int),  
     }
     for env_key, (cfg_key, caster) in env_map.items():
         if env_key in os.environ:
