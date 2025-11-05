@@ -3,155 +3,122 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-
+#### Capsule Layer ####
 class CapsuleFC(nn.Module):
-    """
-    Fully-connected capsule layer (routing over 7 primaries -> K class capsules).
-    Matches the reference behavior:
-      - no LayerNorm (small_std=True -> identity)
-      - routing via softmax over out_n_capsules
-      - supports uniform routing (ablation)
-      - act_type: 'EM' params registered (unused) or 'ONES'
-    Returns (next_capsule_value, next_act, query_key, route_class_emb)
-    """
-    def __init__(
-        self,
-        in_n_capsules: int,
-        in_d_capsules: int,
-        out_n_capsules: int,
-        out_d_capsules: int,
-        n_rank: int | None = None,
-        dp: float = 0.0,
-        dim_pose_to_vote: int = 0,
-        uniform_routing_coefficient: bool = False,
-        act_type: str = "EM",
-        small_std: bool = True,
-        eps: float = 1e-10,
-    ):
-        super().__init__()
-        self.in_n_capsules = in_n_capsules
-        self.in_d_capsules = in_d_capsules
-        self.out_n_capsules = out_n_capsules
-        self.out_d_capsules = out_d_capsules
+    r"""Fully-connected capsule layer with safe init for first routing."""
+    def __init__(self, in_n_capsules, in_d_capsules, out_n_capsules, out_d_capsules,
+                 n_rank, dp, dim_pose_to_vote, uniform_routing_coefficient=False,
+                 act_type='EM', small_std=False):
+        super(CapsuleFC, self).__init__()
+        self.in_n_capsules  = in_n_capsules   # N_in (e.g., 7 routes)
+        self.in_d_capsules  = in_d_capsules   # A   (pc_dim)
+        self.out_n_capsules = out_n_capsules  # N_out (e.g., 2 classes)
+        self.out_d_capsules = out_d_capsules  # D   (mc_caps_dim)
         self.n_rank = n_rank
-        self.eps = eps
 
-        # same init as reference
-        self.weight_init_const = float(
-            np.sqrt(out_n_capsules / (in_d_capsules * max(1, in_n_capsules)))
-        )
+        self.weight_init_const = np.sqrt(out_n_capsules / (in_d_capsules * in_n_capsules))
         self.w = nn.Parameter(
-            self.weight_init_const
-            * torch.randn(in_n_capsules, in_d_capsules, out_n_capsules, out_d_capsules)
-        )
+            self.weight_init_const *
+            torch.randn(in_n_capsules, in_d_capsules, out_n_capsules, out_d_capsules)
+        )  # [N_in, A, N_out, D]
 
-        self.dropout_rate = float(dp)
-        if small_std:
-            # identity: no LayerNorm / nonlinearity to preserve interpretability
-            self.nonlinear_act = nn.Sequential()
-        else:
-            # keep parity with reference (no LN allowed)
-            raise ValueError("layer norm will destroy interpretability, thus not available")
-
+        self.dropout_rate = dp
         self.drop = nn.Dropout(self.dropout_rate)
+
+        # Keep a no-op nonlinearity by default (stable; layer-norm can be outside if needed)
+        self.nonlinear_act = nn.Sequential()
         self.scale = 1.0 / (out_d_capsules ** 0.5)
 
         self.act_type = act_type
-        # register EM/Hubert params for parity (not used by our forward)
-        if self.act_type == "EM":
+        if act_type == 'EM':
             self.beta_u = nn.Parameter(torch.randn(out_n_capsules))
             self.beta_a = nn.Parameter(torch.randn(out_n_capsules))
-        elif self.act_type == "Hubert":
+        elif act_type == 'Hubert':
             self.alpha = nn.Parameter(torch.ones(out_n_capsules))
-            self.beta = nn.Parameter(
-                np.sqrt(1.0 / (in_n_capsules * in_d_capsules))
-                * torch.randn(in_n_capsules, in_d_capsules, out_n_capsules)
+            self.beta  = nn.Parameter(
+                np.sqrt(1.0 / (in_n_capsules * in_d_capsules)) *
+                torch.randn(in_n_capsules, in_d_capsules, out_n_capsules)
             )
 
-        self.uniform_routing_coefficient = uniform_routing_coefficient
+        self.uniform_routing_coefficient = uniform_routing_coefficient  # kept for API
 
-    def extra_repr(self) -> str:
-        return (
-            f"in_n_capsules={self.in_n_capsules}, in_d_capsules={self.in_d_capsules}, "
-            f"out_n_capsules={self.out_n_capsules}, out_d_capsules={self.out_d_capsules}, "
-            f"n_rank={self.n_rank}, weight_init_const={self.weight_init_const}, "
-            f"dropout_rate={self.dropout_rate}"
-        )
+    def extra_repr(self):
+        return ('in_n_capsules={}, in_d_capsules={}, out_n_capsules={}, out_d_capsules={}, '
+                'n_rank={}, weight_init_const={}, dropout_rate={}'
+                ).format(self.in_n_capsules, self.in_d_capsules,
+                         self.out_n_capsules, self.out_d_capsules,
+                         self.n_rank, self.weight_init_const, self.dropout_rate)
 
-    @torch.no_grad()
-    def _uniform_q(self, B: int, device) -> torch.Tensor:
-        q = torch.zeros(B, self.in_n_capsules, self.out_n_capsules, device=device)
-        return F.softmax(q, dim=2)
+    def forward(self, input, current_act, num_iter,
+                next_capsule_value=None, next_act=None, uniform_routing=False):
+        """
+        input            : [B, N_in, A]       (primary poses)
+        current_act      : [B, N_in, 1]       (primary activations)
+        next_capsule_value: [B, N_out, D] or None  (decision poses from prev iter)
+        next_act         : [B, N_out] or None      (decision activations from prev iter)
+        returns:
+          next_capsule_value: [B, N_out, D]
+          next_act          : [B, N_out]
+          query_key         : [B, N_in, N_out]   (routing coefficients)
+        """
+        B = input.shape[0]
+        device = input.device
+        dtype  = input.dtype
+        
+        # make sure the routing weight matches input's dtype/device under AMP
+        W = self.w.to(device=device, dtype=dtype)
+        
+        # [B, N_in]
+        current_act = current_act.view(B, -1)
 
-    def forward(
-        self,
-        input: torch.Tensor,               # [B, N_in, D_in]
-        current_act: torch.Tensor,         # [B, N_in] or [B, N_in, 1]
-        num_iter: int,
-        next_capsule_value: torch.Tensor | None = None,  # [B, N_out, D_out]
-        next_act: torch.Tensor | None = None,            # [B, N_out]
-        uniform_routing: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
-        # normalize current_act shape to [B, N_in]
-        if current_act.dim() == 3 and current_act.size(-1) == 1:
-            current_act = current_act.squeeze(-1)
-        if current_act.dim() != 2:
-            raise ValueError("current_act must be [B, N_in] or [B, N_in, 1].")
-
-        B, Nin, Din = input.shape
-        assert Nin == self.in_n_capsules and Din == self.in_d_capsules
-
-        W = self.w  # [N_in, D_in, N_out, D_out]
-
-        # init or update routing coefficients
+        # --- SAFE INITIALIZATION (first iteration) ---
+        # If next_capsule_value is None, start from uniform routing over N_out
         if next_capsule_value is None:
-            q0 = torch.zeros(self.in_n_capsules, self.out_n_capsules, device=input.device)
-            q0 = F.softmax(q0, dim=1)  # [N_in, N_out]
-            next_capsule_value = torch.einsum("nm, bna, namd -> bmd", q0, input, W)
-            query_key = q0.unsqueeze(0).expand(B, -1, -1)  # [B, N_in, N_out]
+            # query_key_unif: [N_in, N_out] -> softmax over N_out axis
+            query_key_unif = torch.zeros(self.in_n_capsules, self.out_n_capsules, device=device, dtype=dtype)
+            query_key_unif = F.softmax(query_key_unif, dim=1)  # uniform probs
+
+            # votes: [B, N_out, D]  via (N_in,N_out) ⊗ [B,N_in,A] ⊗ [N_in,A,N_out,D]
+            next_capsule_value = torch.einsum('nm, bna, namd->bmd',
+                                              query_key_unif, input, W)  # [B, M, D]
+
+        # If next_act is None, seed it from current primary activations (mean over routes)
+        if next_act is None:
+            init_a = current_act.mean(dim=1)                         # [B]
+            next_act = init_a.unsqueeze(1).expand(B, self.out_n_capsules).contiguous()  # [B, M]
         else:
-            if uniform_routing or self.uniform_routing_coefficient:
-                query_key = self._uniform_q(B, input.device)  # [B, N_in, N_out]
-            else:
-                logits0 = torch.einsum("bna, namd, bmd -> bnm", input, W, next_capsule_value)
-                logits0.mul_(self.scale)
-                query_key = F.softmax(logits0, dim=2)        # softmax over N_out
-                if next_act is not None:                     
-                    query_key = query_key * next_act.unsqueeze(1)
-                    query_key = query_key / (query_key.sum(dim=2, keepdim=True).clamp_min(1e-10))
+            # ensure compatibility if caller provided it
+            next_act = next_act.to(device=device, dtype=dtype)
 
-            next_capsule_value = torch.einsum(
-                "bnm, bna, namd, bn -> bmd", query_key, input, W, current_act
-            )
+        # --- ROUTING STEP ---
+        if uniform_routing or self.uniform_routing_coefficient:
+            # batch-wise uniform over N_out
+            query_key = torch.zeros(B, self.in_n_capsules, self.out_n_capsules, device=device, dtype=dtype)
+            query_key = F.softmax(query_key, dim=2)  # [B, N_in, N_out]
+        else:
+            # agreement: [B, N_in, N_out] = input ⊗ W ⊗ next_capsule_value
+            # input [B,N_in,A], W [N_in,A,N_out,D], next_capsule_value [B,N_out,D]
+            _query_key = torch.einsum('bna, namd, bmd->bnm', input, W, next_capsule_value)  # [B,N_in,N_out]
+            _query_key.mul_(self.scale)
+            query_key = F.softmax(_query_key, dim=2)  # softmax over N_out
 
-        # routing refinement (num_iter >=1 to mimic reference loop)
-        for _ in range(max(1, num_iter)):
-            if uniform_routing or self.uniform_routing_coefficient:
-                query_key = self._uniform_q(B, input.device)
-            else:
-                logits = torch.einsum("bna, namd, bmd -> bnm", input, W, next_capsule_value)
-                logits.mul_(self.scale)
-                query_key = F.softmax(logits, dim=2)
-                if next_act is not None:
-                    query_key = query_key * next_act.unsqueeze(1)
-                    query_key = query_key / (query_key.sum(dim=2, keepdim=True).clamp_min(1e-10))
+            # weight by next_act [B, N_out] -> broadcast to [B,N_in,N_out]
+            query_key = torch.einsum('bnm, bm->bnm', query_key, next_act)
+            # normalize across N_out to keep it stochastic
+            denom = query_key.sum(dim=2, keepdim=True) + 1e-10
+            query_key = query_key / denom
 
-            next_capsule_value = torch.einsum(
-                "bnm, bna, namd, bn -> bmd", query_key, input, W, current_act
-            )
+        # aggregate votes to produce next decision poses: [B, M, D]
+        next_capsule_value = torch.einsum('bnm, bna, namd, bn->bmd',
+                                          query_key, input, W, current_act)
 
-        # activations
-        if self.act_type == "ONES":
-            next_act = torch.ones(next_capsule_value.shape[:2], device=input.device)
-        # EM path keeps next_act as passed/None (we don’t run EM steps here, matching ref)
+        # Optional activation types (kept for compatibility)
+        if self.act_type == 'ONES':
+            next_act = torch.ones(next_capsule_value.shape[:2], device=device, dtype=dtype)
 
+        # regularization + optional nonlinearity
         next_capsule_value = self.drop(next_capsule_value)
         if next_capsule_value.shape[-1] != 1:
             next_capsule_value = self.nonlinear_act(next_capsule_value)
 
-        # Provide per-route × per-class “votes” so the head can concat interactions
-        votes = torch.einsum("bna, namd -> bnkd", input, W)     # [B, N_in, N_out, D_out]
-        weights = query_key * current_act.unsqueeze(-1)         # [B, N_in, N_out]
-        route_class_emb = weights.unsqueeze(-1) * votes         # [B, N_in, N_out, D_out]
-
-        return next_capsule_value, next_act, query_key, route_class_emb
+        return next_capsule_value, next_act, query_key
