@@ -565,6 +565,10 @@ def main():
                 logits, prim_acts, route_embs = out[0], out[1], out[2]
                 routing_coef = out[3] if len(out) > 3 else None
 
+                if args.route_debug and routing_coef is not None and (step % 100 == 0):
+                    _print_routing_mort(routing_coef, prim_acts, where=f"TRAIN@step{step}")
+
+
                 if printed_once and step == 0:
                     keys = ", ".join(f"{k}:{tuple(v.shape)}" for k, v in route_embs.items())
                     print(f"[sanity] routes -> {keys} | logits: {tuple(logits.shape)} "
