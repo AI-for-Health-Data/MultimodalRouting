@@ -13,17 +13,71 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 
-from env_config import CFG, DEVICE, load_cfg, autocast_context, ensure_dir
-from encoders import (
+from phenomodel.env_config import CFG, DEVICE, load_cfg, ensure_dir
+from phenomodel.encoders import (
     BEHRTLabEncoder, BioClinBERTEncoder, ImageEncoder,
     EncoderConfig, build_encoders,
 )
-from routing_and_heads import (
+from phenomodel.routing_and_heads import (
     build_fusions,
     RoutePrimaryProjector,
     CapsulePhenoHead,                 # <<< multi-label head (C phenotypes)
     forward_capsule_from_routes,      # returns logits, prim_acts, route_embs, routing_coef
 )
+# --- NEW: label priors & pos_weight helpers ---
+def _extract_multilabel_block(df: pd.DataFrame, label_cols: List[str], ids: Sequence[int]) -> np.ndarray:
+    """Return float32 array [N,C] of labels for the provided ids, robust to ordering."""
+    sub = df[df["stay_id"].isin(ids)]
+    if not label_cols:  # single JSON/list column case (rare here)
+        raise ValueError("Vectorized labels (multiple columns) expected.")
+    mat = sub[label_cols].to_numpy(dtype=np.float32)  # [N,C]
+    return mat
+
+# --- replace this whole function in phenomodel/main.py ---
+def compute_priors_and_pos_weight(train_ds) -> Tuple[List[float], torch.Tensor]:
+    """
+    Robust per-label prevalence p[c] and pos_weight[c] = (1-p)/p from TRAIN ids.
+    Handles stay_id dtype mismatches and empty intersections; safe fallbacks.
+    """
+    df = train_ds.labels.copy()
+    C = train_ds.num_labels
+
+    if "stay_id" not in df.columns:
+        p = np.full(C, 0.05, dtype=np.float32)
+        pos_w = (1.0 - p) / p
+        print("[priors] labels_pheno.parquet has no 'stay_id' column; using flat prior=0.05")
+        return p.tolist(), torch.tensor(pos_w, dtype=torch.float32)
+
+    # Normalize dtypes
+    df["stay_id"] = pd.to_numeric(df["stay_id"], errors="coerce").astype("Int64")
+    ids = pd.Series(pd.to_numeric(pd.Series(train_ds.ids), errors="coerce")).astype("Int64")
+
+    sub = df[df["stay_id"].isin(ids)]
+    matched = int(sub.shape[0])
+    total = int(df.shape[0])
+    print(f"[priors] matched TRAIN ids in labels: {matched}/{total}")
+
+    if matched == 0:
+        # Fall back to whole table (still clipped and safe)
+        sub = df
+
+    label_cols = [c for c in sub.columns if c != "stay_id"]
+    if len(label_cols) == 0:
+        p = np.full(C, 0.05, dtype=np.float32)
+        pos_w = (1.0 - p) / p
+        print("[priors] no label columns found; using flat prior=0.05")
+        return p.tolist(), torch.tensor(pos_w, dtype=torch.float32)
+
+    mat = sub[label_cols].to_numpy(dtype=np.float32)
+    if mat.size == 0:
+        p = np.full(C, 0.05, dtype=np.float32)
+        print("[priors] empty matrix after filtering; using flat prior=0.05")
+    else:
+        p = np.clip(mat.mean(axis=0), 1e-4, 1 - 1e-4)
+
+    pos_w = (1.0 - p) / p
+    return p.tolist(), torch.tensor(pos_w, dtype=torch.float32)
+
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
@@ -410,8 +464,10 @@ def evaluate_epoch(
     projector: RoutePrimaryProjector,
     cap_head: CapsulePhenoHead,
     loader: DataLoader,
-    amp_ctx,  # autocast/nullcontext
+    amp_ctx,                    # autocast/nullcontext
+    pos_weight: torch.Tensor,   # --- NEW ---
 ) -> Tuple[float, Dict[str, float], Dict[str, float]]:
+
     """
     Evaluate one epoch.
     Returns: (avg_loss, metrics_dict, avg_primary_act_by_route)
@@ -420,7 +476,7 @@ def evaluate_epoch(
     if getattr(bbert, "bert", None) is not None:
         bbert.bert.eval()
 
-    bce = nn.BCEWithLogitsLoss(reduction="mean")
+    bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(DEVICE), reduction="mean")
     total_loss, total = 0.0, 0
     act_sum = torch.zeros(7, dtype=torch.float32)  # CPU
     accum_logits: List[torch.Tensor] = []
@@ -456,6 +512,7 @@ def evaluate_epoch(
 
             loss = bce(logits, y)
 
+
         total_loss += loss.item() * y.size(0)
         total += y.size(0)
         act_sum += prim_acts.detach().float().cpu().sum(dim=0)
@@ -467,6 +524,12 @@ def evaluate_epoch(
     concat_logits = torch.cat(accum_logits, dim=0) if accum_logits else torch.zeros(0, device="cpu")
     concat_targets = torch.cat(accum_targets, dim=0) if accum_targets else torch.zeros(0, device="cpu")
     metrics = multilabel_metrics(concat_logits, concat_targets, thresh=0.5)
+    # --- NEW: prevalence diagnostics ---
+    with torch.no_grad():
+        gt_prev = concat_targets.mean().item() if concat_targets.numel() else 0.0
+        pred_prev05 = (concat_logits.sigmoid() >= 0.5).float().mean().item() if concat_logits.numel() else 0.0
+    metrics["gt_prev"] = gt_prev
+    metrics["pred_prev@0.5"] = pred_prev05
     avg_act  = (act_sum / max(1, total)).tolist()
     route_names = ["L","N","I","LN","LI","NI","LNI"]
     avg_act_dict = {r: avg_act[i] for i, r in enumerate(route_names)}
@@ -519,6 +582,9 @@ def main():
     val_ds   = ICUStayDataset(args.data_root, split="val",   num_labels_hint=args.num_labels)
     test_ds  = ICUStayDataset(args.data_root, split="test",  num_labels_hint=args.num_labels)
     C = train_ds.num_labels  # actual detected/used number of labels
+    # --- NEW: label priors & pos_weight from TRAIN ---
+    train_priors, pos_weight = compute_priors_and_pos_weight(train_ds)
+    print(f"[priors] mean prevalence (TRAIN) ≈ {float(np.mean(train_priors)):.4f}")
 
     collate_train = collate_fn_factory(img_tfms=build_image_transform("train"), num_labels=C)
     collate_eval  = collate_fn_factory(img_tfms=build_image_transform("val"),   num_labels=C)
@@ -572,12 +638,13 @@ def main():
     cap_head = CapsulePhenoHead(
         pc_dim=CFG.capsule_pc_dim,
         mc_caps_dim=CFG.capsule_mc_caps_dim,
-        num_labels=C,
+        num_labels=C,                         # (legacy name; still supported)
         num_routing=CFG.capsule_num_routing,
         dp=CFG.dropout,
         act_type=CFG.capsule_act_type,
         layer_norm=CFG.capsule_layer_norm,
         dim_pose_to_vote=CFG.capsule_dim_pose_to_vote,
+        prior_prevalences=train_priors,       # --- NEW: bias init = logit(prior) ---
     ).to(DEVICE)
     print(f"[capsule-pheno] C={C} pc_dim={CFG.capsule_pc_dim} mc_caps_dim={CFG.capsule_mc_caps_dim} "
           f"iters={CFG.capsule_num_routing} act_type={CFG.capsule_act_type}")
@@ -598,7 +665,7 @@ def main():
         print(f"[main] Resuming from {args.resume}")
         start_epoch = load_checkpoint(args.resume, behrt, bbert, imgenc, fusion, projector, cap_head, optimizer)
 
-    bce = nn.BCEWithLogitsLoss(reduction="mean")
+    bce_train = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(DEVICE), reduction="mean")
     printed_once = False
 
     for epoch in range(start_epoch, args.epochs):
@@ -648,7 +715,7 @@ def main():
                     print(f"[sanity] routes -> {keys} | logits: {tuple(logits.shape)} "
                           f"| prim_acts: {tuple(prim_acts.shape)}")
 
-                loss = bce(logits, y)
+                loss = bce_train(logits, y)
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -671,14 +738,25 @@ def main():
             if args.log_every > 0 and ((step + 1) % args.log_every == 0):
                 cat_logits = torch.cat(step_logits_accum, dim=0); step_logits_accum.clear()
                 cat_targets = torch.cat(step_targets_accum, dim=0); step_targets_accum.clear()
+
+                # metrics @0.5
                 m = multilabel_metrics(cat_logits, cat_targets, thresh=0.5)
                 avg_act = (act_sum / max(1, total)).tolist()
+
+                # NEW: prevalence diagnostics (prove labels flow; explain zero F1 early)
+                with torch.no_grad():
+                    gt_prev = cat_targets.mean().item()
+                    pred_prev05 = (cat_logits.sigmoid() >= 0.5).float().mean().item()
+
                 msg = (f"[epoch {epoch+1} step {step+1}] "
                        f"loss={total_loss/max(1,total):.4f} ")
                 msg += " ".join([f"{k}={v:.4f}" for k, v in m.items()])
+                msg += f" | gt_prev={gt_prev:.4f} pred_prev@0.5={pred_prev05:.4f}"
                 msg += " | avg_prim_act(L,N,I,LN,LI,NI,LNI)=" + ", ".join(f"{a:.3f}" for a in avg_act)
+
                 # optional: routing mean by class omitted (C large); keep lightweight
                 print(msg)
+
 
         # End epoch stats (train)
         train_loss = total_loss / max(1, total)
@@ -688,8 +766,9 @@ def main():
 
         # Validation
         val_loss, val_metrics, val_act = evaluate_epoch(
-            behrt, bbert, imgenc, fusion, projector, cap_head, val_loader, amp_ctx
+            behrt, bbert, imgenc, fusion, projector, cap_head, val_loader, amp_ctx, pos_weight
         )
+
         print(f"[epoch {epoch+1}] VAL   loss={val_loss:.4f} "
               + " ".join([f"{k}={val_metrics[k]:.4f}" for k in val_metrics])
               + " | avg_prim_act=" + ", ".join(f'{k}:{v:.3f}' for k,v in val_act.items()))
@@ -720,7 +799,7 @@ def main():
     if os.path.isfile(best_path):
         _ = load_checkpoint(best_path, behrt, bbert, imgenc, fusion, projector, cap_head, optimizer)
     test_loss, test_metrics, test_act = evaluate_epoch(
-        behrt, bbert, imgenc, fusion, projector, cap_head, test_loader, amp_ctx
+        behrt, bbert, imgenc, fusion, projector, cap_head, test_loader, amp_ctx, pos_weight
     )
     print(f"[TEST] loss={test_loss:.4f} "
           + " ".join([f"{k}={test_metrics[k]:.4f}" for k in test_metrics])
