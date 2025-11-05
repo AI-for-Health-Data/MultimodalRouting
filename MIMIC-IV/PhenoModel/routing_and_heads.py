@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Dict, Tuple, Sequence, Optional
+from typing import Dict, Tuple, Sequence, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -33,7 +33,6 @@ def _peek_tensor(name: str, x: torch.Tensor, k: int = 3) -> None:
 def _nan_guard(tag: str, x: torch.Tensor) -> None:
     if torch.isnan(x).any() or torch.isinf(x).any():
         _dbg(f"[NaN/Inf WARNING] {tag}: nan={torch.isnan(x).any().item()} inf={torch.isinf(x).any().item()}")
-
 
 class _MLP(nn.Module):
     def __init__(
@@ -96,7 +95,6 @@ class PairwiseFusion(nn.Module):
         _peek_tensor("fusion.pair_z", z)
         _nan_guard("fusion.pair_z", z)
         return z
-
 
 class TrimodalFusion(nn.Module):
     """
@@ -215,11 +213,10 @@ class RoutePrimaryProjector(nn.Module):
         device = next(self.parameters()).device
         dtype  = next(self.parameters()).dtype
         pcs = [ self.proj[r]( route_embs[r].to(device=device, dtype=dtype) ) for r in ROUTES ]
-        pc_all = torch.stack(pcs, dim=1)            # [B, 7, pc_dim+1], already correct dtype/device
+        pc_all = torch.stack(pcs, dim=1)            # [B, 7, pc_dim+1]
         poses = pc_all[:, :, :self.pc_dim]
         acts  = torch.sigmoid(pc_all[:, :, self.pc_dim:])
-        
-    
+
         # SANITY PRINT
         if not hasattr(self, "_printed_once"):
             self._printed_once = True
@@ -233,6 +230,10 @@ class RoutePrimaryProjector(nn.Module):
         _nan_guard("projector.acts", acts)
         return poses, acts
 
+
+# ---------------------------
+# Binary mortality head (keep)
+# ---------------------------
 class CapsuleMortalityHead(nn.Module):
     """
     Routes the 7 primary capsules (poses + acts) into TWO decision capsules
@@ -245,15 +246,13 @@ class CapsuleMortalityHead(nn.Module):
         num_routing: int = 3,
         dp: float = 0.1,
         act_type: str = "EM",
-        layer_norm: bool = False,     # toggles CapsuleFC init (small_std)
+        layer_norm: bool = False,
         dim_pose_to_vote: int = 0,
     ):
         super().__init__()
         self.pc_dim = int(pc_dim)
         self.mc_caps_dim = int(mc_caps_dim)
         self.num_routing = int(num_routing)
-
-        # TWO decision capsules (binary 2-class CE)
         self.mc_num_caps = 2
 
         self.mc = capsule_layers.CapsuleFC(
@@ -284,77 +283,153 @@ class CapsuleMortalityHead(nn.Module):
             routing_coef:  [B, 7, 2]
         """
         device = torch.device(DEVICE)
-        dtype  = next(self.cls0.parameters()).dtype  # or next(self.parameters()).dtype
+        dtype  = next(self.cls0.parameters()).dtype
         poses = poses.to(device=device, dtype=dtype)
         acts  = acts.to(device=device, dtype=dtype)
 
-        # One-time debug
         if not hasattr(self, "_printed_once"):
             self._printed_once = True
             _dbg(
-                f"[cap-head] input poses:{tuple(poses.shape)} acts:{tuple(acts.shape)} "
+                f"[cap-head-bin] input poses:{tuple(poses.shape)} acts:{tuple(acts.shape)} "
                 f"(pc_dim={self.pc_dim}, mc_caps_dim={self.mc_caps_dim}, out_caps={self.mc_num_caps}, iters={self.num_routing})"
             )
-            _peek_tensor("cap-head.poses.in", poses)
-            _peek_tensor("cap-head.acts.in", acts)
+            _peek_tensor("cap-head-bin.poses.in", poses)
+            _peek_tensor("cap-head-bin.acts.in", acts)
 
-        # Initial routing (iter 0) without priors
-        decision_pose, decision_act, routing_coef = self.mc(poses, acts, 0)  # pose:[B,2,D], act:[B,2] or None
-
-        # Ensure valid activations for next iterations
+        decision_pose, decision_act, routing_coef = self.mc(poses, acts, 0)
         B = poses.size(0)
         if decision_act is None:
-            _dbg("[cap-head] warning: initial decision_act is None; initializing to 0.5.")
-            decision_act = torch.full((B, self.mc_num_caps), 0.5, device=device)
+            _dbg("[cap-head-bin] warning: initial decision_act is None; initializing to 0.5.")
+            decision_act = torch.full((B, self.mc_num_caps), 0.5, device=device, dtype=dtype)
 
         prev_act = decision_act
         for n in range(1, self.num_routing):
             decision_pose, maybe_act, routing_coef = self.mc(poses, acts, n, decision_pose, prev_act)
             if maybe_act is not None:
-                prev_act = maybe_act  # keep updated
-            else:
-                _dbg(f"[cap-head] iter {n}: mc returned None next_act; reusing previous activations.")
-        
-        # --- FIX: match device/dtype of classifier weights before matmul ---
-        wdev  = self.cls0.weight.device
-        wdtyp = self.cls0.weight.dtype
+                prev_act = maybe_act
+
+        wdev, wdtyp = self.cls0.weight.device, self.cls0.weight.dtype
         decision_pose = decision_pose.to(device=wdev, dtype=wdtyp)
-        
-        # Map poses from the TWO decision capsules to TWO logits
-        log0 = self.cls0(decision_pose[:, 0, :]).squeeze(1)  # [B]
-        log1 = self.cls1(decision_pose[:, 1, :]).squeeze(1)  # [B]
-        logits = torch.stack([log0, log1], dim=1)            # [B,2]
+
+        log0 = self.cls0(decision_pose[:, 0, :]).squeeze(1)
+        log1 = self.cls1(decision_pose[:, 1, :]).squeeze(1)
+        logits = torch.stack([log0, log1], dim=1)  # [B,2]
 
         if not hasattr(self, "_printed_done"):
             self._printed_done = True
-            _dbg(f"[cap-head] decision_pose:{tuple(decision_pose.shape)} -> logits:{tuple(logits.shape)}")
-            with torch.no_grad():
-                _dbg(
-                    f"[cap-head] logit stats -> "
-                    f"min:{logits.min().item():.4f} "
-                    f"max:{logits.max().item():.4f} "
-                    f"mean:{logits.mean().item():.4f}"
-                )
+            _dbg(f"[cap-head-bin] decision_pose:{tuple(decision_pose.shape)} -> logits:{tuple(logits.shape)}")
 
         return logits, routing_coef
 
+
+# ---------------------------
+# Multi-label phenotype head
+# ---------------------------
+class CapsulePhenoHead(nn.Module):
+    """
+    Routes the 7 primary capsules (poses + acts) into C decision capsules
+    (one per phenotype). Returns raw logits [B, C] (use BCEWithLogitsLoss).
+    """
+    def __init__(
+        self,
+        pc_dim: int,              # primary capsule pose dim
+        mc_caps_dim: int,         # decision capsule pose dim
+        num_labels: int,          # C phenotypes (e.g., 25)
+        num_routing: int = 3,
+        dp: float = 0.1,
+        act_type: str = "EM",
+        layer_norm: bool = False,
+        dim_pose_to_vote: int = 0,
+    ):
+        super().__init__()
+        self.pc_dim = int(pc_dim)
+        self.mc_caps_dim = int(mc_caps_dim)
+        self.num_routing = int(num_routing)
+        self.mc_num_caps = int(num_labels)  # C
+
+        self.mc = capsule_layers.CapsuleFC(
+            in_n_capsules=7,
+            in_d_capsules=self.pc_dim,
+            out_n_capsules=self.mc_num_caps,
+            out_d_capsules=self.mc_caps_dim,
+            n_rank=None,
+            dp=dp,
+            act_type=act_type,
+            small_std=not layer_norm,
+            dim_pose_to_vote=dim_pose_to_vote,
+        )
+
+        # Per-class readout: W[C, D], b[C]  -> logit_c = <W[c], pose[b,c,:]> + b[c]
+        self.cls_W = nn.Parameter(torch.empty(self.mc_num_caps, self.mc_caps_dim))
+        self.cls_b = nn.Parameter(torch.zeros(self.mc_num_caps))
+        nn.init.normal_(self.cls_W, std=0.02)
+        nn.init.zeros_(self.cls_b)
+
+    def forward(self, poses: torch.Tensor, acts: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            poses: [B, 7, pc_dim]
+            acts:  [B, 7, 1]
+        Returns:
+            logits:        [B, C]  raw logits (per phenotype)
+            routing_coef:  [B, 7, C]
+        """
+        device = torch.device(DEVICE)
+        dtype  = self.cls_W.dtype
+        poses = poses.to(device=device, dtype=dtype)
+        acts  = acts.to(device=device, dtype=dtype)
+
+        if not hasattr(self, "_printed_once"):
+            self._printed_once = True
+            _dbg(
+                f"[cap-head-pheno] input poses:{tuple(poses.shape)} acts:{tuple(acts.shape)} "
+                f"(pc_dim={self.pc_dim}, mc_caps_dim={self.mc_caps_dim}, out_caps={self.mc_num_caps}, iters={self.num_routing})"
+            )
+            _peek_tensor("cap-head-pheno.poses.in", poses)
+            _peek_tensor("cap-head-pheno.acts.in", acts)
+
+        # Initial routing
+        decision_pose, decision_act, routing_coef = self.mc(poses, acts, 0)  # [B,C,D], [B,C] or None, [B,7,C]
+        B = poses.size(0)
+        if decision_act is None:
+            _dbg("[cap-head-pheno] warning: initial decision_act is None; initializing to 0.5.")
+            decision_act = torch.full((B, self.mc_num_caps), 0.5, device=device, dtype=dtype)
+
+        prev_act = decision_act
+        for n in range(1, self.num_routing):
+            decision_pose, maybe_act, routing_coef = self.mc(poses, acts, n, decision_pose, prev_act)
+            if maybe_act is not None:
+                prev_act = maybe_act
+
+        # Make sure decision_pose matches classifier param device/dtype
+        decision_pose = decision_pose.to(device=self.cls_W.device, dtype=self.cls_W.dtype)
+
+        # Per-class dot with W[c], add b[c]
+        # logits[b,c] = sum_d decision_pose[b,c,d] * cls_W[c,d] + cls_b[c]
+        logits = torch.einsum('bcd,cd->bc', decision_pose, self.cls_W) + self.cls_b  # [B,C]
+
+        if not hasattr(self, "_printed_done"):
+            self._printed_done = True
+            _dbg(f"[cap-head-pheno] decision_pose:{tuple(decision_pose.shape)} -> logits:{tuple(logits.shape)}")
+
+        return logits, routing_coef
 
 def forward_capsule_from_routes(
     z_unimodal: Dict[str, torch.Tensor],          # {"L","N","I"} each [B,d]
     fusion: Dict[str, nn.Module],                 # {"LN","LI","NI","LNI"}
     projector: RoutePrimaryProjector,             # d -> (pc_dim+1) per route
-    capsule_head: CapsuleMortalityHead,           # CapsuleFC wrapper -> [B,2] logits
+    capsule_head: Union[CapsuleMortalityHead, CapsulePhenoHead],  # returns logits + routing
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
     """
     1) Build 7 route embeddings from unimodal pooled embeddings.
     2) Project each route -> primary capsule (pose + act).
-    3) Run capsule routing -> 2-class logits.
+    3) Run capsule routing -> logits.
 
     Returns:
-        logits:       [B, 2]
-        prim_acts:    [B, 7]       (primary capsule activations)
+        logits:       [B, 2] (mortality) or [B, C] (phenotypes)
+        prim_acts:    [B, 7]          (primary capsule activations)
         route_embs:   dict of 7 -> [B, d] (for inspection/aux losses)
-        routing_coef: [B, 7, 2]    (interaction weights per route -> per class)
+        routing_coef: [B, 7, 2] or [B, 7, C] (interaction weights)
     """
     if not hasattr(forward_capsule_from_routes, "_printed_once"):
         forward_capsule_from_routes._printed_once = True
@@ -366,20 +441,15 @@ def forward_capsule_from_routes(
 
     # 1) Build 7 routes
     route_embs = make_route_inputs(z_unimodal, fusion)
-    # --- ensure route_embs tensors are on same device as projector ---
-    #dev = next(projector.parameters()).device
-    #route_embs = {k: v.to(dev, non_blocking=True) for k, v in route_embs.items()}
-    
+
+    # 2) Project to primary capsules (device/dtype aligned to projector)
     dev   = next(projector.parameters()).device
     dtype = next(projector.parameters()).dtype
     route_embs = {k: v.to(device=dev, dtype=dtype, non_blocking=True) for k, v in route_embs.items()}
-
-
-    # 2) Project to primary capsules
     poses, acts = projector(route_embs)                        # [B,7,pc_dim], [B,7,1]
 
-    # 3) Capsule routing -> logits + routing coefficients
-    logits, routing_coef = capsule_head(poses, acts)           # [B,2], [B,7,2]
+    # 3) Capsule routing head
+    logits, routing_coef = capsule_head(poses, acts)           # [B, ?], [B,7, ?]
 
     # Primary activations for inspection
     prim_acts = acts.squeeze(-1).detach()                      # [B,7]
@@ -404,5 +474,6 @@ __all__ = [
     # Capsule bridge
     "RoutePrimaryProjector",
     "CapsuleMortalityHead",
+    "CapsulePhenoHead",
     "forward_capsule_from_routes",
 ]
