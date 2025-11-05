@@ -2,8 +2,7 @@ from __future__ import annotations
 import os
 import json
 import argparse
-from typing import Any, Dict, List, Tuple, Optional
-from contextlib import nullcontext
+from typing import Any, Dict, List, Tuple, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
@@ -22,12 +21,9 @@ from encoders import (
 from routing_and_heads import (
     build_fusions,
     RoutePrimaryProjector,
-    CapsuleMortalityHead,            # NOTE: updated to output [B,2] logits
-    forward_capsule_from_routes,     # returns (logits, prim_acts, route_embs [, routing_coef])
+    CapsulePhenoHead,                 # <<< multi-label head (C phenotypes)
+    forward_capsule_from_routes,      # returns logits, prim_acts, route_embs, routing_coef
 )
-
-TASK_MAP = {"mort": 0}
-COL_MAP  = {"mort": "mort"}
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
@@ -53,11 +49,8 @@ def build_image_transform(split: str) -> T.Compose:
             T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ])
 
-
 def parse_args():
-    ap = argparse.ArgumentParser(description="Mortality (binary) with 7-route capsule routing (2-class CE)")
-    ap.add_argument("--task", type=str, default=getattr(CFG, "task_name", "mort"),
-                    choices=list(TASK_MAP.keys()))
+    ap = argparse.ArgumentParser(description="Phenotype (multi-label) with 7-route capsule routing (BCEWithLogits)")
     ap.add_argument("--data_root", type=str, default=CFG.data_root)
     ap.add_argument("--ckpt_root", type=str, default=CFG.ckpt_root)
     ap.add_argument("--epochs", type=int, default=max(1, getattr(CFG, "max_epochs_tri", 5)))
@@ -72,27 +65,26 @@ def parse_args():
     ap.add_argument("--log_every", type=int, default=300, help="Print training stats every N steps.")
     ap.add_argument("--precision", type=str, default="auto",
                     choices=["auto", "fp16", "bf16", "off"],
-                    help="AMP precision on CUDA; 'off' disables AMP. On CPU, AMP is forced off to avoid dtype issues.")
+                    help="AMP precision on CUDA; 'off' disables AMP. On CPU, AMP is off.")
     ap.add_argument("--peek_first_batch", action="store_true", default=True,
                     help="Print a small debug sample at the first batch.")
     ap.add_argument("--verbose_sanity", action="store_true", default=False,
-                    help="Print extra sanity info (emb norms, route shapes) at the very start.")
+                    help="Print extra sanity info at the very start.")
+    ap.add_argument("--num_labels", type=int, default=25, help="Number of phenotype labels (columns).")
     return ap.parse_args()
-
-
 
 class ICUStayDataset(Dataset):
     """
-    Expects under data_root:
-      - structured_24h.parquet with columns: stay_id, hour, <F features> (F=17)
-      - notes_24h.parquet     with either:
+    Expects under data_root (your 'paired_with_notes'):
+      - structured.parquet         with columns: stay_id, hour, <F features> (F=17)
+      - notes.parquet              with:
             * chunk_* columns (chunk_000..chunk_XXX) OR
-            * a single 'notes_24h' column (string) OR a single 'text' column
-      - images_24h.parquet    with columns: stay_id, image_path
-      - labels_mort.parquet   with columns: stay_id, mort
-      - splits.json           { "train": [...], "val": [...], "test": [...] }
+            * a single 'text' column (or 'notes_24h')
+      - images.parquet             with columns: stay_id, image_path
+      - labels_pheno.parquet       with columns: stay_id, <C phenotype cols> OR single column holding list/JSON
+      - splits.json                { "train": [...], "val": [...], "test": [...] }
     """
-    def __init__(self, root: str, split: str = "train"):
+    def __init__(self, root: str, split: str = "train", num_labels_hint: Optional[int] = None):
         super().__init__()
         root = os.path.abspath(os.path.expanduser(root))
         if not os.path.isdir(root):
@@ -101,16 +93,14 @@ class ICUStayDataset(Dataset):
         self.split = split
         self.img_tfms = build_image_transform(split)
 
-        # required files
-        req = ["splits.json", "labels_mort.parquet", "structured_24h.parquet"]
+        req = ["splits.json", "labels_pheno.parquet", "structured.parquet"]
         missing = [p for p in req if not os.path.exists(os.path.join(root, p))]
         if missing:
             raise FileNotFoundError(
                 f"[ICUStayDataset] missing files under {root}: {missing}\n"
-                f"Expected: {', '.join(req)} plus optional notes_24h.parquet, images_24h.parquet"
+                f"Expected: {', '.join(req)} plus optional notes.parquet, images.parquet"
             )
 
-        # ids for this split
         with open(os.path.join(root, "splits.json")) as f:
             splits = json.load(f)
         if split not in splits:
@@ -118,10 +108,10 @@ class ICUStayDataset(Dataset):
         self.ids: List[int] = list(splits[split])
 
         # file paths
-        struct_fp = os.path.join(root, "structured_24h.parquet")
-        notes_fp  = os.path.join(root, "notes_24h.parquet")
-        images_fp = os.path.join(root, "images_24h.parquet")
-        labels_fp = os.path.join(root, "labels_mort.parquet")
+        struct_fp = os.path.join(root, "structured.parquet")
+        notes_fp  = os.path.join(root, "notes.parquet")
+        images_fp = os.path.join(root, "images.parquet")
+        labels_fp = os.path.join(root, "labels_pheno.parquet")
 
         # load tables
         self.struct = pd.read_parquet(struct_fp)
@@ -133,7 +123,6 @@ class ICUStayDataset(Dataset):
         base_cols = {"stay_id", "hour"}
         self.feat_cols: List[str] = [c for c in self.struct.columns if c not in base_cols]
 
-        # feature-count sanity
         if hasattr(CFG, "structured_n_feats"):
             assert len(self.feat_cols) == CFG.structured_n_feats, \
                 f"CFG.structured_n_feats={CFG.structured_n_feats}, found {len(self.feat_cols)} in {struct_fp}"
@@ -151,19 +140,56 @@ class ICUStayDataset(Dataset):
                 cols.sort()
                 self.chunk_cols = cols if cols else None
 
+        # figure out phenotype columns
+        self.label_cols: List[str] = [c for c in self.labels.columns if c != "stay_id"]
+        # robust handling: if there is exactly 1 label column and it stores a list/json, we’ll parse later
+        self.labels_are_vectorized = len(self.label_cols) > 1
+        self.num_labels = (len(self.label_cols) if self.labels_are_vectorized
+                           else (num_labels_hint if num_labels_hint is not None else 25))
+
         n_chunks = 0 if self.chunk_cols is None else len(self.chunk_cols)
         using = f" using {self.note_col}" if self.note_col else ""
-        print(f"[dataset:{split}] notes columns -> note_col={self.note_col} chunk_cols={n_chunks}")
         print(
             f"[dataset:{split}] root={root} ids={len(self.ids)} "
             f"| struct rows={len(self.struct)} (F={len(self.feat_cols)}) "
             f"| notes rows={len(self.notes)} (chunks={n_chunks}{using}) "
-            f"| images rows={len(self.images)} | labels rows={len(self.labels)}"
+            f"| images rows={len(self.images)} | labels rows={len(self.labels)} "
+            f"| num_labels={self.num_labels} labels_vectorized={self.labels_are_vectorized}"
         )
-
 
     def __len__(self) -> int:
         return len(self.ids)
+
+    @staticmethod
+    def _parse_label_cell(cell: Any, C: int) -> np.ndarray:
+        """
+        Accepts: list/tuple/ndarray of length C, or JSON string of such.
+        Returns float32 array of shape [C] with values in {0,1} (or floats).
+        """
+        if isinstance(cell, (list, tuple, np.ndarray)):
+            arr = np.asarray(cell, dtype=np.float32).reshape(-1)
+        else:
+            s = str(cell)
+            try:
+                obj = json.loads(s)
+                arr = np.asarray(obj, dtype=np.float32).reshape(-1)
+            except Exception:
+                # fallback: comma-separated
+                try:
+                    parts = [float(x) for x in s.split(",")]
+                    arr = np.asarray(parts, dtype=np.float32).reshape(-1)
+                except Exception:
+                    # worst-case: empty -> zeros
+                    arr = np.zeros(C, dtype=np.float32)
+        if arr.size != C:
+            # pad/trim defensively
+            if arr.size < C:
+                z = np.zeros(C, dtype=np.float32)
+                z[:arr.size] = arr
+                arr = z
+            else:
+                arr = arr[:C]
+        return arr
 
     def __getitem__(self, idx: int):
         stay_id = self.ids[idx]
@@ -194,17 +220,36 @@ class ICUStayDataset(Dataset):
             df_i = self.images[self.images.stay_id == stay_id]
             img_paths = df_i.image_path.dropna().astype(str).tolist()[-1:]  # last only
 
-        # Label (float in parquet, convert to long class index 0/1)
-        lab_row = self.labels.loc[self.labels.stay_id == stay_id, ["mort"]]
-        y = 0 if lab_row.empty else int(lab_row.values[0][0])
-        y = torch.tensor(y, dtype=torch.long)  # [ ] scalar long
+        # Labels: multilabel vector [C]
+        if self.labels_are_vectorized:
+            row = self.labels[self.labels.stay_id == stay_id]
+            if row.empty:
+                yv = np.zeros(self.num_labels, dtype=np.float32)
+            else:
+                vals = row[self.label_cols].iloc[0].to_numpy(dtype=np.float32).reshape(-1)
+                if vals.size != self.num_labels:
+                    # pad/trim if needed
+                    tmp = np.zeros(self.num_labels, dtype=np.float32)
+                    n = min(vals.size, self.num_labels)
+                    tmp[:n] = vals[:n]
+                    vals = tmp
+                yv = vals
+        else:
+            # single column with JSON/list per row
+            row = self.labels[self.labels.stay_id == stay_id]
+            if row.empty:
+                yv = np.zeros(self.num_labels, dtype=np.float32)
+            else:
+                cell = row[self.label_cols[0]].iloc[0]
+                yv = self._parse_label_cell(cell, self.num_labels)
+        y = torch.from_numpy(yv)  # [C] float
 
         return {
             "stay_id": stay_id,
             "x_struct": xs,         # [<=T, F]
             "notes_list": notes_list,
             "image_paths": img_paths,
-            "y": y,                 # long scalar 0/1
+            "y": y,                 # [C] float {0/1}
         }
 
 def pad_or_trim_struct(x: torch.Tensor, T: int, F: int) -> torch.Tensor:
@@ -236,12 +281,11 @@ def load_cxr_tensor(paths: List[str], tfms: T.Compose, return_path: bool = False
     return (tensor, p) if return_path else tensor
 
 
-
-def collate_fn_factory(tidx: int, img_tfms: T.Compose):
+def collate_fn_factory(img_tfms: T.Compose, num_labels: int):
     """
     Returns batches:
       xL: [B,T,F], mL: [B,T], notes_batch: List[List[str]],
-      imgs_batch: [B,3,224,224], y: [B] (long),
+      imgs_batch: [B,3,224,224], y: [B,C] float,
       dbg: dict with small debug info (ids, image paths)
     """
     first_print = {"done": False}
@@ -269,13 +313,13 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
             img_paths_list.append(path)
         imgs_batch = torch.stack(imgs_list, dim=0)  # [B,3,224,224]
 
-        # Labels -> class indices [B] long (handles [1]-shaped float tensors)
-        y_list = []
-        for b in batch:
-            # b["y"] expected shape [1] float {0.0,1.0}; fall back to int cast
-            y_scalar = b["y"].view(-1)[0].item() if torch.is_tensor(b["y"]) else b["y"]
-            y_list.append(int(round(float(y_scalar))))
-        y_batch = torch.tensor(y_list, dtype=torch.long)  # [B]
+        # Labels -> [B, C] float
+        ys = [b["y"].view(-1).float() for b in batch]
+        # defensive pad/trim
+        y_batch = torch.zeros(len(batch), num_labels, dtype=torch.float32)
+        for i, y in enumerate(ys):
+            n = min(num_labels, y.numel())
+            y_batch[i, :n] = y[:n]
 
         # Small debug payload
         dbg = {
@@ -330,35 +374,64 @@ def pretty_print_small_batch(
 
 
 @torch.no_grad()
+def multilabel_metrics(logits: torch.Tensor, y: torch.Tensor, thresh: float = 0.5) -> Dict[str, float]:
+    """
+    Simple metrics without sklearn: macro precision/recall/F1 at fixed threshold.
+    """
+    p = (logits.sigmoid() >= thresh).float()
+    tp = (p * y).sum(dim=0)
+    fp = (p * (1 - y)).sum(dim=0)
+    fn = ((1 - p) * y).sum(dim=0)
+
+    prec = tp / (tp + fp + 1e-8)
+    rec  = tp / (tp + fn + 1e-8)
+    f1   = 2 * prec * rec / (prec + rec + 1e-8)
+
+    # macro across labels present in y
+    macro_prec = prec.mean().item()
+    macro_rec  = rec.mean().item()
+    macro_f1   = f1.mean().item()
+    prevalence = y.mean(dim=0).mean().item()
+
+    return {
+        "macro_prec@0.5": macro_prec,
+        "macro_rec@0.5": macro_rec,
+        "macro_f1@0.5": macro_f1,
+        "mean_prevalence": prevalence,
+    }
+
+
+@torch.no_grad()
 def evaluate_epoch(
     behrt: BEHRTLabEncoder,
     bbert: BioClinBERTEncoder,
     imgenc: ImageEncoder,
     fusion: Dict[str, nn.Module],
     projector: RoutePrimaryProjector,
-    cap_head: CapsuleMortalityHead,
+    cap_head: CapsulePhenoHead,
     loader: DataLoader,
-    amp_ctx,  # <<< pass the autocast/nullcontext from main()
-) -> Tuple[float, float, Dict[str, float]]:
+    amp_ctx,  # autocast/nullcontext
+) -> Tuple[float, Dict[str, float], Dict[str, float]]:
     """
     Evaluate one epoch.
-    Returns: (avg_loss, avg_acc, avg_primary_act_by_route)
+    Returns: (avg_loss, metrics_dict, avg_primary_act_by_route)
     """
     behrt.eval(); imgenc.eval()
     if getattr(bbert, "bert", None) is not None:
         bbert.bert.eval()
 
-    ce = nn.CrossEntropyLoss(reduction="mean")
-    total_loss, total_correct, total = 0.0, 0, 0
-    act_sum = torch.zeros(7, dtype=torch.float32)  # keep on CPU for stability
+    bce = nn.BCEWithLogitsLoss(reduction="mean")
+    total_loss, total = 0.0, 0
+    act_sum = torch.zeros(7, dtype=torch.float32)  # CPU
+    accum_logits: List[torch.Tensor] = []
+    accum_targets: List[torch.Tensor] = []
     printed_once = False
 
     for xL, mL, notes, imgs, y, dbg in loader:
-        # to device
         xL = xL.to(DEVICE, non_blocking=True)
         mL = mL.to(DEVICE, non_blocking=True)
         imgs = imgs.to(DEVICE, non_blocking=True)
-        y   = y.to(DEVICE,   non_blocking=True)   # [B] long
+        y   = y.to(DEVICE,   non_blocking=True)   # [B,C] float
 
         with amp_ctx:
             # Unimodal pooled embeddings
@@ -372,35 +445,32 @@ def evaluate_epoch(
                 print(f"[eval:unimodal] zL:{tuple(zL.shape)} zN:{tuple(zN.shape)} zI:{tuple(zI.shape)}")
                 pretty_print_small_batch(xL, mL, notes, dbg, k=3)
 
-            # 7-route capsule inference
-            out = forward_capsule_from_routes(
+            logits, prim_acts, route_embs, routing_coef = forward_capsule_from_routes(
                 z_unimodal=z, fusion=fusion, projector=projector, capsule_head=cap_head
-            )
-            logits, prim_acts, route_embs = out[0], out[1], out[2]
-            # routing_coef is optional (may be absent depending on head)
-            routing_coef = out[3] if len(out) > 3 else None
+            )  # logits [B,C], prim_acts [B,7]
 
             if printed_once:
                 keys = ", ".join(f"{k}:{tuple(v.shape)}" for k, v in route_embs.items())
                 print(f"[eval:caps] logits:{tuple(logits.shape)} "
                       f"prim_acts:{tuple(prim_acts.shape)} routes -> {keys}")
 
-            loss = ce(logits, y)      # CE: logits [B,2], y [B] long
+            loss = bce(logits, y)
 
-        # accumulate on CPU
         total_loss += loss.item() * y.size(0)
-        pred = logits.argmax(dim=1)
-        total_correct += (pred == y).sum().item()
         total += y.size(0)
         act_sum += prim_acts.detach().float().cpu().sum(dim=0)
 
+        accum_logits.append(logits.detach().float().cpu())
+        accum_targets.append(y.detach().float().cpu())
+
     avg_loss = total_loss / max(1, total)
-    avg_acc  = total_correct / max(1, total)
+    concat_logits = torch.cat(accum_logits, dim=0) if accum_logits else torch.zeros(0, device="cpu")
+    concat_targets = torch.cat(accum_targets, dim=0) if accum_targets else torch.zeros(0, device="cpu")
+    metrics = multilabel_metrics(concat_logits, concat_targets, thresh=0.5)
     avg_act  = (act_sum / max(1, total)).tolist()
     route_names = ["L","N","I","LN","LI","NI","LNI"]
     avg_act_dict = {r: avg_act[i] for i, r in enumerate(route_names)}
-    return avg_loss, avg_acc, avg_act_dict
-
+    return avg_loss, metrics, avg_act_dict
 
 
 def save_checkpoint(path: str, state: Dict):
@@ -417,7 +487,7 @@ def load_checkpoint(path: str, behrt, bbert, imgenc, fusion, projector, cap_head
     projector.load_state_dict(ckpt["projector"])
     cap_head.load_state_dict(ckpt["cap_head"])
     optimizer.load_state_dict(ckpt["optimizer"])
-    print(f"[ckpt] loaded epoch={ckpt.get('epoch', 0)} val_acc={ckpt.get('val_acc', -1):.4f}")
+    print(f"[ckpt] loaded epoch={ckpt.get('epoch', 0)} metrics={ckpt.get('val_metrics', {})}")
     return int(ckpt.get("epoch", 0))
 
 
@@ -425,26 +495,33 @@ def main():
     args = parse_args()
     load_cfg()
     print(f"[setup] DEVICE={DEVICE} | batch_size={args.batch_size} | epochs={args.epochs}")
-    
-    # AMP policy: enable ONLY on CUDA. On CPU => nullcontext (prevents bf16/float mismatches).
+
+    # AMP policy
     use_cuda = (DEVICE == "cuda" and torch.cuda.is_available())
     if use_cuda:
         if args.precision == "fp16":
             amp_ctx = torch.cuda.amp.autocast(dtype=torch.float16)
         elif args.precision == "bf16":
             amp_ctx = torch.cuda.amp.autocast(dtype=torch.bfloat16)
+        elif args.precision == "off":
+            from contextlib import nullcontext
+            amp_ctx = nullcontext()
         else:  # "auto"
-            amp_ctx = torch.cuda.amp.autocast()  # Let PyTorch choose
+            amp_ctx = torch.cuda.amp.autocast()
         scaler = torch.amp.GradScaler("cuda", enabled=True)
     else:
+        from contextlib import nullcontext
         amp_ctx = nullcontext()
-        scaler = torch.amp.GradScaler("cuda", enabled=False)  # off on CPU
-    train_ds = ICUStayDataset(args.data_root, split="train")
-    val_ds   = ICUStayDataset(args.data_root, split="val")
-    test_ds  = ICUStayDataset(args.data_root, split="test")
+        scaler = torch.amp.GradScaler("cuda", enabled=False)
 
-    collate_train = collate_fn_factory(tidx=TASK_MAP[args.task], img_tfms=build_image_transform("train"))
-    collate_eval  = collate_fn_factory(tidx=TASK_MAP[args.task], img_tfms=build_image_transform("val"))
+    # Datasets / loaders
+    train_ds = ICUStayDataset(args.data_root, split="train", num_labels_hint=args.num_labels)
+    val_ds   = ICUStayDataset(args.data_root, split="val",   num_labels_hint=args.num_labels)
+    test_ds  = ICUStayDataset(args.data_root, split="test",  num_labels_hint=args.num_labels)
+    C = train_ds.num_labels  # actual detected/used number of labels
+
+    collate_train = collate_fn_factory(img_tfms=build_image_transform("train"), num_labels=C)
+    collate_eval  = collate_fn_factory(img_tfms=build_image_transform("val"),   num_labels=C)
     pin = use_cuda
 
     train_loader = DataLoader(
@@ -460,7 +537,7 @@ def main():
         num_workers=args.num_workers, pin_memory=pin, collate_fn=collate_eval
     )
 
-    # Encoders (set structured_n_feats=17 and structured_seq_len=24 in CFG)
+    # Encoders (structured_n_feats=17, structured_seq_len=24 in CFG)
     enc_cfg = EncoderConfig(
         d=CFG.d, dropout=CFG.dropout,
         structured_seq_len=CFG.structured_seq_len,     # 24
@@ -492,36 +569,36 @@ def main():
         fusion[k].to(DEVICE)
     projector = RoutePrimaryProjector(d_in=CFG.d, pc_dim=CFG.capsule_pc_dim).to(DEVICE)
 
-    #projector = RoutePrimaryProjector(d_in=CFG.d, pc_dim=CFG.capsule_pc_dim)
-    cap_head = CapsuleMortalityHead(
+    cap_head = CapsulePhenoHead(
         pc_dim=CFG.capsule_pc_dim,
         mc_caps_dim=CFG.capsule_mc_caps_dim,
+        num_labels=C,
         num_routing=CFG.capsule_num_routing,
         dp=CFG.dropout,
         act_type=CFG.capsule_act_type,
         layer_norm=CFG.capsule_layer_norm,
         dim_pose_to_vote=CFG.capsule_dim_pose_to_vote,
     ).to(DEVICE)
-    print(f"[capsule] pc_dim={CFG.capsule_pc_dim} mc_caps_dim={CFG.capsule_mc_caps_dim} "
+    print(f"[capsule-pheno] C={C} pc_dim={CFG.capsule_pc_dim} mc_caps_dim={CFG.capsule_mc_caps_dim} "
           f"iters={CFG.capsule_num_routing} act_type={CFG.capsule_act_type}")
 
     # Optimizer
-    params = list(behrt.parameters()) + list(bbert.parameters()) + list(imgenc.parameters())
-    for k in fusion.keys(): params += list(fusion[k].parameters())
+    params: List[torch.nn.Parameter] = list(behrt.parameters()) + list(bbert.parameters()) + list(imgenc.parameters())
+    for k in fusion.keys():
+        params += list(fusion[k].parameters())
     params += list(projector.parameters()) + list(cap_head.parameters())
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
+    # Optionally resume
     start_epoch = 0
-    best_val_acc = -1.0
-    ckpt_dir = os.path.join(args.ckpt_root, "mort_capsule")
+    best_val_f1 = -1.0
+    ckpt_dir = os.path.join(args.ckpt_root, f"pheno_capsule_{C}")
     ensure_dir(ckpt_dir)
     if args.resume and os.path.isfile(args.resume):
         print(f"[main] Resuming from {args.resume}")
         start_epoch = load_checkpoint(args.resume, behrt, bbert, imgenc, fusion, projector, cap_head, optimizer)
 
-    #scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE == "cuda"))
-    ce = nn.CrossEntropyLoss(reduction="mean")
-
+    bce = nn.BCEWithLogitsLoss(reduction="mean")
     printed_once = False
 
     for epoch in range(start_epoch, args.epochs):
@@ -529,16 +606,17 @@ def main():
         if args.finetune_text and getattr(bbert, "bert", None) is not None:
             bbert.bert.train()
 
-        total_loss, total_correct, total = 0.0, 0, 0
+        total_loss, total = 0.0, 0
         act_sum = torch.zeros(7, dtype=torch.float32)
+        step_logits_accum: List[torch.Tensor] = []
+        step_targets_accum: List[torch.Tensor] = []
 
         for step, (xL, mL, notes, imgs, y, dbg) in enumerate(train_loader):
             xL, mL = xL.to(DEVICE), mL.to(DEVICE)
             imgs = imgs.to(DEVICE)
-            y = y.to(DEVICE)                  # [B] long
+            y = y.to(DEVICE)                  # [B,C] float
 
             if (epoch == start_epoch) and (step == 0):
-                # print 2-3 samples to verify inputs
                 pretty_print_small_batch(xL, mL, notes, dbg, k=3)
 
             optimizer.zero_grad(set_to_none=True)
@@ -561,16 +639,16 @@ def main():
                                   f"||zN||={zN[i].norm().item():.3f} ||zI||={zI[i].norm().item():.3f}")
 
                 # Capsule forward (routes → projector → head)
-                out = forward_capsule_from_routes(z_unimodal=z, fusion=fusion, projector=projector, capsule_head=cap_head)
-                logits, prim_acts, route_embs = out[0], out[1], out[2]
-                routing_coef = out[3] if len(out) > 3 else None
+                logits, prim_acts, route_embs, routing_coef = forward_capsule_from_routes(
+                    z_unimodal=z, fusion=fusion, projector=projector, capsule_head=cap_head
+                )  # logits [B,C]
 
-                if printed_once and step == 0:
+                if step == 0:
                     keys = ", ".join(f"{k}:{tuple(v.shape)}" for k, v in route_embs.items())
                     print(f"[sanity] routes -> {keys} | logits: {tuple(logits.shape)} "
                           f"| prim_acts: {tuple(prim_acts.shape)}")
 
-                loss = ce(logits, y)          # CE for [B,2] logits vs [B] targets
+                loss = bce(logits, y)
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -583,44 +661,43 @@ def main():
                 torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
                 optimizer.step()
 
-            total_loss += loss.item() * y.size(0)
-            pred = logits.argmax(dim=1)
-            total_correct += (pred == y).sum().item()
-            total += y.size(0)
+            B = y.size(0)
+            total_loss += loss.item() * B
+            total += B
             act_sum += prim_acts.detach().cpu().sum(dim=0)
+            step_logits_accum.append(logits.detach().float().cpu())
+            step_targets_accum.append(y.detach().float().cpu())
 
             if args.log_every > 0 and ((step + 1) % args.log_every == 0):
+                cat_logits = torch.cat(step_logits_accum, dim=0); step_logits_accum.clear()
+                cat_targets = torch.cat(step_targets_accum, dim=0); step_targets_accum.clear()
+                m = multilabel_metrics(cat_logits, cat_targets, thresh=0.5)
                 avg_act = (act_sum / max(1, total)).tolist()
                 msg = (f"[epoch {epoch+1} step {step+1}] "
-                       f"loss={total_loss/max(1,total):.4f} "
-                       f"acc={total_correct/max(1,total):.4f} "
-                       f"avg_prim_act(L,N,I,LN,LI,NI,LNI)="
-                       f"{', '.join(f'{a:.3f}' for a in avg_act)}")
-                if routing_coef is not None:
-                    rc = routing_coef.detach().float().cpu()   # [B,7,2]
-                    rc_mean = rc.mean(dim=0)                   # [7,2]
-                    routes = ["L","N","I","LN","LI","NI","LNI"]
-                    rc_str = " | ".join(
-                        f"{r}:({rc_mean[i,0]:.3f},{rc_mean[i,1]:.3f})" for i, r in enumerate(routes)
-                    )
-                    msg += f" | [routing mean] {rc_str}"
+                       f"loss={total_loss/max(1,total):.4f} ")
+                msg += " ".join([f"{k}={v:.4f}" for k, v in m.items()])
+                msg += " | avg_prim_act(L,N,I,LN,LI,NI,LNI)=" + ", ".join(f"{a:.3f}" for a in avg_act)
+                # optional: routing mean by class omitted (C large); keep lightweight
                 print(msg)
 
-        # End epoch stats
+        # End epoch stats (train)
         train_loss = total_loss / max(1, total)
-        train_acc = total_correct / max(1, total)
         train_avg_act = (act_sum / max(1, total)).tolist()
-        print(f"[epoch {epoch+1}] TRAIN loss={train_loss:.4f} acc={train_acc:.4f} "
+        print(f"[epoch {epoch+1}] TRAIN loss={train_loss:.4f} "
               f"avg_prim_act={', '.join(f'{a:.3f}' for a in train_avg_act)}")
 
         # Validation
-        val_loss, val_acc, val_act = evaluate_epoch(behrt, bbert, imgenc, fusion, projector, cap_head, val_loader, amp_ctx)
-        print(f"[epoch {epoch+1}] VAL   loss={val_loss:.4f} acc={val_acc:.4f} "
-              f"avg_prim_act={', '.join(f'{k}:{v:.3f}' for k,v in val_act.items())}")
+        val_loss, val_metrics, val_act = evaluate_epoch(
+            behrt, bbert, imgenc, fusion, projector, cap_head, val_loader, amp_ctx
+        )
+        print(f"[epoch {epoch+1}] VAL   loss={val_loss:.4f} "
+              + " ".join([f"{k}={val_metrics[k]:.4f}" for k in val_metrics])
+              + " | avg_prim_act=" + ", ".join(f'{k}:{v:.3f}' for k,v in val_act.items()))
 
         # Save checkpoints
-        is_best = val_acc > best_val_acc
-        best_val_acc = max(best_val_acc, val_acc)
+        val_f1 = val_metrics.get("macro_f1@0.5", -1.0)
+        is_best = val_f1 > best_val_f1
+        best_val_f1 = max(best_val_f1, val_f1)
         ckpt = {
             "epoch": epoch + 1,
             "behrt": behrt.state_dict(),
@@ -630,21 +707,24 @@ def main():
             "projector": projector.state_dict(),
             "cap_head": cap_head.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "val_acc": val_acc,
+            "val_metrics": val_metrics,
         }
         save_checkpoint(os.path.join(ckpt_dir, "last.pt"), ckpt)
         if is_best:
             save_checkpoint(os.path.join(ckpt_dir, "best.pt"), ckpt)
-            print(f"[epoch {epoch+1}] Saved BEST checkpoint (acc={val_acc:.4f})")
+            print(f"[epoch {epoch+1}] Saved BEST checkpoint (macro_f1@0.5={val_f1:.4f})")
 
     # Final test
     print("[main] Evaluating BEST checkpoint on TEST...")
     best_path = os.path.join(ckpt_dir, "best.pt")
     if os.path.isfile(best_path):
         _ = load_checkpoint(best_path, behrt, bbert, imgenc, fusion, projector, cap_head, optimizer)
-    test_loss, test_acc, test_act = evaluate_epoch(behrt, bbert, imgenc, fusion, projector, cap_head, test_loader, amp_ctx)
-    print(f"[TEST] loss={test_loss:.4f} acc={test_acc:.4f} "
-          f"avg_prim_act={', '.join(f'{k}:{v:.3f}' for k,v in test_act.items())}")
+    test_loss, test_metrics, test_act = evaluate_epoch(
+        behrt, bbert, imgenc, fusion, projector, cap_head, test_loader, amp_ctx
+    )
+    print(f"[TEST] loss={test_loss:.4f} "
+          + " ".join([f"{k}={test_metrics[k]:.4f}" for k in test_metrics])
+          + " | avg_prim_act=" + ", ".join(f'{k}:{v:.3f}' for k,v in test_act.items()))
 
 
 if __name__ == "__main__":
