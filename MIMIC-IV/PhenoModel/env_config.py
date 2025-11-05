@@ -12,15 +12,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    import lightning as L 
+    import lightning as L
 except Exception:
     L = None
 
 try:
-    import yaml  
+    import yaml
 except Exception:
     yaml = None
-
 
 ROUTES: List[str] = ["L", "N", "I", "LN", "LI", "NI", "LNI"]
 BLOCKS: Dict[str, List[str]] = {
@@ -28,11 +27,15 @@ BLOCKS: Dict[str, List[str]] = {
     "bi":  ["LN", "LI", "NI"],
     "tri": ["LNI"],
 }
-TASKS: List[str] = ["mort"]
+# PHENO-ONLY
+TASKS: List[str] = ["pheno"]
 
 @dataclass
 class Config:
+    # Shared embedding dim across encoders/fusion
     d: int = 768
+
+    # Optimization / regularization
     dropout: float = 0.1
     lr: float = 2e-4
     batch_size: int = 16
@@ -46,7 +49,7 @@ class Config:
     text_model_name: str = "emilyalsentzer/Bio_ClinicalBERT"
     max_text_len: int = 512
 
-    # Structured 
+    # Structured EHR sequence
     structured_seq_len: int = 24
     structured_n_feats: int = 17
     structured_layers: int = 2
@@ -56,37 +59,37 @@ class Config:
     image_model_name: str = "resnet34"
 
     # Fusion / routing
-    feature_mode: str = "concat"             
-    routing_backend: str = "capsule"         
-    use_gates: bool = True                    
+    feature_mode: str = "concat"              
+    routing_backend: str = "capsule"
+    use_gates: bool = True                    # per-route sigmoid gates
 
-    # Capsule head hyperparams 
-    capsule_pc_dim: int = 32                 
-    capsule_mc_caps_dim: int = 64             
+    # Capsule head hyperparams (multi-label phenotyping)
+    capsule_pc_dim: int = 32                  # primary capsule pose dim (per route)
+    capsule_mc_caps_dim: int = 64             # decision capsule pose dim (per class)
     capsule_num_routing: int = 3
-    capsule_act_type: str = "EM"             
-    capsule_layer_norm: bool = False          
-    capsule_dim_pose_to_vote: int = 0 
-    capsule_out_caps: int = 2                
-    loss_type: str = "ce"                     
-      
+    capsule_act_type: str = "EM"              
+    capsule_layer_norm: bool = False
+    capsule_dim_pose_to_vote: int = 0
+
+    # Loss (multi-label)
+    loss_type: str = "bce"                    # BCEWithLogits for phenotyping
 
     # Paths & misc
     data_root: str = "./data"
     ckpt_root: str = "./checkpoints"
-    task_name: str = "mort"
+    task_name: str = "pheno"                  
 
     # System
     use_cudnn_benchmark: bool = True
-    precision_amp: str = "auto"              
+    precision_amp: str = "auto"               
     deterministic: bool = False
     seed: int = 42
     verbose: bool = True
 
     # Debug / logging helpers
-    debug_samples: int = 3                    # how many sample rows to pretty-print
-    routing_print_every: int = 50             # print routing stats every N steps
-
+    debug_samples: int = 3
+    routing_print_every: int = 50
+    
 # Global singletons
 CFG: Config = Config()
 DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -100,7 +103,6 @@ def set_global_seed(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-
 def set_deterministic(enabled: bool) -> None:
     try:
         torch.use_deterministic_algorithms(bool(enabled))
@@ -108,7 +110,6 @@ def set_deterministic(enabled: bool) -> None:
         pass
     torch.backends.cudnn.deterministic = bool(enabled)
     torch.backends.cudnn.benchmark = bool(not enabled and CFG.use_cudnn_benchmark)
-
 
 def amp_autocast_dtype(precision_amp: str) -> Optional[torch.dtype]:
     p = (precision_amp or "auto").lower()
@@ -121,8 +122,6 @@ def amp_autocast_dtype(precision_amp: str) -> Optional[torch.dtype]:
     if torch.cuda.is_available():
         return torch.float16
     return torch.bfloat16 if hasattr(torch, "bfloat16") else None
-
-
 
 def autocast_context() -> torch.autocast:
     dt = amp_autocast_dtype(CFG.precision_amp)
@@ -138,7 +137,6 @@ def autocast_context() -> torch.autocast:
         enabled=True,
     )
 
-
 def is_cuda_device(dev) -> bool:
     return (
         torch.cuda.is_available()
@@ -148,22 +146,18 @@ def is_cuda_device(dev) -> bool:
         )
     )
 
-
 def ensure_dir(path: str) -> None:
     if path and not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
-
 
 def set_requires_grad(module: nn.Module, flag: bool) -> None:
     for p in module.parameters():
         p.requires_grad = flag
 
-
 def _merge(base: Dict[str, Any], upd: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(base)
     out.update(upd or {})
     return out
-
 
 def _coerce_types(d: Dict[str, Any]) -> Dict[str, Any]:
     def conv(x):
@@ -187,10 +181,8 @@ def _coerce_types(d: Dict[str, Any]) -> Dict[str, Any]:
             out[k] = conv(v)
     return out
 
-
 def load_cfg(yaml_path: Optional[str] = None,
              overrides: Optional[Dict[str, Any]] = None) -> Config:
-    """Load defaults, then YAML (optional), then overrides/env, and finalize globals."""
     global CFG, DEVICE, TASK2IDX, SELECTED_TASK_IDX
 
     cfg_dict: Dict[str, Any] = asdict(Config())
@@ -215,10 +207,11 @@ def load_cfg(yaml_path: Optional[str] = None,
         except Exception:
             pass
 
+    # Individual env vars
     env_map = {
         "MIMICIV_DATA_ROOT": ("data_root", str),
         "MIMICIV_CKPT_ROOT": ("ckpt_root", str),
-        "MIMICIV_TASK": ("task_name", str),
+        "MIMICIV_TASK": ("task_name", str),  # should remain 'pheno'
         "MIMICIV_TEXT_MODEL": ("text_model_name", str),
         "MIMICIV_MAX_TEXT_LEN": ("max_text_len", int),
         "MIMICIV_STRUCT_SEQ_LEN": ("structured_seq_len", int),
@@ -231,8 +224,7 @@ def load_cfg(yaml_path: Optional[str] = None,
         "MIMICIV_CAP_ACT": ("capsule_act_type", str),
         "MIMICIV_CAP_LN": ("capsule_layer_norm", lambda s: str(s).lower() in {"1", "true", "yes"}),
         "MIMICIV_CAP_DPOSE2VOTE": ("capsule_dim_pose_to_vote", int),
-        "MIMICIV_CAP_OUT": ("capsule_out_caps", int),            
-        "MIMICIV_LOSS": ("loss_type", str),                       
+        "MIMICIV_LOSS": ("loss_type", str),  # 'bce' recommended
         "MIMICIV_LR": ("lr", float),
         "MIMICIV_BS": ("batch_size", int),
         "MIMICIV_DROPOUT": ("dropout", float),
@@ -241,8 +233,8 @@ def load_cfg(yaml_path: Optional[str] = None,
         "MIMICIV_DETERMINISTIC": ("deterministic", lambda s: str(s).lower() in {"1", "true", "yes"}),
         "MIMICIV_SEED": ("seed", int),
         "MIMICIV_VERBOSE": ("verbose", lambda s: str(s).lower() in {"1", "true", "yes"}),
-        "MIMICIV_DEBUG_SAMPLES": ("debug_samples", int),          
-        "MIMICIV_ROUTING_PRINT_EVERY": ("routing_print_every", int),  
+        "MIMICIV_DEBUG_SAMPLES": ("debug_samples", int),
+        "MIMICIV_ROUTING_PRINT_EVERY": ("routing_print_every", int),
     }
     for env_key, (cfg_key, caster) in env_map.items():
         if env_key in os.environ:
@@ -251,17 +243,21 @@ def load_cfg(yaml_path: Optional[str] = None,
             except Exception:
                 cfg_dict[cfg_key] = os.environ[env_key]
 
+    # Instantiate dataclass
     CFG = Config(**cfg_dict)
 
+    # Determinism & device
     set_global_seed(int(CFG.seed))
     set_deterministic(bool(CFG.deterministic))
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     torch.backends.cudnn.benchmark = bool(CFG.use_cudnn_benchmark and not CFG.deterministic)
 
+    # Task index maps (PHENO-ONLY)
     TASK2IDX = {name: i for i, name in enumerate(TASKS)}
     SELECTED_TASK_IDX = TASK2IDX.get(CFG.task_name, 0)
 
+    # Ensure dirs exist
     ensure_dir(CFG.ckpt_root)
     ensure_dir(CFG.data_root)
 
@@ -274,13 +270,10 @@ def load_cfg(yaml_path: Optional[str] = None,
 
     return CFG
 
-
 load_cfg(yaml_path=None, overrides=None)
-
 
 def get_device() -> torch.device:
     return torch.device(DEVICE)
-
 
 def bfloat16_supported() -> bool:
     try:
