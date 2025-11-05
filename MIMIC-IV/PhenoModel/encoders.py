@@ -1,4 +1,4 @@
-afrom __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, Optional, Literal, Tuple, Sequence, Union, Dict
@@ -42,7 +42,6 @@ def _ensure_2d_mask(mask: Optional[torch.Tensor], B: int, T: int, device) -> tor
         return mask.unsqueeze(0).expand(B, -1).contiguous().float()
     return mask.float()
 
-
 class BEHRTLabEncoder(nn.Module):
     """
     Transformer encoder over structured sequences.
@@ -51,7 +50,7 @@ class BEHRTLabEncoder(nn.Module):
     Pooling:
       - "mean": masked mean over time
       - "last": last valid timestep
-      - "cls" : learnable CLS token (not included in returned sequence; used only for pooled output)
+      - "cls" : learnable CLS token (used for pooled output)
     """
     def __init__(
         self,
@@ -111,9 +110,8 @@ class BEHRTLabEncoder(nn.Module):
         """
         Run transformer. If pool='cls', prepend CLS and return:
           - seq_out_no_cls: [B,T,D] (timesteps only)
-          - mask_out:       [B,T]   (unchanged mask)
-          - cls_vec:        [B,D]   (pooled cls), else None
-        If pool!='cls', cls_vec=None and output is just seq-out.
+          - mask_out:       [B,T]
+          - cls_vec:        [B,D] (pooled cls), else None
         """
         B, T, F = x.shape
         dev = x.device
@@ -184,7 +182,6 @@ class BEHRTLabEncoder(nn.Module):
         else:  # mean
             z = _masked_mean(seq_h, m_out)
         return z
-
 
 class BioClinBERTEncoder(nn.Module):
     """
@@ -263,10 +260,8 @@ class BioClinBERTEncoder(nn.Module):
             self.bert.eval()
             self.bert.to(self._device())
 
-        # --- fix: add this so later debug prints don't crash ---
+        # for one-time debug printing
         self._printed_once = False
-        # -------------------------------------------------------
-
 
     def _device(self) -> torch.device:
         return self.device_override or next(self.parameters()).device
@@ -322,8 +317,6 @@ class BioClinBERTEncoder(nn.Module):
             out = torch.zeros(len(token_windows), self.hidden, device=device)
             _peek_tensor("bbert.cls_fallback_zeros", out)
             return out
-            # Or: raise RuntimeError("Bio_ClinicalBERT unavailable. Set force_hf=True and fix env.")
-
 
         if next(self.bert.parameters()).device != device:
             self.bert.to(device)
@@ -351,7 +344,6 @@ class BioClinBERTEncoder(nn.Module):
             cls = out.last_hidden_state[:, 0]  # [S, hidden]
         _peek_tensor("bbert.cls_raw", cls)
         return cls
-
 
     @staticmethod
     def _normalize_input(batch_notes: Union[Sequence[str], Sequence[Sequence[str]]]) -> List[List[str]]:
@@ -394,7 +386,8 @@ class BioClinBERTEncoder(nn.Module):
             else:
                 cls_list: List[torch.Tensor] = []
                 for start in range(0, len(token_windows), chunk_bs):
-                    end = min(start + chunk_bs, len(token_windows))
+                    end = min(start + chunk_bs, end := start + chunk_bs)
+                    end = min(end, len(token_windows))
                     cls_hidden = self._encode_token_windows_to_cls(token_windows[start:end])
                     cls_proj = self.drop(self.proj(cls_hidden))
                     cls_list.append(cls_proj)
@@ -420,6 +413,7 @@ class BioClinBERTEncoder(nn.Module):
         if not self._printed_once:
             _dbg(f"[BioClinBERT] encode_seq -> Hpad:{tuple(Hpad.shape)} mask:{tuple(M.shape)}")
             _peek_tensor("bbert.Hpad", Hpad)
+            self._printed_once = True  # ensure one-time
         return Hpad, M
 
     def encode_chunks(
@@ -490,10 +484,10 @@ class BioClinBERTEncoder(nn.Module):
             Hpad[i, :s] = H
             M[i, :s] = 1.0
 
-        if not self._printed_once:
+        if not hasattr(self, "_printed_once_chunks") or not self._printed_once_chunks:
             _dbg(f"[BioClinBERT] encode_chunks -> Hpad:{tuple(Hpad.shape)} mask:{tuple(M.shape)}")
             _peek_tensor("bbert.Hpad_chunks", Hpad)
-            self._printed_once = True
+            self._printed_once_chunks = True
         return Hpad, M
 
     def forward(self, notes_or_chunks: Union[List[str], List[List[str]]]) -> torch.Tensor:
@@ -518,6 +512,7 @@ class BioClinBERTEncoder(nn.Module):
 
         _peek_tensor("bbert.z", z)
         return z  # embedding
+
 
 class MedFuseImageEncoder(nn.Module):
     """
@@ -599,7 +594,7 @@ class MedFuseImageEncoder(nn.Module):
             lossvalue_bce = torch.zeros(1, device=device)
 
         return preds, lossvalue_bce, visual_feats
-
+                    
 class ImageEncoder(nn.Module):
     """
     Wrapper over MedFuseImageEncoder that:
@@ -720,7 +715,6 @@ class ImageEncoder(nn.Module):
     def unfreeze_backbone(self) -> None:
         for p in self.medfuse.vision_backbone.parameters():
             p.requires_grad = True
-
 
 
 class _MLP(nn.Module):
@@ -891,7 +885,7 @@ class EncoderConfig:
     dropout: float = 0.1
     # structured
     structured_seq_len: int = 24            # 48h @ 2h bins
-    structured_n_feats: int = 17            # <-- match your data (17 variables)
+    structured_n_feats: int = 17            # match your data (17 variables)
     structured_layers: int = 2
     structured_heads: int = 8
     structured_pool: Literal["last", "mean", "cls"] = "mean"
