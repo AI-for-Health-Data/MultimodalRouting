@@ -9,7 +9,6 @@ import torch.nn.functional as F
 
 from env_config import CFG, DEVICE  
 
-# Small utilities
 def _dbg(msg: str) -> None:
     if getattr(CFG, "verbose", False):
         print(msg)
@@ -50,21 +49,6 @@ def _ensure_2d_mask(mask: Optional[torch.Tensor], B: int, T: int, device) -> tor
 
 
 class BEHRTLabEncoder(nn.Module):
-    """
-    Transformer encoder over structured sequences.
-
-    Inputs:
-      x    : [B, T, F] where F = number of variables (e.g., 17). If [B,T], it's auto-expanded to [B,T,1].
-      mask : [B, T] where 1=valid timestep.
-
-    Pooling:
-      - "mean": masked mean over time
-      - "last": last valid timestep (by mask)
-      - "cls" : learnable CLS token; pooled CLS
-
-    Output: [B, D] embedding
-    """
-
     def __init__(
         self,
         n_feats: int,
@@ -121,12 +105,6 @@ class BEHRTLabEncoder(nn.Module):
     def _encode_with_optional_cls(
         self, x: torch.Tensor, mask: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Run transformer. If pool='cls', prepend CLS and return:
-          - seq_out_no_cls: [B,T,D]
-          - mask_out:       [B,T]
-          - cls_vec:        [B,D] (else None)
-        """
         B, T, F = x.shape
         dev = x.device
         assert self.input_proj.in_features == F, f"Expected F={self.input_proj.in_features}, got F={F}"
@@ -153,11 +131,6 @@ class BEHRTLabEncoder(nn.Module):
             return H, mask, None
 
     def encode_seq(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns per-timestep sequence representations (without CLS) and mask:
-          - h: [B,T,D]
-          - mask: [B,T] float
-        """
         if x.dim() == 2:
             x = x.unsqueeze(-1)  # [B,T,1]
         B, T, _ = x.shape
@@ -202,21 +175,8 @@ class BEHRTLabEncoder(nn.Module):
 
 
 # Bio_ClinicalBERT encoder
+
 class BioClinBERTEncoder(nn.Module):
-    """
-    Bio-ClinicalBERT encoder (pre-tokenized only).
-
-    Expected per-patient input (pick one format and keep it consistent):
-      1) Dict with stacked chunks:
-         {"input_ids": LongTensor[S, L], "attention_mask": LongTensor[S, L]}
-      2) List of (ids, attn) chunk pairs:
-         [(LongTensor[L] or [1,L], LongTensor[L] or [1,L]), ...]
-    Batch = list of those per-patient objects.
-
-    Returns:
-      forward(...)   -> [B, D]  (mean pooled over chunks)
-      encode_seq(...) -> ([B, S_max, D], [B, S_max])  (per-chunk CLS with mask)
-    """
     def __init__(
         self,
         model_name: str = "emilyalsentzer/Bio_ClinicalBERT",
@@ -303,12 +263,6 @@ class BioClinBERTEncoder(nn.Module):
         return cls
 
     def encode_seq(self, notes_or_chunks) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Build per-patient sequence of CLS embeddings.
-        Returns:
-            Hpad: [B, S_max, D]
-            M   : [B, S_max] (float mask)
-        """
         dev = self._device()
         batch = self._normalize_batch(notes_or_chunks)
 
@@ -362,14 +316,6 @@ import torch.nn as nn
 import torchvision
 
 class MedFuseImageEncoder(nn.Module):
-    """
-    MedFuse-style image branch (CXRModels-equivalent):
-      - build torchvision backbone with pretrained weights
-      - remove final classifier ('fc' for ResNet, 'classifier' for DenseNet/EfficientNet)
-      - expose pooled features as visual_feats
-      - 1x Linear head -> sigmoid -> BCE loss
-      - forward returns (preds, lossvalue_bce, visual_feats)
-    """
     def __init__(
         self,
         vision_backbone: str = "resnet34",
@@ -380,10 +326,8 @@ class MedFuseImageEncoder(nn.Module):
         super().__init__()
         self.device = torch.device(device)
 
-        # Build backbone like MedFuse does
         self.vision_backbone = getattr(torchvision.models, vision_backbone)(pretrained=pretrained)
 
-        # Remove final classifier and get feature dim (robust across tv versions)
         d_visual = None
         for classifier in ("classifier", "fc"):
             cls_layer = getattr(self.vision_backbone, classifier, None)
@@ -413,10 +357,8 @@ class MedFuseImageEncoder(nn.Module):
         if d_visual is None:
             raise ValueError(f"Unsupported backbone `{vision_backbone}` (no `fc`/`classifier` head found).")
 
-        # BCE (size_average=True in old code == reduction='mean')
         self.bce_loss = nn.BCELoss(reduction="mean")
 
-        # Single Linear head (MedFuse behavior)
         self.classifier = nn.Sequential(nn.Linear(d_visual, vision_num_classes))
 
         self.feats_dim = d_visual
@@ -430,20 +372,7 @@ class MedFuseImageEncoder(nn.Module):
         n_crops: int = 0,
         bs: int | None = None,
     ):
-        """
-        Args
-        ----
-        x         : [B, 3, H, W] (or [bs*n_crops, 3, H, W] if using multi-crop)
-        labels    : [B, C] multi-label targets {0,1}, optional (for loss)
-        n_crops   : number of crops per image; if > 0 averages predictions across crops
-        bs        : original batch size when n_crops > 0 (so B == bs*n_crops)
 
-        Returns
-        -------
-        preds        : [B, C] or [bs, C] after crop-avg (sigmoid probabilities)
-        lossvalue_bce: scalar BCE loss tensor (0 if labels is None)
-        visual_feats : [B, D] pooled features from backbone (before classifier)
-        """
         device = next(self.parameters()).device
         x = x.to(device)
 
@@ -472,17 +401,6 @@ class MedFuseImageEncoder(nn.Module):
 
 # Fusion-facing image encoder wrapper
 class ImageEncoder(nn.Module):
-    """
-    Wrapper over MedFuseImageEncoder that:
-      - keeps exact MedFuse behavior available via `medfuse_forward(...)`
-      - adds a projection `visual_feats -> d` to integrate with fusion (returns embeddings)
-      - provides encode_seq(...) returning ([B,1,d], [B,1]) for route builder
-
-    Use:
-      preds, loss, feats = imgenc.medfuse_forward(x, labels=..., n_crops=..., bs=...)
-      z = imgenc(x)  # -> [B, d] embedding for fusion
-    """
-
     def __init__(
         self,
         d: int,
@@ -502,7 +420,7 @@ class ImageEncoder(nn.Module):
             device=str(dev),
         )
         self.img_agg = img_agg  # kept for API symmetry
-        self.proj = nn.Linear(self.medfuse.feats_dim, d)  # type: ignore[arg-type]
+        self.proj = nn.Linear(self.medfuse.feats_dim, d)  
         self.drop = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
         self.to(dev)
     
@@ -525,12 +443,7 @@ class ImageEncoder(nn.Module):
 
 
     def forward(self, x: Union[torch.Tensor, List[torch.Tensor], List[List[torch.Tensor]]]) -> torch.Tensor:
-        """
-        Fusion-friendly forward:
-          - If x is [B,3,H,W], returns [B, d]
-          - If x is list[Tensors], stacks to [B,3,H,W] then returns [B, d]
-          - If x is list[list[Tensors]], uses last image per sample -> [B, d]
-        """
+
         device = next(self.parameters()).device
 
         if isinstance(x, torch.Tensor):
@@ -659,7 +572,7 @@ class RouteActivation(nn.Module):
 @dataclass
 class MulTConfig:
     d: int = 256
-    dropout: float = 0.0           
+    dropout: float = 0.0              # default 0 for pure linear
     unimodal_pool: Literal["mean", "last"] = "mean"
 
 class MultimodalFeatureExtractor(nn.Module):
@@ -672,7 +585,6 @@ class MultimodalFeatureExtractor(nn.Module):
         self.pair_NI = PairwiseConcatFusion(d, p_drop=cfg.dropout)
         self.tri_LNI = TrimodalConcatFusion(d, p_drop=cfg.dropout)
 
-        # Optional: keep simple per-route activations (sigmoid); comment out if not needed
         self.act_L  = RouteActivation(d)
         self.act_N  = RouteActivation(d)
         self.act_I  = RouteActivation(d)
@@ -713,7 +625,6 @@ class MultimodalFeatureExtractor(nn.Module):
         }
         return route_embs, route_act
 
-# Builders
 @dataclass
 class EncoderConfig:
     d: int = 256
@@ -791,12 +702,11 @@ def build_multimodal_feature_extractor(
     return MultimodalFeatureExtractor(cfg).to(dev)
 
 NoteItem = Union[
-    Dict[str, torch.Tensor],                
-    List[Tuple[torch.Tensor, torch.Tensor]] 
+    Dict[str, torch.Tensor],                # {"input_ids":[S,L], "attention_mask":[S,L]}
+    List[Tuple[torch.Tensor, torch.Tensor]] # [(ids[L], attn[L]), ...]
 ]
 BatchNotes = List[NoteItem]
 
-# Route encoders helpers 
 def encode_all_routes_from_batch(
     behrt: BEHRTLabEncoder,
     bbert: BioClinBERTEncoder,
