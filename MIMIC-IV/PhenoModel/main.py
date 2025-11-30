@@ -3,6 +3,7 @@ from __future__ import annotations
 import os as _os
 _os.environ.setdefault("HF_HOME", _os.path.expanduser("~/.cache/huggingface"))
 _os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import os
 import json
 import argparse
@@ -41,15 +42,12 @@ from routing_and_heads import (
     forward_capsule_from_routes,
 )
 
-
-def print_route_matrix_detailed(routing_coef, prim_acts, label_names, where: str = ""):
-    """
-    Print comprehensive routing analysis.
-
-    routing_coef: [B, 7, K] – routing weights (softmax)
-    prim_acts: [B, 7] – primary activations (sigmoid)
-    label_names: list of K phenotype names
-    """
+def print_route_matrix_detailed(
+    routing_coef: torch.Tensor,
+    prim_acts: torch.Tensor,
+    label_names: List[str],
+    where: str = "",
+):
     with torch.no_grad():
         rc = routing_coef.detach().float().cpu()  # [B,7,K]
         pa = prim_acts.detach().float().cpu()     # [B,7]
@@ -60,33 +58,35 @@ def print_route_matrix_detailed(routing_coef, prim_acts, label_names, where: str
         rc_mean = rc.mean(dim=0).numpy()          # [7,K]
         pa_mean = pa.mean(dim=0).numpy()          # [7]
 
-        # Effective weights 
+        # Effective weights (per route × phenotype)
         effective = rc_mean * pa_mean[:, np.newaxis]  # [7,K]
 
         routes = ["L", "N", "I", "LN", "LI", "NI", "LNI"]
 
-        print(f"\n{'='*120}")
+        print(f"\n{'=' * 120}")
         print(f"[ROUTING ANALYSIS] {where}")
-        print(f"{'='*120}")
+        print(f"{'=' * 120}")
 
         # Primary activations
         print(f"\n1. PRIMARY ACTIVATIONS (sigmoid, same across all phenotypes):")
         print("   " + " | ".join(f"{r:4s}={pa_mean[i]:.3f}" for i, r in enumerate(routes)))
 
-        # Per-phenotype routing coefficients + effective weights
+        # Per-phenotype routing + effective weights
         print(f"\n2. PER-PHENOTYPE ROUTING WEIGHTS:")
         print("   Format: phenotype_name | L | N | I | LN | LI | NI | LNI")
-        print(f"   Each cell shows: routing_coef(effective_weight)")
-        print(f"   {'-'*116}")
+        print("   Each cell shows: routing_coef(effective_weight)")
+        print(f"   {'-' * 116}")
 
         for k in range(K):
             cells = []
             for i in range(R):
                 cells.append(f"{rc_mean[i, k]:.4f}({effective[i, k]:.4f})")
 
-            row = f"   {label_names[k]:15s} | " + " | ".join(f"{cell:>10s}" for cell in cells)
+            name = label_names[k] if k < len(label_names) else f"label_{k}"
+            row = f"   {name:15s} | " + " | ".join(f"{cell:>10s}" for cell in cells)
             print(row)
 
+        # Route importance aggregated across phenotypes
         print(f"\n3. ROUTE IMPORTANCE (averaged across all phenotypes):")
         rc_avg = rc_mean.mean(axis=1)      # [7]
         eff_avg = effective.mean(axis=1)   # [7]
@@ -98,33 +98,28 @@ def print_route_matrix_detailed(routing_coef, prim_acts, label_names, where: str
                 f"| primary_act={pa_mean[i]:.3f}"
             )
 
+        # Quick health check
         print(f"\n4. ROUTE HEALTH CHECK:")
         for i, r in enumerate(routes):
             if pa_mean[i] < 0.01:
                 print(f"    {r:4s} COLLAPSED (primary activation = {pa_mean[i]:.4f})")
             elif pa_mean[i] < 0.1:
-                print(f"     {r:4s} WEAK (primary activation = {pa_mean[i]:.4f})")
+                print(f"    {r:4s} WEAK (primary activation = {pa_mean[i]:.4f})")
             elif eff_avg[i] < 0.01:
-                print(f"     {r:4s} LOW EFFECTIVE WEIGHT (avg = {eff_avg[i]:.4f})")
+                print(f"    {r:4s} LOW EFFECTIVE WEIGHT (avg = {eff_avg[i]:.4f})")
             else:
-                print(f"     {r:4s} HEALTHY (effective weight = {eff_avg[i]:.3f})")
+                print(f"    {r:4s} HEALTHY (effective weight = {eff_avg[i]:.3f})")
 
-        print(f"{'='*120}\n")
+        print(f"{'=' * 120}\n")
 
-
-from typing import Optional as _Optional
 
 def print_phenotype_routing_heatmap(
-    routing_coef,
-    prim_acts,
-    label_names: _Optional[List[str]] = None,
+    routing_coef: torch.Tensor,
+    prim_acts: torch.Tensor,
+    label_names: Optional[List[str]] = None,
     where: str = "",
-    top_k: _Optional[int] = None,
+    top_k: Optional[int] = None,
 ):
-    """
-    Show which routes are most important for which phenotypes.
-    If top_k is None, show ALL phenotypes.
-    """
     with torch.no_grad():
         rc = routing_coef.detach().float().cpu()
         pa = prim_acts.detach().float().cpu()
@@ -135,7 +130,7 @@ def print_phenotype_routing_heatmap(
 
         effective = rc_mean * pa_mean[:, np.newaxis]  # [7,K]
 
-        # Decide which phenotypes to show
+        # decide which phenotypes to show
         if top_k is None or top_k >= K:
             top_indices = np.arange(K)
         else:
@@ -144,14 +139,18 @@ def print_phenotype_routing_heatmap(
 
         routes = ["L", "N", "I", "LN", "LI", "NI", "LNI"]
 
-        print(f"\n{'='*120}")
+        print(f"\n{'=' * 120}")
         print(f"[PHENOTYPE ROUTING HEATMAP] {where}")
         print("Showing effective weights (primary_act × routing_coef):")
-        print(f"{'-'*120}")
+        print(f"{'-' * 120}")
 
         for idx in top_indices:
-            name = label_names[idx] if label_names is not None else get_pheno_name(idx)
-            weights = effective[:, idx]
+            if label_names is not None and idx < len(label_names):
+                name = label_names[idx]
+            else:
+                name = get_pheno_name(idx)
+
+            weights = effective[:, idx]  # [7]
 
             dominant_idx = weights.argmax()
             dominant_route = routes[dominant_idx]
@@ -164,22 +163,16 @@ def print_phenotype_routing_heatmap(
                 f"  {name:60s} → DOMINANT: {dominant_route:4s} ({dominant_weight:.3f}) "
                 f"| ALL: {weight_str}"
             )
-        print(f"{'='*120}\n")
+        print(f"{'=' * 120}\n")
 
 
 def save_routing_heatmap(
-    routing_coef,
-    prim_acts,
-    label_names,
+    routing_coef: torch.Tensor,
+    prim_acts: torch.Tensor,
+    label_names: List[str],
     where: str,
     out_dir: str,
 ):
-    """
-    Save a heatmap image for effective routing weights (routes × phenotypes).
-    - routing_coef: [B, 7, K]
-    - prim_acts:    [B, 7]
-    - label_names:  list of K phenotype names
-    """
     with torch.no_grad():
         rc = routing_coef.detach().float().cpu()
         pa = prim_acts.detach().float().cpu()
@@ -210,7 +203,6 @@ def save_routing_heatmap(
         plt.close()
         print(f"[routing] saved heatmap → {fname}")
 
-
 def _cfg(name: str, default):
     return getattr(CFG, name, default)
 
@@ -223,7 +215,6 @@ IMAGENET_STD  = (0.229, 0.224, 0.225)
 TOKENIZER = None
 MAXLEN = 512
 CHUNK_STRIDE = 128
-
 
 def _chunk_long_ids(ids: List[int], attn: List[int], maxlen: int, stride: int):
     if len(ids) <= maxlen:
@@ -243,6 +234,10 @@ def _chunk_long_ids(ids: List[int], attn: List[int], maxlen: int, stride: int):
 
 
 def pretok_batch_notes(batch_notes: List[List[str]]):
+    """
+    Takes a list of lists of raw text chunks per stay.
+    Returns tokenized tensors on DEVICE, with chunking for long notes.
+    """
     global TOKENIZER, MAXLEN
     if TOKENIZER is None:
         raise RuntimeError("TOKENIZER not initialized; call main() after load_cfg().")
@@ -288,7 +283,6 @@ def pretok_batch_notes(batch_notes: List[List[str]]):
 
         out.append({"input_ids": ids_mat, "attention_mask": attn_mat})
     return out
-
 
 def build_image_transform(split: str) -> T.Compose:
     split = str(split).lower()
@@ -340,10 +334,10 @@ def parse_args():
     ap.add_argument("--calib_bins", type=int, default=10)
     return ap.parse_args()
 
-
 class ICUStayDataset(Dataset):
     """
     Strict tri-modal dataset for 25 phenotypes.
+
     REQUIRED under data_root:
       - splits.json
       - structured.parquet       (stay_id, hour, <17 feature columns>)
@@ -392,12 +386,13 @@ class ICUStayDataset(Dataset):
         self.images = pd.read_parquet(images_fp)
         self.labels = pd.read_parquet(labels_fp)
 
+        # unify stay_id dtype
         for attr in ["struct", "notes", "images", "labels"]:
             df = getattr(self, attr)
             if "stay_id" in df.columns:
                 df["stay_id"] = df["stay_id"].astype(int)
 
-        # structured feature columns 
+        # structured feature columns
         base_cols = {"stay_id", "hour"}
         self.feat_cols: List[str] = [c for c in self.struct.columns if c not in base_cols]
         if hasattr(CFG, "structured_n_feats"):
@@ -405,7 +400,7 @@ class ICUStayDataset(Dataset):
                 f"CFG.structured_n_feats={CFG.structured_n_feats}, " \
                 f"found {len(self.feat_cols)} in {struct_fp}"
 
-        # note chunk columns 
+        # note chunk columns
         self.chunk_cols: List[str] = [c for c in self.notes.columns if str(c).startswith("chunk_")]
         self.chunk_cols.sort()
         if len(self.chunk_cols) == 0:
@@ -413,7 +408,7 @@ class ICUStayDataset(Dataset):
                 "[ICUStayDataset] notes.parquet must contain at least one 'chunk_*' column."
             )
 
-        # phenotype label columns 
+        # phenotype label columns
         self.label_cols: List[str] = [c for c in self.labels.columns if c != "stay_id"]
         self.label_cols.sort()
         if len(self.label_cols) == 0:
@@ -427,7 +422,7 @@ class ICUStayDataset(Dataset):
 
         self.num_labels = len(self.label_cols)
 
-        # tri-modal intersection on stay_id 
+        # tri-modal intersection on stay_id
         ids_set = set(int(x) for x in split_ids)
 
         struct_ids = set(self.struct["stay_id"].astype(int).unique().tolist())
@@ -477,6 +472,7 @@ class ICUStayDataset(Dataset):
     def __getitem__(self, idx: int):
         stay_id = self.ids[idx]
 
+        # structured EHR
         df_s = self.struct[self.struct.stay_id == stay_id].sort_values("hour")
         xs_np = (
             df_s[self.feat_cols]
@@ -486,6 +482,7 @@ class ICUStayDataset(Dataset):
         )
         xs = torch.from_numpy(xs_np)  # [<=T,F]
 
+        # notes: collect all non-empty chunks from first matching row
         notes_list: List[str] = []
         df_n = self.notes[self.notes.stay_id == stay_id].copy()
         if not df_n.empty:
@@ -508,12 +505,13 @@ class ICUStayDataset(Dataset):
                 f"[ICUStayDataset] stay_id={stay_id} has no non-empty notes chunks in __getitem__"
             )
 
+        # images: use last path
         img_paths: List[str] = []
         df_i = self.images[self.images.stay_id == stay_id]
         if not df_i.empty:
             img_paths = df_i.image_path.dropna().astype(str).tolist()[-1:]
 
-        # 25-phenotype multi-label target 
+        # multi-label phenotype target [K]
         lab_row = self.labels[self.labels.stay_id == stay_id]
         if lab_row.empty:
             raise RuntimeError(f"[ICUStayDataset] Missing labels for stay_id={stay_id}")
@@ -527,7 +525,6 @@ class ICUStayDataset(Dataset):
             "image_paths": img_paths,
             "y": y,
         }
-
 
 def pad_or_trim_struct(x: torch.Tensor, T: int, F: int) -> torch.Tensor:
     t = x.shape[0]
@@ -560,6 +557,15 @@ def load_cxr_tensor(paths: List[str], tfms: T.Compose, return_path: bool = False
 
 
 def collate_fn_factory(tidx: int, img_tfms: T.Compose):
+    """
+    Collate giving:
+      xL_batch: [B,T,F]
+      mL_batch: [B,T]
+      notes_batch: list of list[str]
+      imgs_batch: [B,3,224,224]
+      y_batch: [B,K]
+      dbg: dict with stay_ids / img_paths
+    """
     first_print = {"done": False}
 
     def _collate(batch: List[Dict[str, Any]]):
@@ -605,7 +611,9 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
                 f"| y_batch: {tuple(y_batch.shape)}"
             )
         return xL_batch, mL_batch, notes_batch, imgs_batch, y_batch, dbg
+
     return _collate
+
 
 @torch.no_grad()
 def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
@@ -629,10 +637,12 @@ def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
         )
     print("[sample-inspect] ---------------------------\n")
 
-
 def _capsule_forward_safe(z, fusion, projector, cap_head,
                           route_mask=None, act_temperature=1.0,
                           detach_priors=False, return_routing=True):
+    """
+    Wrapper that handles older forward_capsule_from_routes signatures gracefully.
+    """
     try:
         return forward_capsule_from_routes(
             z_unimodal=z, fusion=fusion, projector=projector, capsule_head=cap_head,
@@ -644,6 +654,7 @@ def _capsule_forward_safe(z, fusion, projector, cap_head,
             z_unimodal=z, fusion=fusion, projector=projector, capsule_head=cap_head,
             return_routing=return_routing
         )
+
 
 def _clamp_norm(x: torch.Tensor, max_norm: float = 20.0) -> torch.Tensor:
     if x.ndim < 2:
@@ -659,7 +670,6 @@ def _safe_tensor(x: torch.Tensor, name: str = "") -> torch.Tensor:
         print(f"[NaN/Inf GUARD] {name}: found {n_nan} non-finite entries, clamping.")
         x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
     return x
-
 
 @torch.no_grad()
 def evaluate_epoch(
@@ -710,6 +720,7 @@ def evaluate_epoch(
             logits, prim_acts, route_embs = out[0], out[1], out[2]
             routing_coef = out[3] if len(out) > 3 else None
 
+            # routing debugging / heatmaps for first batch
             if route_debug and routing_coef is not None and bidx == 0:
                 names = label_names if label_names is not None else \
                     [get_pheno_name(i) for i in range(routing_coef.size(2))]
@@ -767,6 +778,7 @@ def save_checkpoint(path: str, state: Dict):
     ensure_dir(os.path.dirname(path))
     torch.save(state, path)
 
+
 def load_checkpoint(path: str, behrt, bbert, imgenc, fusion, projector, cap_head, optimizer) -> int:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     behrt.load_state_dict(ckpt["behrt"])
@@ -779,6 +791,7 @@ def load_checkpoint(path: str, behrt, bbert, imgenc, fusion, projector, cap_head
     optimizer.load_state_dict(ckpt["optimizer"])
     print(f"[ckpt] loaded epoch={ckpt.get('epoch', 0)} val_acc={ckpt.get('val_acc', -1):.4f}")
     return int(ckpt.get("epoch", 0))
+
 
 @torch.no_grad()
 def collect_epoch_outputs(loader, behrt, bbert, imgenc, fusion, projector, cap_head, amp_ctx):
@@ -817,6 +830,8 @@ def collect_epoch_outputs(loader, behrt, bbert, imgenc, fusion, projector, cap_h
     p1     = torch.cat(p1, dim=0).numpy()
     return y_true, p1, ids
 
+
+# Multi-label metrics / calibration
 
 def epoch_metrics(y_true, p, y_pred):
     """
@@ -1039,10 +1054,6 @@ def compute_split_prevalence(
     split_name: str = "VAL",
     label_names: Optional[List[str]] = None,
 ):
-    """
-    Compute and print per-label prevalence for a given split.
-    y_true: [N, K] binary labels
-    """
     y_true = np.asarray(y_true)
     prev = y_true.mean(axis=0)  # [K]
 
@@ -1108,11 +1119,9 @@ def save_split_thresholds(
     print(f"[{split_name}] Saved thresholds → {path}")
     return path
 
-
 def main():
     args = parse_args()
 
-    # Apply CLI overrides
     apply_cli_overrides(args)
 
     if hasattr(args, "finetune_text") and args.finetune_text:
@@ -1127,7 +1136,7 @@ def main():
     TOKENIZER = AutoTokenizer.from_pretrained(CFG.text_model_name)
     MAXLEN = int(_cfg("max_text_len", 512))
 
-    print(f"[setup] DEVICE={DEVICE} | batch_size={CFG.batch_size} | epochs={CFG.max_epochs_tri}")
+    print(f"[setup] DEVICE={DEVICE} | batch_size={args.batch_size} | epochs={args.epochs}")
 
     use_cuda = (str(DEVICE).startswith("cuda") and torch.cuda.is_available())
     if use_cuda:
@@ -1142,9 +1151,11 @@ def main():
         amp_ctx = nullcontext()
         scaler = torch.cuda.amp.GradScaler(enabled=False)
 
+    # Datasets
     train_ds = ICUStayDataset(args.data_root, split="train")
     tri_ids = set(train_ds.ids)
 
+    # Class-balancing pos_weight from TRAIN
     train_label_df = train_ds.labels[
         train_ds.labels["stay_id"].isin(tri_ids)
     ][train_ds.label_cols].astype(float)
@@ -1153,7 +1164,6 @@ def main():
     pos_counts = train_label_df.sum(axis=0).values
     neg_counts = N_train - pos_counts
     pos_weight = neg_counts / (pos_counts + 1e-6)
-
     pos_weight_tensor = torch.tensor(pos_weight, dtype=torch.float32, device=DEVICE)
 
     val_ds   = ICUStayDataset(args.data_root, split="val")
@@ -1186,6 +1196,7 @@ def main():
         collate_fn=collate_eval
     )
 
+    # Encoders
     enc_cfg = EncoderConfig(
         d=_cfg("d", 256), dropout=_cfg("dropout", 0.0),
         structured_seq_len=_cfg("structured_seq_len", 24),
@@ -1197,9 +1208,9 @@ def main():
         text_max_len=_cfg("max_text_len", 512),
         note_agg="attention",
         img_agg="last",
-        vision_backbone=_cfg("image_model_name", "resnet34"),  
-        vision_num_classes=14,                                  
-        vision_pretrained=True,                                 
+        vision_backbone=_cfg("image_model_name", "resnet34"),
+        vision_num_classes=14,
+        vision_pretrained=True,
     )
     behrt, bbert, imgenc = build_encoders(enc_cfg, device=DEVICE)
     print(
@@ -1213,6 +1224,7 @@ def main():
         bbert.bert.eval()
         print("[encoders] Bio_ClinicalBERT frozen (feature extractor mode)")
 
+    # Fusions + capsule head
     fusion = build_fusions(d=CFG.d, feature_mode=CFG.feature_mode, p_drop=CFG.dropout)
     for k in fusion.keys():
         fusion[k].to(DEVICE)
@@ -1225,7 +1237,7 @@ def main():
         act_type=CFG.capsule_act_type,
         layer_norm=CFG.capsule_layer_norm,
         dim_pose_to_vote=CFG.capsule_dim_pose_to_vote,
-        num_classes=num_phenos,
+        num_classes=num_phenos,  # <<< K=25 phenotypes
     ).to(DEVICE)
     print(
         f"[capsule] pc_dim={CFG.capsule_pc_dim} mc_caps_dim={CFG.capsule_mc_caps_dim} "
@@ -1233,6 +1245,7 @@ def main():
         f"out_caps={num_phenos}"
     )
 
+    # Optimizer
     params = list(behrt.parameters()) + list(bbert.parameters()) + list(imgenc.parameters())
     for k in fusion.keys():
         params += list(fusion[k].parameters())
@@ -1254,7 +1267,7 @@ def main():
 
     route_entropy_lambda = float(_cfg("route_entropy_lambda", 1e-3))
     route_entropy_warm   = int(_cfg("route_entropy_warmup_epochs", 10))
-    entropy_use_rc       = bool(_cfg("entropy_use_rc", False))
+    entropy_use_rc       = bool(_cfg("entropy_use_rc", False))  # kept for compatibility
 
     route_uniform_lambda = float(_cfg("route_uniform_lambda", 1e-3))
     route_uniform_warm   = int(_cfg("route_uniform_warmup_epochs", 5))
@@ -1338,6 +1351,7 @@ def main():
                         drop_idx = int(torch.randint(low=0, high=7, size=(1,)))
                         route_mask[:, drop_idx] = 0.0
 
+                    # second drop with smaller prob in early epochs
                     if (epoch - start_epoch) < 2 and (torch.rand(()) < route_dropout_p * 0.5):
                         drop_idx2 = int(torch.randint(low=0, high=7, size=(1,)))
                         route_mask[:, drop_idx2] = 0.0
@@ -1379,9 +1393,9 @@ def main():
                         f"| prim_acts: {tuple(prim_acts.shape)}"
                     )
 
+                # Multi-label BCE loss
                 loss = bce(logits, y.float())
 
-                # Entropy bonus (anti-collapse, symmetric across routes)
                 if route_entropy_lambda > 0.0 and ((epoch - start_epoch) < route_entropy_warm):
                     pa = prim_acts
                     pa = pa / (pa.sum(dim=1, keepdim=True) + 1e-6)
@@ -1456,6 +1470,7 @@ def main():
             f"avg_prim_act={', '.join(f'{a:.3f}' for a in train_avg_act)}"
         )
 
+        # VAL metrics (BCE + 0.5 threshold / F1-based thresholds)
         val_loss, val_acc, val_act = evaluate_epoch(
             behrt, bbert, imgenc, fusion, projector, cap_head,
             val_loader, amp_ctx, bce,
@@ -1471,6 +1486,7 @@ def main():
             f"avg_prim_act={', '.join(f'{k}:{v:.3f}' for k, v in val_act.items())}"
         )
 
+        # Collect outputs for full VAL metrics
         y_true, p1, _ = collect_epoch_outputs(
             val_loader, behrt, bbert, imgenc, fusion, projector, cap_head, amp_ctx
         )
@@ -1541,6 +1557,7 @@ def main():
             save_checkpoint(os.path.join(ckpt_dir, "best.pt"), ckpt)
             print(f"[epoch {epoch + 1}] Saved BEST checkpoint (acc={val_acc:.4f})")
 
+    # TEST evaluation using BEST checkpoint
     print("[main] Evaluating BEST checkpoint on TEST...")
     best_path = os.path.join(ckpt_dir, "best.pt")
     if os.path.isfile(best_path):
@@ -1565,6 +1582,7 @@ def main():
         f"avg_prim_act={', '.join(f'{k}:{v:.3f}' for k, v in test_act.items())}"
     )
 
+    # Compute prevalence & thresholds on VAL
     y_true_v, p_v, _ = collect_epoch_outputs(
         val_loader, behrt, bbert, imgenc, fusion, projector, cap_head, amp_ctx
     )
@@ -1592,6 +1610,7 @@ def main():
     )
     save_split_thresholds(thr_test, ckpt_dir, split_name="TEST")
 
+    # Evaluate TEST using VAL-optimized thresholds
     y_pred_t = (p1_t >= thr_val[np.newaxis, :]).astype(float)
     mt = epoch_metrics(y_true_t, p1_t, y_pred_t)
 
