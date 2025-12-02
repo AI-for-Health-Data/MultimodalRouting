@@ -48,6 +48,13 @@ def print_route_matrix_detailed(
     label_names: List[str],
     where: str = "",
 ):
+    """
+    Print comprehensive routing analysis.
+
+    routing_coef: [B, 7, K] – routing weights (softmax over routes or caps)
+    prim_acts:    [B, 7]     – primary activations (sigmoid over 7 routes)
+    label_names:  list of K phenotype names (for display)
+    """
     with torch.no_grad():
         rc = routing_coef.detach().float().cpu()  # [B,7,K]
         pa = prim_acts.detach().float().cpu()     # [B,7]
@@ -120,6 +127,10 @@ def print_phenotype_routing_heatmap(
     where: str = "",
     top_k: Optional[int] = None,
 ):
+    """
+    Textual "heatmap" showing effective weights (prim_act × routing_coef)
+    per phenotype across the 7 routes.
+    """
     with torch.no_grad():
         rc = routing_coef.detach().float().cpu()
         pa = prim_acts.detach().float().cpu()
@@ -173,6 +184,12 @@ def save_routing_heatmap(
     where: str,
     out_dir: str,
 ):
+    """
+    Save a matplotlib heatmap for effective routing weights (routes × phenotypes).
+    routing_coef: [B, 7, K]
+    prim_acts:    [B, 7]
+    label_names:  list of K phenotype names
+    """
     with torch.no_grad():
         rc = routing_coef.detach().float().cpu()
         pa = prim_acts.detach().float().cpu()
@@ -234,10 +251,6 @@ def _chunk_long_ids(ids: List[int], attn: List[int], maxlen: int, stride: int):
 
 
 def pretok_batch_notes(batch_notes: List[List[str]]):
-    """
-    Takes a list of lists of raw text chunks per stay.
-    Returns tokenized tensors on DEVICE, with chunking for long notes.
-    """
     global TOKENIZER, MAXLEN
     if TOKENIZER is None:
         raise RuntimeError("TOKENIZER not initialized; call main() after load_cfg().")
@@ -305,7 +318,6 @@ def build_image_transform(split: str) -> T.Compose:
             T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ])
 
-
 def parse_args():
     ap = argparse.ArgumentParser(
         description="Phenotype prediction with 7-route capsule routing (multi-label)"
@@ -316,7 +328,7 @@ def parse_args():
                     help="Only keep stays that have structured + notes + image.")
     ap.add_argument("--data_root", type=str, default=_cfg("data_root", "./data"))
     ap.add_argument("--ckpt_root", type=str, default=_cfg("ckpt_root", "./ckpts"))
-    ap.add_argument("--epochs", type=int, default=max(1, _cfg("max_epochs_tri", 5)))
+    ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--batch_size", type=int, default=_cfg("batch_size", 16))
     ap.add_argument("--lr", type=float, default=_cfg("lr", 2e-4))
     ap.add_argument("--weight_decay", type=float, default=_cfg("weight_decay", 1e-4))
@@ -386,7 +398,6 @@ class ICUStayDataset(Dataset):
         self.images = pd.read_parquet(images_fp)
         self.labels = pd.read_parquet(labels_fp)
 
-        # unify stay_id dtype
         for attr in ["struct", "notes", "images", "labels"]:
             df = getattr(self, attr)
             if "stay_id" in df.columns:
@@ -422,7 +433,6 @@ class ICUStayDataset(Dataset):
 
         self.num_labels = len(self.label_cols)
 
-        # tri-modal intersection on stay_id
         ids_set = set(int(x) for x in split_ids)
 
         struct_ids = set(self.struct["stay_id"].astype(int).unique().tolist())
@@ -472,7 +482,6 @@ class ICUStayDataset(Dataset):
     def __getitem__(self, idx: int):
         stay_id = self.ids[idx]
 
-        # structured EHR
         df_s = self.struct[self.struct.stay_id == stay_id].sort_values("hour")
         xs_np = (
             df_s[self.feat_cols]
@@ -482,7 +491,6 @@ class ICUStayDataset(Dataset):
         )
         xs = torch.from_numpy(xs_np)  # [<=T,F]
 
-        # notes: collect all non-empty chunks from first matching row
         notes_list: List[str] = []
         df_n = self.notes[self.notes.stay_id == stay_id].copy()
         if not df_n.empty:
@@ -505,7 +513,6 @@ class ICUStayDataset(Dataset):
                 f"[ICUStayDataset] stay_id={stay_id} has no non-empty notes chunks in __getitem__"
             )
 
-        # images: use last path
         img_paths: List[str] = []
         df_i = self.images[self.images.stay_id == stay_id]
         if not df_i.empty:
@@ -637,12 +644,10 @@ def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
         )
     print("[sample-inspect] ---------------------------\n")
 
+
 def _capsule_forward_safe(z, fusion, projector, cap_head,
                           route_mask=None, act_temperature=1.0,
                           detach_priors=False, return_routing=True):
-    """
-    Wrapper that handles older forward_capsule_from_routes signatures gracefully.
-    """
     try:
         return forward_capsule_from_routes(
             z_unimodal=z, fusion=fusion, projector=projector, capsule_head=cap_head,
@@ -693,6 +698,11 @@ def evaluate_epoch(
     printed_caps_once = False
     rpt_every = int(_cfg("routing_print_every", 0) or 0)
 
+    # per-route, per-phenotype routing importance
+    rc_sum_mat = None      
+    has_routing = False
+
+
     for bidx, (xL, mL, notes, imgs, y, dbg) in enumerate(loader):
         xL = xL.to(DEVICE, non_blocking=True)
         mL = mL.to(DEVICE, non_blocking=True)
@@ -719,8 +729,16 @@ def evaluate_epoch(
             )
             logits, prim_acts, route_embs = out[0], out[1], out[2]
             routing_coef = out[3] if len(out) > 3 else None
+            if routing_coef is not None:
+                has_routing = True
+                rc = routing_coef.detach().float().cpu()   # [B, 7, K]
+                rc_mean_batch = rc.mean(dim=0)             # [7, K]
 
-            # routing debugging / heatmaps for first batch
+                if rc_sum_mat is None:
+                    rc_sum_mat = torch.zeros_like(rc_mean_batch)  # [7, K]
+
+                rc_sum_mat += rc_mean_batch * y.size(0)          
+
             if route_debug and routing_coef is not None and bidx == 0:
                 names = label_names if label_names is not None else \
                     [get_pheno_name(i) for i in range(routing_coef.size(2))]
@@ -772,7 +790,14 @@ def evaluate_epoch(
     avg_act  = (act_sum / max(1, num_samples)).tolist()
     route_names = ["L", "N", "I", "LN", "LI", "NI", "LNI"]
     avg_act_dict = {r: avg_act[i] for i, r in enumerate(route_names)}
-    return avg_loss, avg_acc, avg_act_dict
+
+    if num_samples > 0 and has_routing and rc_sum_mat is not None:
+        avg_rc_mat = (rc_sum_mat / num_samples).numpy()   # [7, K]
+    else:
+        avg_rc_mat = None
+
+    return avg_loss, avg_acc, avg_act_dict, avg_rc_mat
+
 
 def save_checkpoint(path: str, state: Dict):
     ensure_dir(os.path.dirname(path))
@@ -829,9 +854,6 @@ def collect_epoch_outputs(loader, behrt, bbert, imgenc, fusion, projector, cap_h
     y_true = torch.cat(y_true, dim=0).numpy()
     p1     = torch.cat(p1, dim=0).numpy()
     return y_true, p1, ids
-
-
-# Multi-label metrics / calibration
 
 def epoch_metrics(y_true, p, y_pred):
     """
@@ -940,7 +962,6 @@ def epoch_metrics(y_true, p, y_pred):
     out["Recall_micro"]    = micro_rec
     out["F1_micro"]        = micro_f1
 
-    # Example-based F1
     example_f1s = []
     for i in range(N):
         true_i = (y_true[i] == 1)
@@ -1005,7 +1026,6 @@ def reliability_plot(bin_centers, bin_conf, bin_acc, out_path):
     plt.savefig(out_path, dpi=150)
     plt.close()
 
-
 def _set_all_seeds():
     seed = int(_cfg("seed", 42))
     import random
@@ -1054,6 +1074,10 @@ def compute_split_prevalence(
     split_name: str = "VAL",
     label_names: Optional[List[str]] = None,
 ):
+    """
+    Compute and print per-label prevalence for a given split.
+    y_true: [N, K] binary labels
+    """
     y_true = np.asarray(y_true)
     prev = y_true.mean(axis=0)  # [K]
 
@@ -1069,12 +1093,6 @@ def grid_search_thresholds(
     p: np.ndarray,
     n_steps: int = 101,
 ):
-    """
-    Per-label threshold search that maximizes per-label F1.
-    Returns:
-      thresholds: [K]
-      best_f1:    [K]
-    """
     y_true = np.asarray(y_true)
     p      = np.asarray(p)
     N, K = p.shape
@@ -1161,6 +1179,12 @@ def main():
     ][train_ds.label_cols].astype(float)
     N_train = train_label_df.shape[0]
 
+    # print TRAIN prevalence from labels 
+    compute_split_prevalence(
+        train_label_df.values,
+        split_name="TRAIN",
+        label_names=[get_pheno_name(i) for i in range(train_ds.num_labels)]
+    )
     pos_counts = train_label_df.sum(axis=0).values
     neg_counts = N_train - pos_counts
     pos_weight = neg_counts / (pos_counts + 1e-6)
@@ -1237,7 +1261,7 @@ def main():
         act_type=CFG.capsule_act_type,
         layer_norm=CFG.capsule_layer_norm,
         dim_pose_to_vote=CFG.capsule_dim_pose_to_vote,
-        num_classes=num_phenos,  # <<< K=25 phenotypes
+        num_classes=num_phenos, 
     ).to(DEVICE)
     print(
         f"[capsule] pc_dim={CFG.capsule_pc_dim} mc_caps_dim={CFG.capsule_mc_caps_dim} "
@@ -1262,6 +1286,7 @@ def main():
 
     printed_once = False
 
+    # Routing regularization hyperparams
     route_dropout_p = float(_cfg("route_dropout_p", 0.0))
     routing_warmup_epochs = int(_cfg("routing_warmup_epochs", 1))
 
@@ -1276,7 +1301,15 @@ def main():
     seen_patients = 0
     stop_training = False
 
+    # Epoch-level early stopping based on VAL macro AUROC
+    best_val_auroc = -float("inf")  
+    epochs_no_improve = 0
+    patience_epochs = 5    # stop after 5 epochs with no meaningful improvement
+    min_delta = 1e-4      
+
+    
     for epoch in range(start_epoch, args.epochs):
+
         if stop_training:
             print(f"[debug] Early stop flag set → breaking before epoch {epoch + 1}.")
             break
@@ -1346,6 +1379,7 @@ def main():
                 B = zL.size(0)
                 route_mask = torch.ones(B, 7, device=DEVICE, dtype=torch.float32)
 
+                # Route dropout (stochastic gating) for regularization
                 if route_dropout_p > 0.0:
                     if torch.rand(()) < route_dropout_p:
                         drop_idx = int(torch.randint(low=0, high=7, size=(1,)))
@@ -1369,6 +1403,7 @@ def main():
                 logits, prim_acts, route_embs = out[0], out[1], out[2]
                 routing_coef = out[3] if len(out) > 3 else None
 
+                # Routing debug on first step of each epoch
                 if getattr(args, "route_debug", False) and routing_coef is not None and step == 0:
                     where_train = f"train_epoch{epoch + 1:03d}"
                     print_route_matrix_detailed(
@@ -1410,6 +1445,7 @@ def main():
                     uniform_loss = ((p_mean - target) ** 2).sum()
                     loss = loss + route_uniform_lambda * uniform_loss
 
+            # Backprop
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -1421,6 +1457,7 @@ def main():
                 torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
                 optimizer.step()
 
+            # Log running stats
             total_loss += loss.item() * y.size(0)
 
             probs = torch.sigmoid(logits)
@@ -1430,6 +1467,7 @@ def main():
 
             act_sum += prim_acts.detach().cpu().sum(dim=0)
             num_samples += y.size(0)
+
 
             if args.log_every > 0 and ((step + 1) % args.log_every == 0):
                 avg_loss_step = total_loss / max(1, total // num_phenos)
@@ -1461,6 +1499,7 @@ def main():
                         f"mean={max(avg_act):.3f}"
                     )
 
+        # Epoch summary (TRAIN)
         train_loss = total_loss / max(1, total // num_phenos)
         train_acc  = total_correct / max(1, total)
 
@@ -1471,7 +1510,7 @@ def main():
         )
 
         # VAL metrics (BCE + 0.5 threshold / F1-based thresholds)
-        val_loss, val_acc, val_act = evaluate_epoch(
+        val_loss, val_acc, val_act, val_rc_mat = evaluate_epoch(
             behrt, bbert, imgenc, fusion, projector, cap_head,
             val_loader, amp_ctx, bce,
             route_debug=bool(getattr(args, "route_debug", False)),
@@ -1481,10 +1520,48 @@ def main():
             routing_out_dir=os.path.join(ckpt_dir, "routing"),
         )
 
-        print(
-            f"[epoch {epoch + 1}] VAL loss={val_loss:.4f} acc={val_acc:.4f} "
-            f"avg_prim_act={', '.join(f'{k}:{v:.3f}' for k, v in val_act.items())}"
-        )
+        routes = ["L", "N", "I", "LN", "LI", "NI", "LNI"]
+
+        if val_rc_mat is not None:
+            # Data-derived mean routing coefficients per route (averaged over phenotypes)
+            rc_mean_val = val_rc_mat.mean(axis=1)   # [7]
+            print("\n[epoch %d] [VAL] mean routing coefficient per route (data-derived):" % (epoch + 1))
+            for i, r in enumerate(routes):
+                print(f"  rc_mean_{r} = {rc_mean_val[i]:.4f}")
+
+            # Learned global route weights β_i from cap_head.beta_logits (start uniform, then drift)
+            with torch.no_grad():
+                global_beta_val = torch.softmax(cap_head.beta_logits, dim=0).detach().cpu().numpy()
+            print("\n[epoch %d] [VAL] learned global route weights β_i:" % (epoch + 1))
+            for i, r in enumerate(routes):
+                print(f"  β_global_{r} = {global_beta_val[i]:.4f}")
+
+            # Per-route, per-phenotype routing importance (7 x K) from routing coefficients
+            K = val_rc_mat.shape[1]
+            pheno_names = [get_pheno_name(i) for i in range(K)]
+
+            print("\n[epoch %d] [VAL] per-route, per-phenotype routing importance (mean routing coeff):" % (epoch + 1))
+            for i, r in enumerate(routes):
+                row = " | ".join(
+                    f"{pheno_names[k]}:{val_rc_mat[i, k]:.3f}"
+                    for k in range(K)
+                )
+                print(f"  {r}: {row}")
+
+            # Heatmap of 7 x K routing importance on VAL for this epoch
+            plt.figure(figsize=(max(6.0, 0.4 * K), 4.0))
+            im = plt.imshow(val_rc_mat, aspect="auto")
+            plt.colorbar(im, label="mean routing coeff")
+            plt.yticks(range(len(routes)), routes)
+            plt.xticks(range(K), pheno_names, rotation=90, fontsize=6)
+            plt.xlabel("Phenotype")
+            plt.ylabel("Route")
+            plt.title(f"Per-route, per-phenotype routing importance (VAL, epoch {epoch + 1})")
+            plt.tight_layout()
+            fname = os.path.join(ckpt_dir, f"routing_val_mean_rc_epoch{epoch + 1:03d}.png")
+            plt.savefig(fname, dpi=150)
+            plt.close()
+            print(f"[routing] saved VAL per-route-per-phenotype map → {fname}")
 
         # Collect outputs for full VAL metrics
         y_true, p1, _ = collect_epoch_outputs(
@@ -1529,6 +1606,34 @@ def main():
                 f"Recall={rec_per[k]:.4f}"
             )
 
+        # Epoch-level early stopping on VAL macro AUROC 
+        val_macro_auroc = m["AUROC"] 
+
+        if val_macro_auroc > best_val_auroc + min_delta:
+            # Significant improvement in AUROC
+            best_val_auroc = val_macro_auroc
+            epochs_no_improve = 0
+            print(
+                f"[early-stop] AUROC improved to {best_val_auroc:.4f} "
+                f"(epoch {epoch + 1})"
+            )
+        else:
+            epochs_no_improve += 1
+            print(
+                f"[early-stop] No significant improvement in VAL AUROC for "
+                f"{epochs_no_improve}/{patience_epochs} epochs "
+                f"(best={best_val_auroc:.4f}, current={val_macro_auroc:.4f}, "
+                f"min_delta={min_delta:.1e})"
+            )
+
+            if epochs_no_improve >= patience_epochs:
+                print(
+                    f"[early-stop] VAL AUROC has not improved for "
+                    f"{patience_epochs} consecutive epochs → stopping training."
+                )
+                break
+
+        # Calibration
         ece, centers, bconf, bacc, bcnt = expected_calibration_error(
             p1.reshape(-1), y_true.reshape(-1), n_bins=args.calib_bins
         )
@@ -1537,9 +1642,11 @@ def main():
         reliability_plot(centers, bconf, bacc, out_path=rel_path)
         print(f"[epoch {epoch + 1}] Saved reliability diagram → {rel_path}")
 
-        val_score = m["F1_macro"]
-        is_best = val_acc > best_val_acc
-        best_val_acc = max(best_val_acc, val_acc)
+        # Save checkpoints based on VAL accuracy 
+        val_score = m["AUROC"]
+        is_best = val_score > best_val_acc
+        best_val_acc = max(best_val_acc, val_score)
+
         ckpt = {
             "epoch": epoch + 1,
             "behrt": behrt.state_dict(),
@@ -1557,7 +1664,7 @@ def main():
             save_checkpoint(os.path.join(ckpt_dir, "best.pt"), ckpt)
             print(f"[epoch {epoch + 1}] Saved BEST checkpoint (acc={val_acc:.4f})")
 
-    # TEST evaluation using BEST checkpoint
+
     print("[main] Evaluating BEST checkpoint on TEST...")
     best_path = os.path.join(ckpt_dir, "best.pt")
     if os.path.isfile(best_path):
@@ -1570,7 +1677,7 @@ def main():
         projector.load_state_dict(ckpt["projector"])
         cap_head.load_state_dict(ckpt["cap_head"])
 
-    test_loss, test_acc, test_act = evaluate_epoch(
+    test_loss, test_acc, test_act, test_rc_mat = evaluate_epoch(
         behrt, bbert, imgenc, fusion, projector, cap_head,
         test_loader, amp_ctx, bce,
         route_debug=False,
@@ -1582,6 +1689,52 @@ def main():
         f"avg_prim_act={', '.join(f'{k}:{v:.3f}' for k, v in test_act.items())}"
     )
 
+
+    # Routing importance: global and per-phenotype (TEST) 
+    routes = ["L", "N", "I", "LN", "LI", "NI", "LNI"]
+
+    if test_rc_mat is not None:
+        # Data-derived mean routing coefficients per route (averaged over phenotypes)
+        rc_mean_test = test_rc_mat.mean(axis=1)
+        print("\n[TEST] mean routing coefficient per route (data-derived):")
+        for i, r in enumerate(routes):
+            print(f"  rc_mean_{r} = {rc_mean_test[i]:.4f}")
+
+        # Learned global route weights β_i on TEST model
+        with torch.no_grad():
+            global_beta_test = torch.softmax(cap_head.beta_logits, dim=0).detach().cpu().numpy()
+        print("\n[TEST] learned global route weights β_i:")
+        for i, r in enumerate(routes):
+            print(f"  β_global_{r} = {global_beta_test[i]:.4f}")
+
+        # Per-route, per-phenotype routing importance on TEST (7 x K)
+        K = test_rc_mat.shape[1]
+        pheno_names = [get_pheno_name(i) for i in range(K)]
+
+        print("\n[TEST] per-route, per-phenotype routing importance (mean routing coeff):")
+        for i, r in enumerate(routes):
+            row = " | ".join(
+                f"{pheno_names[k]}:{test_rc_mat[i, k]:.3f}"
+                for k in range(K)
+            )
+            print(f"  {r}: {row}")
+
+        # Heatmap for TEST
+        plt.figure(figsize=(max(6.0, 0.4 * K), 4.0))
+        im = plt.imshow(test_rc_mat, aspect="auto")
+        plt.colorbar(im, label="mean routing coeff")
+        plt.yticks(range(len(routes)), routes)
+        plt.xticks(range(K), pheno_names, rotation=90, fontsize=6)
+        plt.xlabel("Phenotype")
+        plt.ylabel("Route")
+        plt.title("Per-route, per-phenotype routing importance (TEST)")
+        plt.tight_layout()
+        fname = os.path.join(ckpt_dir, "routing_test_mean_rc.png")
+        plt.savefig(fname, dpi=150)
+        plt.close()
+        print(f"[routing] saved TEST per-route-per-phenotype map → {fname}")
+
+
     # Compute prevalence & thresholds on VAL
     y_true_v, p_v, _ = collect_epoch_outputs(
         val_loader, behrt, bbert, imgenc, fusion, projector, cap_head, amp_ctx
@@ -1592,6 +1745,7 @@ def main():
     thr_val, f1_val_thr = grid_search_thresholds(y_true_v, p_v, n_steps=101)
     save_split_thresholds(thr_val, ckpt_dir, split_name="VAL")
 
+    # Prevalence, thresholds and metrics on TEST
     y_true_t, p1_t, _ = collect_epoch_outputs(
         test_loader, behrt, bbert, imgenc, fusion, projector, cap_head, amp_ctx
     )
