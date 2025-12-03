@@ -49,9 +49,7 @@ def print_route_matrix_detailed(
     where: str = "",
 ):
     """
-    Print comprehensive routing analysis.
-
-    routing_coef: [B, 7, K] – routing weights (softmax over routes or caps)
+    routing_coef: [B, 7, K] – routing weights (softmax over routes)
     prim_acts:    [B, 7]     – primary activations (sigmoid over 7 routes)
     label_names:  list of K phenotype names (for display)
     """
@@ -105,7 +103,6 @@ def print_route_matrix_detailed(
                 f"| primary_act={pa_mean[i]:.3f}"
             )
 
-        # Quick health check
         print(f"\n4. ROUTE HEALTH CHECK:")
         for i, r in enumerate(routes):
             if pa_mean[i] < 0.01:
@@ -127,10 +124,6 @@ def print_phenotype_routing_heatmap(
     where: str = "",
     top_k: Optional[int] = None,
 ):
-    """
-    Textual "heatmap" showing effective weights (prim_act × routing_coef)
-    per phenotype across the 7 routes.
-    """
     with torch.no_grad():
         rc = routing_coef.detach().float().cpu()
         pa = prim_acts.detach().float().cpu()
@@ -184,41 +177,40 @@ def save_routing_heatmap(
     where: str,
     out_dir: str,
 ):
-    """
-    Save a matplotlib heatmap for effective routing weights (routes × phenotypes).
-    routing_coef: [B, 7, K]
-    prim_acts:    [B, 7]
-    label_names:  list of K phenotype names
-    """
     with torch.no_grad():
         rc = routing_coef.detach().float().cpu()
         pa = prim_acts.detach().float().cpu()
 
-        B, R, K = rc.shape
-        rc_mean = rc.mean(dim=0).numpy()   # [7,K]
-        pa_mean = pa.mean(dim=0).numpy()   # [7]
-        effective = rc_mean * pa_mean[:, np.newaxis]  # [7,K]
+        B, R, K = rc.shape          # [B, 7, K]
+        rc_mean = rc.mean(dim=0).numpy()     # [7, K]
+        pa_mean = pa.mean(dim=0).numpy()     # [7]
+        effective = rc_mean * pa_mean[:, np.newaxis]  # [7, K]
 
         routes = ["L", "N", "I", "LN", "LI", "NI", "LNI"]
 
-        os.makedirs(out_dir, exist_ok=True)
-        fig_w = max(6.0, 0.4 * K)
-        fig_h = 4.0
-        plt.figure(figsize=(fig_w, fig_h))
-        im = plt.imshow(effective, aspect="auto")
-        plt.colorbar(im, fraction=0.046, pad=0.04, label="effective weight")
+        mat = effective.T  # [K, 7]
 
-        plt.yticks(range(len(routes)), routes)
-        plt.xticks(range(K), label_names, rotation=90, fontsize=6)
-        plt.xlabel("Phenotype")
-        plt.ylabel("Route")
-        plt.title(f"Routing effective weights – {where}")
+        os.makedirs(out_dir, exist_ok=True)
+
+        plt.figure(figsize=(10, 8))
+        im = plt.imshow(mat, aspect="auto")
+        plt.colorbar(
+            im,
+            label="Effective weight (primary_act × routing_coef)"
+        )
+
+        plt.xticks(ticks=np.arange(len(routes)), labels=routes)
+        plt.yticks(ticks=np.arange(K), labels=label_names, fontsize=6)
+
+        plt.xlabel("Route")
+        plt.ylabel("Phenotype")
+        plt.title(f"Phenotype Routing Heatmap ({where}, effective weights)")
         plt.tight_layout()
 
-        fname = os.path.join(out_dir, f"routing_{where}.png")
-        plt.savefig(fname, dpi=150)
+        fname = os.path.join(out_dir, f"phenotype_routing_{where}_heatmap.png")
+        plt.savefig(fname, dpi=300)
         plt.close()
-        print(f"[routing] saved heatmap → {fname}")
+        print(f"[routing] saved phenotype routing heatmap → {fname}")
 
 def _cfg(name: str, default):
     return getattr(CFG, name, default)
@@ -251,6 +243,10 @@ def _chunk_long_ids(ids: List[int], attn: List[int], maxlen: int, stride: int):
 
 
 def pretok_batch_notes(batch_notes: List[List[str]]):
+    """
+    Takes a list of lists of raw text chunks per stay.
+    Returns tokenized tensors on DEVICE, with chunking for long notes.
+    """
     global TOKENIZER, MAXLEN
     if TOKENIZER is None:
         raise RuntimeError("TOKENIZER not initialized; call main() after load_cfg().")
@@ -328,7 +324,7 @@ def parse_args():
                     help="Only keep stays that have structured + notes + image.")
     ap.add_argument("--data_root", type=str, default=_cfg("data_root", "./data"))
     ap.add_argument("--ckpt_root", type=str, default=_cfg("ckpt_root", "./ckpts"))
-    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--batch_size", type=int, default=_cfg("batch_size", 16))
     ap.add_argument("--lr", type=float, default=_cfg("lr", 2e-4))
     ap.add_argument("--weight_decay", type=float, default=_cfg("weight_decay", 1e-4))
@@ -348,9 +344,6 @@ def parse_args():
 
 class ICUStayDataset(Dataset):
     """
-    Strict tri-modal dataset for 25 phenotypes.
-
-    REQUIRED under data_root:
       - splits.json
       - structured.parquet       (stay_id, hour, <17 feature columns>)
       - notes.parquet            (stay_id, chunk_000..chunk_XXX)
@@ -398,6 +391,7 @@ class ICUStayDataset(Dataset):
         self.images = pd.read_parquet(images_fp)
         self.labels = pd.read_parquet(labels_fp)
 
+        # unify stay_id dtype
         for attr in ["struct", "notes", "images", "labels"]:
             df = getattr(self, attr)
             if "stay_id" in df.columns:
@@ -433,6 +427,7 @@ class ICUStayDataset(Dataset):
 
         self.num_labels = len(self.label_cols)
 
+        # tri-modal intersection on stay_id
         ids_set = set(int(x) for x in split_ids)
 
         struct_ids = set(self.struct["stay_id"].astype(int).unique().tolist())
@@ -482,6 +477,7 @@ class ICUStayDataset(Dataset):
     def __getitem__(self, idx: int):
         stay_id = self.ids[idx]
 
+        # structured EHR
         df_s = self.struct[self.struct.stay_id == stay_id].sort_values("hour")
         xs_np = (
             df_s[self.feat_cols]
@@ -491,6 +487,7 @@ class ICUStayDataset(Dataset):
         )
         xs = torch.from_numpy(xs_np)  # [<=T,F]
 
+        # notes: collect all non-empty chunks from first matching row
         notes_list: List[str] = []
         df_n = self.notes[self.notes.stay_id == stay_id].copy()
         if not df_n.empty:
@@ -513,6 +510,7 @@ class ICUStayDataset(Dataset):
                 f"[ICUStayDataset] stay_id={stay_id} has no non-empty notes chunks in __getitem__"
             )
 
+        # images: use last path
         img_paths: List[str] = []
         df_i = self.images[self.images.stay_id == stay_id]
         if not df_i.empty:
@@ -644,7 +642,6 @@ def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
         )
     print("[sample-inspect] ---------------------------\n")
 
-
 def _capsule_forward_safe(z, fusion, projector, cap_head,
                           route_mask=None, act_temperature=1.0,
                           detach_priors=False, return_routing=True):
@@ -699,7 +696,7 @@ def evaluate_epoch(
     rpt_every = int(_cfg("routing_print_every", 0) or 0)
 
     # per-route, per-phenotype routing importance
-    rc_sum_mat = None      
+    rc_sum_mat = None      # [7, K]
     has_routing = False
 
 
@@ -737,7 +734,7 @@ def evaluate_epoch(
                 if rc_sum_mat is None:
                     rc_sum_mat = torch.zeros_like(rc_mean_batch)  # [7, K]
 
-                rc_sum_mat += rc_mean_batch * y.size(0)          
+                rc_sum_mat += rc_mean_batch * y.size(0)           # weight by batch size
 
             if route_debug and routing_coef is not None and bidx == 0:
                 names = label_names if label_names is not None else \
@@ -817,7 +814,6 @@ def load_checkpoint(path: str, behrt, bbert, imgenc, fusion, projector, cap_head
     print(f"[ckpt] loaded epoch={ckpt.get('epoch', 0)} val_acc={ckpt.get('val_acc', -1):.4f}")
     return int(ckpt.get("epoch", 0))
 
-
 @torch.no_grad()
 def collect_epoch_outputs(loader, behrt, bbert, imgenc, fusion, projector, cap_head, amp_ctx):
     behrt.eval()
@@ -854,6 +850,7 @@ def collect_epoch_outputs(loader, behrt, bbert, imgenc, fusion, projector, cap_h
     y_true = torch.cat(y_true, dim=0).numpy()
     p1     = torch.cat(p1, dim=0).numpy()
     return y_true, p1, ids
+
 
 def epoch_metrics(y_true, p, y_pred):
     """
@@ -1026,6 +1023,7 @@ def reliability_plot(bin_centers, bin_conf, bin_acc, out_path):
     plt.savefig(out_path, dpi=150)
     plt.close()
 
+
 def _set_all_seeds():
     seed = int(_cfg("seed", 42))
     import random
@@ -1093,6 +1091,12 @@ def grid_search_thresholds(
     p: np.ndarray,
     n_steps: int = 101,
 ):
+    """
+    Per-label threshold search that maximizes per-label F1.
+    Returns:
+      thresholds: [K]
+      best_f1:    [K]
+    """
     y_true = np.asarray(y_true)
     p      = np.asarray(p)
     N, K = p.shape
@@ -1140,6 +1144,7 @@ def save_split_thresholds(
 def main():
     args = parse_args()
 
+    # Apply CLI overrides to CFG
     apply_cli_overrides(args)
 
     if hasattr(args, "finetune_text") and args.finetune_text:
@@ -1169,7 +1174,6 @@ def main():
         amp_ctx = nullcontext()
         scaler = torch.cuda.amp.GradScaler(enabled=False)
 
-    # Datasets
     train_ds = ICUStayDataset(args.data_root, split="train")
     tri_ids = set(train_ds.ids)
 
@@ -1261,7 +1265,7 @@ def main():
         act_type=CFG.capsule_act_type,
         layer_norm=CFG.capsule_layer_norm,
         dim_pose_to_vote=CFG.capsule_dim_pose_to_vote,
-        num_classes=num_phenos, 
+        num_classes=num_phenos,  # K=25 phenotypes
     ).to(DEVICE)
     print(
         f"[capsule] pc_dim={CFG.capsule_pc_dim} mc_caps_dim={CFG.capsule_mc_caps_dim} "
@@ -1276,6 +1280,7 @@ def main():
     params += list(projector.parameters()) + list(cap_head.parameters())
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
+    # Checkpoint setup
     start_epoch = 0
     best_val_acc = -1.0
     ckpt_dir = os.path.join(args.ckpt_root, "pheno_capsule")
@@ -1302,12 +1307,12 @@ def main():
     stop_training = False
 
     # Epoch-level early stopping based on VAL macro AUROC
-    best_val_auroc = -float("inf")  
+    best_val_auroc = -float("inf") 
     epochs_no_improve = 0
     patience_epochs = 5    # stop after 5 epochs with no meaningful improvement
-    min_delta = 1e-4      
-
+    min_delta = 1e-4       
     
+    # Training loop
     for epoch in range(start_epoch, args.epochs):
 
         if stop_training:
@@ -1379,7 +1384,7 @@ def main():
                 B = zL.size(0)
                 route_mask = torch.ones(B, 7, device=DEVICE, dtype=torch.float32)
 
-                # Route dropout (stochastic gating) for regularization
+                # Route dropout for regularization
                 if route_dropout_p > 0.0:
                     if torch.rand(()) < route_dropout_p:
                         drop_idx = int(torch.randint(low=0, high=7, size=(1,)))
@@ -1431,6 +1436,7 @@ def main():
                 # Multi-label BCE loss
                 loss = bce(logits, y.float())
 
+                # Entropy bonus (encourage higher entropy over routes, avoid single-route collapse)
                 if route_entropy_lambda > 0.0 and ((epoch - start_epoch) < route_entropy_warm):
                     pa = prim_acts
                     pa = pa / (pa.sum(dim=1, keepdim=True) + 1e-6)
@@ -1438,6 +1444,7 @@ def main():
                     H = -(pa * pa.log()).sum(dim=1).mean()
                     loss = loss - route_entropy_lambda * H
 
+                # Uniform prior bonus across routes (mean distribution ≈ uniform)
                 if route_uniform_lambda > 0.0 and ((epoch - start_epoch) < route_uniform_warm):
                     pa_dist = prim_acts / (prim_acts.sum(dim=1, keepdim=True) + 1e-6)
                     p_mean = pa_dist.mean(dim=0)
@@ -1488,7 +1495,7 @@ def main():
                     rc_str = " | ".join(
                         f"{r}:{rc_route_mean[i]:.3f}" for i, r in enumerate(routes)
                     )
-                    msg += f" | [routing mean β] {rc_str}"
+                    msg += f" | [routing mean coeff] {rc_str}"
 
                 print(msg)
 
@@ -1520,6 +1527,7 @@ def main():
             routing_out_dir=os.path.join(ckpt_dir, "routing"),
         )
 
+        # Routing importance: global and per-phenotype (VAL) 
         routes = ["L", "N", "I", "LN", "LI", "NI", "LNI"]
 
         if val_rc_mat is not None:
@@ -1528,13 +1536,6 @@ def main():
             print("\n[epoch %d] [VAL] mean routing coefficient per route (data-derived):" % (epoch + 1))
             for i, r in enumerate(routes):
                 print(f"  rc_mean_{r} = {rc_mean_val[i]:.4f}")
-
-            # Learned global route weights β_i from cap_head.beta_logits (start uniform, then drift)
-            with torch.no_grad():
-                global_beta_val = torch.softmax(cap_head.beta_logits, dim=0).detach().cpu().numpy()
-            print("\n[epoch %d] [VAL] learned global route weights β_i:" % (epoch + 1))
-            for i, r in enumerate(routes):
-                print(f"  β_global_{r} = {global_beta_val[i]:.4f}")
 
             # Per-route, per-phenotype routing importance (7 x K) from routing coefficients
             K = val_rc_mat.shape[1]
@@ -1548,20 +1549,26 @@ def main():
                 )
                 print(f"  {r}: {row}")
 
-            # Heatmap of 7 x K routing importance on VAL for this epoch
-            plt.figure(figsize=(max(6.0, 0.4 * K), 4.0))
-            im = plt.imshow(val_rc_mat, aspect="auto")
-            plt.colorbar(im, label="mean routing coeff")
-            plt.yticks(range(len(routes)), routes)
-            plt.xticks(range(K), pheno_names, rotation=90, fontsize=6)
-            plt.xlabel("Phenotype")
-            plt.ylabel("Route")
+            # Heatmap of routing importance on VAL for this epoch
+            mat_val = val_rc_mat.T  # [K, 7]
+
+            plt.figure(figsize=(10, 8))
+            im = plt.imshow(mat_val, aspect="auto")
+            plt.colorbar(im, label="Mean routing coefficient")
+
+            plt.xticks(range(len(routes)), routes)
+            plt.yticks(range(K), pheno_names, fontsize=6)
+
+            plt.xlabel("Route")
+            plt.ylabel("Phenotype")
             plt.title(f"Per-route, per-phenotype routing importance (VAL, epoch {epoch + 1})")
             plt.tight_layout()
+
             fname = os.path.join(ckpt_dir, f"routing_val_mean_rc_epoch{epoch + 1:03d}.png")
-            plt.savefig(fname, dpi=150)
+            plt.savefig(fname, dpi=300)
             plt.close()
             print(f"[routing] saved VAL per-route-per-phenotype map → {fname}")
+
 
         # Collect outputs for full VAL metrics
         y_true, p1, _ = collect_epoch_outputs(
@@ -1607,7 +1614,7 @@ def main():
             )
 
         # Epoch-level early stopping on VAL macro AUROC 
-        val_macro_auroc = m["AUROC"] 
+        val_macro_auroc = m["AUROC"]  
 
         if val_macro_auroc > best_val_auroc + min_delta:
             # Significant improvement in AUROC
@@ -1642,8 +1649,8 @@ def main():
         reliability_plot(centers, bconf, bacc, out_path=rel_path)
         print(f"[epoch {epoch + 1}] Saved reliability diagram → {rel_path}")
 
-        # Save checkpoints based on VAL accuracy 
-        val_score = m["AUROC"]
+        # Save checkpoints based on VAL accuracy
+        val_score = m["AUROC"]  # macro AUROC
         is_best = val_score > best_val_acc
         best_val_acc = max(best_val_acc, val_score)
 
@@ -1663,7 +1670,6 @@ def main():
         if is_best:
             save_checkpoint(os.path.join(ckpt_dir, "best.pt"), ckpt)
             print(f"[epoch {epoch + 1}] Saved BEST checkpoint (acc={val_acc:.4f})")
-
 
     print("[main] Evaluating BEST checkpoint on TEST...")
     best_path = os.path.join(ckpt_dir, "best.pt")
@@ -1700,13 +1706,6 @@ def main():
         for i, r in enumerate(routes):
             print(f"  rc_mean_{r} = {rc_mean_test[i]:.4f}")
 
-        # Learned global route weights β_i on TEST model
-        with torch.no_grad():
-            global_beta_test = torch.softmax(cap_head.beta_logits, dim=0).detach().cpu().numpy()
-        print("\n[TEST] learned global route weights β_i:")
-        for i, r in enumerate(routes):
-            print(f"  β_global_{r} = {global_beta_test[i]:.4f}")
-
         # Per-route, per-phenotype routing importance on TEST (7 x K)
         K = test_rc_mat.shape[1]
         pheno_names = [get_pheno_name(i) for i in range(K)]
@@ -1719,21 +1718,25 @@ def main():
             )
             print(f"  {r}: {row}")
 
-        # Heatmap for TEST
-        plt.figure(figsize=(max(6.0, 0.4 * K), 4.0))
-        im = plt.imshow(test_rc_mat, aspect="auto")
-        plt.colorbar(im, label="mean routing coeff")
-        plt.yticks(range(len(routes)), routes)
-        plt.xticks(range(K), pheno_names, rotation=90, fontsize=6)
-        plt.xlabel("Phenotype")
-        plt.ylabel("Route")
+        # Heatmap for TEST (phenotypes on y-axis, routes on x-axis)
+        mat_test = test_rc_mat.T  # [K, 7]
+
+        plt.figure(figsize=(10, 8))
+        im = plt.imshow(mat_test, aspect="auto")
+        plt.colorbar(im, label="Mean routing coefficient")
+
+        plt.xticks(range(len(routes)), routes)
+        plt.yticks(range(K), pheno_names, fontsize=6)
+
+        plt.xlabel("Route")
+        plt.ylabel("Phenotype")
         plt.title("Per-route, per-phenotype routing importance (TEST)")
         plt.tight_layout()
+
         fname = os.path.join(ckpt_dir, "routing_test_mean_rc.png")
-        plt.savefig(fname, dpi=150)
+        plt.savefig(fname, dpi=300)
         plt.close()
         print(f"[routing] saved TEST per-route-per-phenotype map → {fname}")
-
 
     # Compute prevalence & thresholds on VAL
     y_true_v, p_v, _ = collect_epoch_outputs(
