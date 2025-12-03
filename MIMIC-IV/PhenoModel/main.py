@@ -49,7 +49,7 @@ def print_route_matrix_detailed(
     where: str = "",
 ):
     """
-    routing_coef: [B, 7, K] – routing weights (softmax over routes)
+    routing_coef: [B, 7, K] – routing weights (softmax over routes or caps)
     prim_acts:    [B, 7]     – primary activations (sigmoid over 7 routes)
     label_names:  list of K phenotype names (for display)
     """
@@ -243,10 +243,6 @@ def _chunk_long_ids(ids: List[int], attn: List[int], maxlen: int, stride: int):
 
 
 def pretok_batch_notes(batch_notes: List[List[str]]):
-    """
-    Takes a list of lists of raw text chunks per stay.
-    Returns tokenized tensors on DEVICE, with chunking for long notes.
-    """
     global TOKENIZER, MAXLEN
     if TOKENIZER is None:
         raise RuntimeError("TOKENIZER not initialized; call main() after load_cfg().")
@@ -642,6 +638,7 @@ def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
         )
     print("[sample-inspect] ---------------------------\n")
 
+
 def _capsule_forward_safe(z, fusion, projector, cap_head,
                           route_mask=None, act_temperature=1.0,
                           detach_priors=False, return_routing=True):
@@ -696,7 +693,7 @@ def evaluate_epoch(
     rpt_every = int(_cfg("routing_print_every", 0) or 0)
 
     # per-route, per-phenotype routing importance
-    rc_sum_mat = None      # [7, K]
+    rc_sum_mat = None      # will become [7, K]
     has_routing = False
 
 
@@ -736,6 +733,7 @@ def evaluate_epoch(
 
                 rc_sum_mat += rc_mean_batch * y.size(0)           # weight by batch size
 
+            # routing debugging / heatmaps for first batch
             if route_debug and routing_coef is not None and bidx == 0:
                 names = label_names if label_names is not None else \
                     [get_pheno_name(i) for i in range(routing_coef.size(2))]
@@ -795,11 +793,9 @@ def evaluate_epoch(
 
     return avg_loss, avg_acc, avg_act_dict, avg_rc_mat
 
-
 def save_checkpoint(path: str, state: Dict):
     ensure_dir(os.path.dirname(path))
     torch.save(state, path)
-
 
 def load_checkpoint(path: str, behrt, bbert, imgenc, fusion, projector, cap_head, optimizer) -> int:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
@@ -959,6 +955,7 @@ def epoch_metrics(y_true, p, y_pred):
     out["Recall_micro"]    = micro_rec
     out["F1_micro"]        = micro_f1
 
+    # Example-based F1
     example_f1s = []
     for i in range(N):
         true_i = (y_true[i] == 1)
@@ -1023,7 +1020,6 @@ def reliability_plot(bin_centers, bin_conf, bin_acc, out_path):
     plt.savefig(out_path, dpi=150)
     plt.close()
 
-
 def _set_all_seeds():
     seed = int(_cfg("seed", 42))
     import random
@@ -1072,10 +1068,6 @@ def compute_split_prevalence(
     split_name: str = "VAL",
     label_names: Optional[List[str]] = None,
 ):
-    """
-    Compute and print per-label prevalence for a given split.
-    y_true: [N, K] binary labels
-    """
     y_true = np.asarray(y_true)
     prev = y_true.mean(axis=0)  # [K]
 
@@ -1144,7 +1136,6 @@ def save_split_thresholds(
 def main():
     args = parse_args()
 
-    # Apply CLI overrides to CFG
     apply_cli_overrides(args)
 
     if hasattr(args, "finetune_text") and args.finetune_text:
@@ -1174,6 +1165,7 @@ def main():
         amp_ctx = nullcontext()
         scaler = torch.cuda.amp.GradScaler(enabled=False)
 
+    # Datasets
     train_ds = ICUStayDataset(args.data_root, split="train")
     tri_ids = set(train_ds.ids)
 
@@ -1183,7 +1175,6 @@ def main():
     ][train_ds.label_cols].astype(float)
     N_train = train_label_df.shape[0]
 
-    # print TRAIN prevalence from labels 
     compute_split_prevalence(
         train_label_df.values,
         split_name="TRAIN",
@@ -1265,7 +1256,7 @@ def main():
         act_type=CFG.capsule_act_type,
         layer_norm=CFG.capsule_layer_norm,
         dim_pose_to_vote=CFG.capsule_dim_pose_to_vote,
-        num_classes=num_phenos,  # K=25 phenotypes
+        num_classes=num_phenos,  # <<< K=25 phenotypes
     ).to(DEVICE)
     print(
         f"[capsule] pc_dim={CFG.capsule_pc_dim} mc_caps_dim={CFG.capsule_mc_caps_dim} "
@@ -1307,11 +1298,11 @@ def main():
     stop_training = False
 
     # Epoch-level early stopping based on VAL macro AUROC
-    best_val_auroc = -float("inf") 
+    best_val_auroc = -float("inf")  
     epochs_no_improve = 0
-    patience_epochs = 5    # stop after 5 epochs with no meaningful improvement
+    patience_epochs = 5    
     min_delta = 1e-4       
-    
+
     # Training loop
     for epoch in range(start_epoch, args.epochs):
 
@@ -1436,7 +1427,7 @@ def main():
                 # Multi-label BCE loss
                 loss = bce(logits, y.float())
 
-                # Entropy bonus (encourage higher entropy over routes, avoid single-route collapse)
+                # Entropy bonus 
                 if route_entropy_lambda > 0.0 and ((epoch - start_epoch) < route_entropy_warm):
                     pa = prim_acts
                     pa = pa / (pa.sum(dim=1, keepdim=True) + 1e-6)
@@ -1444,7 +1435,7 @@ def main():
                     H = -(pa * pa.log()).sum(dim=1).mean()
                     loss = loss - route_entropy_lambda * H
 
-                # Uniform prior bonus across routes (mean distribution ≈ uniform)
+                # Uniform prior bonus across routes
                 if route_uniform_lambda > 0.0 and ((epoch - start_epoch) < route_uniform_warm):
                     pa_dist = prim_acts / (prim_acts.sum(dim=1, keepdim=True) + 1e-6)
                     p_mean = pa_dist.mean(dim=0)
@@ -1569,7 +1560,6 @@ def main():
             plt.close()
             print(f"[routing] saved VAL per-route-per-phenotype map → {fname}")
 
-
         # Collect outputs for full VAL metrics
         y_true, p1, _ = collect_epoch_outputs(
             val_loader, behrt, bbert, imgenc, fusion, projector, cap_head, amp_ctx
@@ -1671,6 +1661,7 @@ def main():
             save_checkpoint(os.path.join(ckpt_dir, "best.pt"), ckpt)
             print(f"[epoch {epoch + 1}] Saved BEST checkpoint (acc={val_acc:.4f})")
 
+    # TEST evaluation using BEST checkpoint
     print("[main] Evaluating BEST checkpoint on TEST...")
     best_path = os.path.join(ckpt_dir, "best.pt")
     if os.path.isfile(best_path):
