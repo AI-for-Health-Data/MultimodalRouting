@@ -59,7 +59,7 @@ PHENO_NAMES: List[str] = [
 
 @dataclass
 class Config:
-    d: int = 256                 # shared embedding dim across encoders/fusions
+    d: int = 256                 
     dropout: float = 0.0
     lr: float = 2e-4
     batch_size: int = 16
@@ -112,15 +112,15 @@ class Config:
     debug_samples: int = 3
     routing_print_every: int = 50
 
-    route_entropy_lambda: float = 1e-3        # set 0 to disable
-    route_entropy_warmup_epochs: int = 10     # apply entropy bonus for first K epochs
+    route_entropy_lambda = 0.0        
+    route_entropy_warmup_epochs: float = 0.0     
 
-    route_uniform_lambda: float = 1e-3        
-    route_uniform_warmup_epochs: int = 5      
+    route_uniform_lambda = 0.0   
+    route_uniform_warmup_epochs: float = 0.0      
 
     # Dropout / warmup
     route_dropout_p: float = 0.0             
-    routing_warmup_epochs: int = 1            # for first K epochs, stop-grad through priors
+    routing_warmup_epochs: float = 0.0            
 
     # Priors & misc
     route_prior_floor: float = 1e-3           # min clamp for primary acts
@@ -272,31 +272,67 @@ def load_cfg(yaml_path: Optional[str] = None,
         "MIMICIV_DATA_ROOT": ("data_root", str),
         "MIMICIV_CKPT_ROOT": ("ckpt_root", str),
         "MIMICIV_TASK": ("task_name", str),
-        "MIMICIV_FINETUNE_TEXT": ("finetune_text", lambda s: str(s).lower() in {"1","true","yes"}),
+
+        "MIMICIV_FINETUNE_TEXT": (
+            "finetune_text",
+            lambda s: str(s).lower() in {"1", "true", "yes"},
+        ),
         "MIMICIV_TEXT_MODEL": ("text_model_name", str),
         "MIMICIV_MAX_TEXT_LEN": ("max_text_len", int),
+
         "MIMICIV_STRUCT_SEQ_LEN": ("structured_seq_len", int),
         "MIMICIV_STRUCT_N_FEATS": ("structured_n_feats", int),
+
         "MIMICIV_FEATURE_MODE": ("feature_mode", str),
         "MIMICIV_ROUTING_BACKEND": ("routing_backend", str),
+
         "MIMICIV_CAP_PC_DIM": ("capsule_pc_dim", int),
         "MIMICIV_CAP_MC_DIM": ("capsule_mc_caps_dim", int),
         "MIMICIV_CAP_ITERS": ("capsule_num_routing", int),
         "MIMICIV_CAP_ACT": ("capsule_act_type", str),
-        "MIMICIV_CAP_LN": ("capsule_layer_norm", lambda s: str(s).lower() in {"1", "true", "yes"}),
+        "MIMICIV_CAP_LN": (
+            "capsule_layer_norm",
+            lambda s: str(s).lower() in {"1", "true", "yes"},
+        ),
         "MIMICIV_CAP_DPOSE2VOTE": ("capsule_dim_pose_to_vote", int),
+
         "MIMICIV_LOSS": ("loss_type", str),
         "MIMICIV_LR": ("lr", float),
         "MIMICIV_BS": ("batch_size", int),
         "MIMICIV_DROPOUT": ("dropout", float),
         "MIMICIV_NUM_WORKERS": ("num_workers", int),
         "MIMICIV_PRECISION": ("precision_amp", str),
-        "MIMICIV_DETERMINISTIC": ("deterministic", lambda s: str(s).lower() in {"1", "true", "yes"}),
+        "MIMICIV_DETERMINISTIC": (
+            "deterministic",
+            lambda s: str(s).lower() in {"1", "true", "yes"},
+        ),
         "MIMICIV_SEED": ("seed", int),
-        "MIMICIV_VERBOSE": ("verbose", lambda s: str(s).lower() in {"1", "true", "yes"}),
+        "MIMICIV_VERBOSE": (
+            "verbose",
+            lambda s: str(s).lower() in {"1", "true", "yes"},
+        ),
         "MIMICIV_DEBUG_SAMPLES": ("debug_samples", int),
         "MIMICIV_ROUTING_PRINT_EVERY": ("routing_print_every", int),
+
+        "MIMICIV_ROUTE_ENTROPY_LAMBDA": ("route_entropy_lambda", float),
+        "MIMICIV_ROUTE_ENTROPY_WARM": ("route_entropy_warmup_epochs", int),
+
+        "MIMICIV_ROUTE_UNIFORM_LAMBDA": ("route_uniform_lambda", float),
+        "MIMICIV_ROUTE_UNIFORM_WARM": ("route_uniform_warmup_epochs", int),
+
+        "MIMICIV_ROUTE_DROPOUT_P": ("route_dropout_p", float),
+        "MIMICIV_ROUTING_WARMUP_EPOCHS": ("routing_warmup_epochs", int),
+
+        "MIMICIV_ROUTE_PRIOR_FLOOR": ("route_prior_floor", float),
+        "MIMICIV_ROUTE_PRIOR_CEILING": ("route_prior_ceiling", float),
+
+        "MIMICIV_LABEL_SMOOTHING": ("label_smoothing", float),
+        "MIMICIV_ENTROPY_USE_RC": (
+            "entropy_use_rc",
+            lambda s: str(s).lower() in {"1", "true", "yes"},
+        ),
     }
+
     for env_key, (cfg_key, caster) in env_map.items():
         if env_key in os.environ:
             try:
