@@ -1,31 +1,25 @@
-# MIMIC-IV/MortModel/env_config.py
 from __future__ import annotations
-
 import os
 import json
 import random
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Any
-
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  # noqa: F401
+import torch.nn.functional as F  
 
 try:
-    import lightning as L  # noqa: F401
+    import lightning as L  
 except Exception:
     L = None
-
 try:
-    import yaml  # noqa: F401
+    import yaml  
 except Exception:
     yaml = None
+from typing import Any
 
 
-# -----------------------------
-# Project constants
-# -----------------------------
 ROUTES: List[str] = ["L", "N", "I", "LN", "LI", "NI", "LNI"]
 BLOCKS: Dict[str, List[str]] = {
     "uni": ["L", "N", "I"],
@@ -34,15 +28,10 @@ BLOCKS: Dict[str, List[str]] = {
 }
 TASKS: List[str] = ["mort"]
 
-
-# -----------------------------
-# Config
-# -----------------------------
 @dataclass
 class Config:
-    # Core dims / training
-    d: int = 256                 # shared embedding dim across encoders/fusions
-    dropout: float = 0.5
+    d: int = 256                 
+    dropout: float = 0.0
     lr: float = 2e-4
     batch_size: int = 16
     max_epochs_uni: int = 5
@@ -73,11 +62,10 @@ class Config:
     # Capsule head hyperparams
     capsule_pc_dim: int = 32
     capsule_mc_caps_dim: int = 64
-    capsule_num_routing: int = 1     # keep low per anti-collapse recipe
+    capsule_num_routing: int = 3     
     capsule_act_type: str = "EM"
     capsule_layer_norm: bool = False
     capsule_dim_pose_to_vote: int = 0
-    capsule_out_caps: int = 2
     loss_type: str = "ce"
 
     # Paths & misc
@@ -87,47 +75,40 @@ class Config:
 
     # System
     use_cudnn_benchmark: bool = True
-    precision_amp: str = "auto"   # "auto" | "fp16" | "bf16" | "fp32"/"off"
+    precision_amp: str = "auto"  
     deterministic: bool = False
     seed: int = 42
     verbose: bool = True
 
-    # Debug / logging helpers
     debug_samples: int = 3
     routing_print_every: int = 50
 
-    # --- anti-collapse knobs (MUST have types) ---
-    route_entropy_lambda: float = 1e-4       # set 0 to disable; anneal to 0 after warmup
-    route_entropy_warmup_epochs: int = 2     # apply entropy bonus for first K epochs
-    route_dropout_p: float = 0.10            # prob to drop exactly ONE interaction route per batch (train only)
-    routing_warmup_epochs: int = 1           # for first K epochs, stop-grad through priors
-    route_prior_floor: float = 1e-3          # min clamp for primary acts
-    route_prior_ceiling: float = 0.999       # max clamp to avoid saturations
-    label_smoothing: float = 0.05            # CE smoothing
-    entropy_use_rc: bool = True              # prefer routing_coef for entropy; fallback to prim_acts
+    route_entropy_lambda : float = 0.0      
+    route_entropy_warmup_epochs: float = 0.0     
+
+    route_uniform_lambda : float = 0.0     
+    route_uniform_warmup_epochs: float = 0.0      
+
+    # Dropout / warmup
+    route_dropout_p: float = 0.0             
+    routing_warmup_epochs: float = 0.0            
+
+    # Priors & misc
+    route_prior_floor: float = 1e-3           # min clamp for primary acts
+    route_prior_ceiling: float = 0.999        # max clamp to avoid saturations
+    label_smoothing: float = 0.05             # CE smoothing
+    entropy_use_rc: bool = False              # prefer routing_coef for entropy; fallback to prim_acts
 
 
-# -----------------------------
-# Globals (single source of truth)
-# -----------------------------
+
 CFG: Config = Config()
-DEVICE: str = "cpu"  # set by load_cfg()
+DEVICE: str = "cpu"  
 TASK2IDX: Dict[str, int] = {name: i for i, name in enumerate(TASKS)}
 SELECTED_TASK_IDX: int = TASK2IDX.get(CFG.task_name, 0)
 
 
-# -----------------------------
-# Utilities
-# -----------------------------
 def _pick_device() -> str:
-    """
-    Decide device exactly once for the whole run.
-    Priority:
-      1) env MIMICIV_DEVICE ∈ {"cpu", "cuda", "cuda:0", "cuda:1", ...}
-      2) auto: "cuda" if available else "cpu"
-    """
     want = str(os.environ.get("MIMICIV_DEVICE", "auto")).lower().strip()
-
     if want == "cpu":
         return "cpu"
 
@@ -171,7 +152,7 @@ def amp_autocast_dtype(precision_amp: str) -> Optional[torch.dtype]:
         return torch.float16
     if p == "bf16":
         return torch.bfloat16
-    return torch.float16  # auto: prefer fp16 on CUDA; (CPU autocast off)
+    return torch.float16 
 
 
 def autocast_context():
@@ -232,20 +213,12 @@ def _coerce_types(d: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-# -----------------------------
-# Config loader (sets DEVICE once)
-# -----------------------------
 def load_cfg(yaml_path: Optional[str] = None,
              overrides: Optional[Dict[str, Any]] = None) -> Config:
-    """
-    Load defaults, YAML (optional), overrides/env, then finalize globals.
-    Critically: this sets DEVICE exactly once for the whole run.
-    """
     global CFG, DEVICE, TASK2IDX, SELECTED_TASK_IDX
 
     cfg_dict: Dict[str, Any] = asdict(Config())
 
-    # YAML file
     if yaml_path and os.path.isfile(yaml_path):
         if yaml is None:
             raise RuntimeError("YAML path provided but PyYAML is not installed.")
@@ -255,11 +228,9 @@ def load_cfg(yaml_path: Optional[str] = None,
             raise ValueError(f"Config YAML at {yaml_path} must be a mapping.")
         cfg_dict = _merge(cfg_dict, _coerce_types(y))
 
-    # Programmatic overrides
     if overrides:
         cfg_dict = _merge(cfg_dict, _coerce_types(overrides))
 
-    # JSON override via env
     if "MIMICIV_CFG_JSON" in os.environ:
         try:
             blob = json.loads(os.environ["MIMICIV_CFG_JSON"])
@@ -273,32 +244,67 @@ def load_cfg(yaml_path: Optional[str] = None,
         "MIMICIV_DATA_ROOT": ("data_root", str),
         "MIMICIV_CKPT_ROOT": ("ckpt_root", str),
         "MIMICIV_TASK": ("task_name", str),
-        "MIMICIV_FINETUNE_TEXT": ("finetune_text", lambda s: str(s).lower() in {"1","true","yes"}),
+
+        "MIMICIV_FINETUNE_TEXT": (
+            "finetune_text",
+            lambda s: str(s).lower() in {"1", "true", "yes"},
+        ),
         "MIMICIV_TEXT_MODEL": ("text_model_name", str),
         "MIMICIV_MAX_TEXT_LEN": ("max_text_len", int),
+
         "MIMICIV_STRUCT_SEQ_LEN": ("structured_seq_len", int),
         "MIMICIV_STRUCT_N_FEATS": ("structured_n_feats", int),
+
         "MIMICIV_FEATURE_MODE": ("feature_mode", str),
         "MIMICIV_ROUTING_BACKEND": ("routing_backend", str),
+
         "MIMICIV_CAP_PC_DIM": ("capsule_pc_dim", int),
         "MIMICIV_CAP_MC_DIM": ("capsule_mc_caps_dim", int),
         "MIMICIV_CAP_ITERS": ("capsule_num_routing", int),
         "MIMICIV_CAP_ACT": ("capsule_act_type", str),
-        "MIMICIV_CAP_LN": ("capsule_layer_norm", lambda s: str(s).lower() in {"1", "true", "yes"}),
+        "MIMICIV_CAP_LN": (
+            "capsule_layer_norm",
+            lambda s: str(s).lower() in {"1", "true", "yes"},
+        ),
         "MIMICIV_CAP_DPOSE2VOTE": ("capsule_dim_pose_to_vote", int),
-        "MIMICIV_CAP_OUT": ("capsule_out_caps", int),
+
         "MIMICIV_LOSS": ("loss_type", str),
         "MIMICIV_LR": ("lr", float),
         "MIMICIV_BS": ("batch_size", int),
         "MIMICIV_DROPOUT": ("dropout", float),
         "MIMICIV_NUM_WORKERS": ("num_workers", int),
         "MIMICIV_PRECISION": ("precision_amp", str),
-        "MIMICIV_DETERMINISTIC": ("deterministic", lambda s: str(s).lower() in {"1", "true", "yes"}),
+        "MIMICIV_DETERMINISTIC": (
+            "deterministic",
+            lambda s: str(s).lower() in {"1", "true", "yes"},
+        ),
         "MIMICIV_SEED": ("seed", int),
-        "MIMICIV_VERBOSE": ("verbose", lambda s: str(s).lower() in {"1", "true", "yes"}),
+        "MIMICIV_VERBOSE": (
+            "verbose",
+            lambda s: str(s).lower() in {"1", "true", "yes"},
+        ),
         "MIMICIV_DEBUG_SAMPLES": ("debug_samples", int),
         "MIMICIV_ROUTING_PRINT_EVERY": ("routing_print_every", int),
+
+        "MIMICIV_ROUTE_ENTROPY_LAMBDA": ("route_entropy_lambda", float),
+        "MIMICIV_ROUTE_ENTROPY_WARM": ("route_entropy_warmup_epochs", int),
+
+        "MIMICIV_ROUTE_UNIFORM_LAMBDA": ("route_uniform_lambda", float),
+        "MIMICIV_ROUTE_UNIFORM_WARM": ("route_uniform_warmup_epochs", int),
+
+        "MIMICIV_ROUTE_DROPOUT_P": ("route_dropout_p", float),
+        "MIMICIV_ROUTING_WARMUP_EPOCHS": ("routing_warmup_epochs", int),
+
+        "MIMICIV_ROUTE_PRIOR_FLOOR": ("route_prior_floor", float),
+        "MIMICIV_ROUTE_PRIOR_CEILING": ("route_prior_ceiling", float),
+
+        "MIMICIV_LABEL_SMOOTHING": ("label_smoothing", float),
+        "MIMICIV_ENTROPY_USE_RC": (
+            "entropy_use_rc",
+            lambda s: str(s).lower() in {"1", "true", "yes"},
+        ),
     }
+
     for env_key, (cfg_key, caster) in env_map.items():
         if env_key in os.environ:
             try:
@@ -306,20 +312,15 @@ def load_cfg(yaml_path: Optional[str] = None,
             except Exception:
                 cfg_dict[cfg_key] = os.environ[env_key]
 
-    # Instantiate config
     CFG = Config(**cfg_dict)
 
-    # Seed & determinism
     set_global_seed(int(CFG.seed))
     set_deterministic(bool(CFG.deterministic))
 
-    # Decide device ONCE
     DEVICE = _pick_device()
 
-    # cuDNN tuning
     torch.backends.cudnn.benchmark = bool(CFG.use_cudnn_benchmark and not CFG.deterministic)
 
-    # Task indices
     TASK2IDX = {name: i for i, name in enumerate(TASKS)}
     SELECTED_TASK_IDX = TASK2IDX.get(CFG.task_name, 0)
 
@@ -336,8 +337,34 @@ def load_cfg(yaml_path: Optional[str] = None,
 
     return CFG
 
+def apply_cli_overrides(args) -> None:
+    global CFG
 
-# Initialize on import (one-time choice)
+    if hasattr(args, "data_root") and args.data_root is not None:
+        CFG.data_root = args.data_root
+    if hasattr(args, "ckpt_root") and args.ckpt_root is not None:
+        CFG.ckpt_root = args.ckpt_root
+
+    if hasattr(args, "lr") and args.lr is not None:
+        CFG.lr = float(args.lr)
+    if hasattr(args, "batch_size") and args.batch_size is not None:
+        CFG.batch_size = int(args.batch_size)
+    if hasattr(args, "epochs") and args.epochs is not None:
+        CFG.max_epochs_tri = int(args.epochs)  
+
+    if hasattr(args, "route_dropout_p") and args.route_dropout_p is not None:
+        CFG.route_dropout_p = float(args.route_dropout_p)
+    if hasattr(args, "route_entropy_lambda") and args.route_entropy_lambda is not None:
+        CFG.route_entropy_lambda = float(args.route_entropy_lambda)
+    if hasattr(args, "route_entropy_warmup_epochs") and args.route_entropy_warmup_epochs is not None:
+        CFG.route_entropy_warmup_epochs = int(args.route_entropy_warmup_epochs)
+
+    if hasattr(args, "finetune_text") and args.finetune_text:
+        CFG.finetune_text = True
+
+    ensure_dir(CFG.ckpt_root)
+    ensure_dir(CFG.data_root)
+
 load_cfg(yaml_path=None, overrides=None)
 
 def get_device() -> torch.device:
