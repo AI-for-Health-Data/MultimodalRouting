@@ -341,8 +341,6 @@ def prepare_notes_batch(notes_batch: List[Dict[str, Any]]):
 
     return out
 
-
-
 def pretok_batch_notes(batch_notes: List[List[str]]):
     global TOKENIZER, MAXLEN
     if TOKENIZER is None:
@@ -598,12 +596,9 @@ class ICUStayDataset(Dataset):
         self.split = split
         self.img_tfms = build_image_transform(split)
 
-        # ----------------------------
-        # Decide FULL vs PARTIAL
-        # ----------------------------
         # If user didn't specify, auto-detect by presence of partial files
         if use_partial is None:
-            use_partial = os.path.exists(os.path.join(root, "structured_partial_17.parquet"))
+            use_partial = os.path.exists(os.path.join(root, "structured_partial_medfuse.parquet"))
 
         # splits file
         splits_path = _pick_existing(root, [
@@ -614,9 +609,9 @@ class ICUStayDataset(Dataset):
 
         # parquet files
         structured_path = _pick_existing(root, [
-            "structured_partial_17.parquet" if use_partial else "structured_partial_17.parquet",
-            "structured_partial_17.parquet",
-            "structured_partial_17.parquet",
+            "structured_partial_medfuse.parquet" if use_partial else "structured_partial_medfuse.parquet",
+            "structured_partial_medfuse.parquet",
+            "structured_partial_medfuse.parquet",
         ])
 
         notes_path = _pick_existing(root, [
@@ -653,9 +648,6 @@ class ICUStayDataset(Dataset):
         print(f"[dataset:{split}] images   = {os.path.basename(images_path)}")
         print(f"[dataset:{split}] labels   = {os.path.basename(labels_path)}")
 
-        # ----------------------------
-        # Read splits (robust to bad ids like "nan_...")
-        # ----------------------------
         with open(splits_path) as f:
             splits = json.load(f)
         if split not in splits:
@@ -678,19 +670,11 @@ class ICUStayDataset(Dataset):
 
         ids_set = set(split_ids)
 
-
-        # ----------------------------
-        # Load tables
-        # ----------------------------
         self.struct = pd.read_parquet(structured_path)
         self.notes  = pd.read_parquet(notes_path)
         self.images = pd.read_parquet(images_path)
         self.labels = pd.read_parquet(labels_path)
 
-        # ----------------------------
-        # Standardize ID column name to `stay_id` everywhere
-        # (partial data often uses sample_id)
-        # ----------------------------
         self.struct = _standardize_id_column(self.struct, want="stay_id")
         self.notes  = _standardize_id_column(self.notes,  want="stay_id")
         self.images = _standardize_id_column(self.images, want="stay_id")
@@ -699,7 +683,6 @@ class ICUStayDataset(Dataset):
         # normalize image path column to cxr_path
         self.images = _standardize_image_path_column(self.images)
 
-        # ---- everything below here can remain exactly as you already have it ----
         # structured feature columns
         base_cols = {"stay_id", "hour"}
         self.feat_cols: List[str] = [c for c in self.struct.columns if c not in base_cols]
@@ -805,7 +788,6 @@ class ICUStayDataset(Dataset):
                         attn_chunks.append(msk)
                 notes_payload = {"mode": "pretokenized", "input_ids": ids_chunks, "attention_mask": attn_chunks}
 
-
         # images: use last path
         df_i = self.images[self.images.stay_id == stay_id]
         img_paths = []
@@ -813,7 +795,6 @@ class ICUStayDataset(Dataset):
             img_paths = df_i.cxr_path.dropna().astype(str).tolist()
             img_paths = [p for p in img_paths if str(p).strip()]
         img_paths = img_paths[-1:]  # last only (or empty)
-
 
         # multi-label phenotype target [K]
         lab_row = self.labels[self.labels.stay_id == stay_id]
@@ -930,7 +911,6 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
                 f"L={has_L.mean().item():.3f}, N={has_N.mean().item():.3f}, I={has_I.mean().item():.3f}"
             )
 
-        # ✅ IMPORTANT: return availability so training/eval can build route_mask
         return xL_batch, mL_batch, notes_batch, imgs_batch, y_batch, dbg, has_L, has_N, has_I
 
     return _collate
@@ -939,11 +919,6 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
 
 @torch.no_grad()
 def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
-    """
-    notes is expected to be the collated notes_batch:
-      - List[{"mode":"text","chunks":[...]}]  OR
-      - List[{"mode":"pretokenized","input_ids":[[...],...],"attention_mask":[[...],...]}]
-    """
     B, T, F = xL.shape
     k = min(k, B)
 
@@ -952,7 +927,6 @@ def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
         sid = dbg.get("stay_ids", ["<id?>"] * B)[i]
         imgp = dbg.get("img_paths", ["<path?>"] * B)[i]
 
-        # show a couple non-zero EHR rows (first 5 feats)
         nz_rows = (mL[i] > 0.5).nonzero(as_tuple=False).flatten().tolist()
         show_rows = nz_rows[:2] if nz_rows else []
         ehr_rows = []
@@ -960,7 +934,6 @@ def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
             vec = xL[i, r].detach().cpu().numpy()
             ehr_rows.append(np.round(vec[:min(5, F)], 3).tolist())
 
-        # notes summary (robust to new schema)
         note_obj = notes[i]
 
         note_preview = "<no-notes>"
