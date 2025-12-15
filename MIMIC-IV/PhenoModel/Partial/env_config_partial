@@ -75,7 +75,7 @@ class Config:
     max_text_len: int = 512
 
     # Structured
-    structured_seq_len: int = 24
+    structured_seq_len: int = 48
     structured_n_feats: int = 17
     structured_layers: int = 2
     structured_heads: int = 8
