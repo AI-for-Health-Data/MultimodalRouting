@@ -603,7 +603,7 @@ class ICUStayDataset(Dataset):
         # ----------------------------
         # If user didn't specify, auto-detect by presence of partial files
         if use_partial is None:
-            use_partial = os.path.exists(os.path.join(root, "structured_partial.parquet"))
+            use_partial = os.path.exists(os.path.join(root, "structured_partial_17.parquet"))
 
         # splits file
         splits_path = _pick_existing(root, [
@@ -614,9 +614,9 @@ class ICUStayDataset(Dataset):
 
         # parquet files
         structured_path = _pick_existing(root, [
-            "structured_partial.parquet" if use_partial else "structured.parquet",
-            "structured_partial.parquet",
-            "structured.parquet",
+            "structured_partial_17.parquet" if use_partial else "structured_partial_17.parquet",
+            "structured_partial_17.parquet",
+            "structured_partial_17.parquet",
         ])
 
         notes_path = _pick_existing(root, [
@@ -1589,7 +1589,7 @@ def main():
     # Encoders
     enc_cfg = EncoderConfig(
         d=_cfg("d", 256), dropout=_cfg("dropout", 0.0),
-        structured_seq_len=_cfg("structured_seq_len", 24),
+        structured_seq_len=_cfg("structured_seq_len", 48),
         structured_n_feats=_cfg("structured_n_feats", 17),
         structured_layers=_cfg("structured_layers", 2),
         structured_heads=_cfg("structured_heads", 8),
