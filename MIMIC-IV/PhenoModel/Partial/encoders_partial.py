@@ -69,7 +69,7 @@ class BEHRTLabEncoder(nn.Module):
         self,
         n_feats: int,
         d: int,
-        seq_len: int = 24,
+        seq_len: int = 48,
         n_layers: int = 2,
         n_heads: int = 8,
         dropout: float = 0.0,
@@ -808,7 +808,7 @@ class EncoderConfig:
     dropout: float = 0.0
 
     # structured
-    structured_seq_len: int = 24
+    structured_seq_len: int = 48
     structured_n_feats: int = 17
     structured_layers: int = 2
     structured_heads: int = 8
