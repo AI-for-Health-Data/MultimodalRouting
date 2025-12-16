@@ -28,14 +28,14 @@ import matplotlib.pyplot as plt
 
 from transformers import AutoTokenizer
 
-from env_config import CFG, DEVICE, load_cfg, ensure_dir
-from env_config import get_pheno_name, apply_cli_overrides
+import env_config_partial as E
+from env_config_partial import load_cfg, ensure_dir, get_pheno_name, apply_cli_overrides
 
-from encoders import (
+from encoders_partial import (
     BEHRTLabEncoder, BioClinBERTEncoder, ImageEncoder,
     EncoderConfig, build_encoders,
 )
-from routing_and_heads import (
+from routing_and_heads_partial import (
     build_fusions,
     RoutePrimaryProjector,
     CapsuleMortalityHead,
@@ -213,7 +213,7 @@ def save_routing_heatmap(
         print(f"[routing] saved phenotype routing heatmap → {fname}")
 
 def _cfg(name: str, default):
-    return getattr(CFG, name, default)
+    return getattr(E.CFG, name, default)
 
 
 TASK_MAP = {"pheno": 0}
@@ -321,8 +321,8 @@ def prepare_notes_batch(notes_batch: List[Dict[str, Any]]):
         paired = [(a, b) for a, b in zip(ids_chunks, attn_chunks) if len(a) > 0 and len(b) > 0]
         if len(paired) == 0:
             out.append({
-                "input_ids": torch.zeros(0, L, dtype=torch.long, device=DEVICE),
-                "attention_mask": torch.zeros(0, L, dtype=torch.long, device=DEVICE),
+                "input_ids": torch.zeros(0, L, dtype=torch.long, device=E.DEVICE),
+                "attention_mask": torch.zeros(0, L, dtype=torch.long, device=E.DEVICE),
             })
             continue
 
@@ -330,11 +330,11 @@ def prepare_notes_batch(notes_batch: List[Dict[str, Any]]):
 
         ids_mat = torch.tensor(
             [_pad_to_len(x, pad_id, L) for x in ids_chunks],
-            dtype=torch.long, device=DEVICE
+            dtype=torch.long, device=E.DEVICE
         )
         attn_mat = torch.tensor(
             [_pad_to_len(x, 0, L) for x in attn_chunks],
-            dtype=torch.long, device=DEVICE
+            dtype=torch.long, device=E.DEVICE
         )
 
         out.append({"input_ids": ids_mat, "attention_mask": attn_mat})
@@ -359,8 +359,8 @@ def pretok_batch_notes(batch_notes: List[List[str]]):
     for texts in cleaned:
         if not texts:
             out.append({
-                "input_ids": torch.zeros(0, MAXLEN, dtype=torch.long, device=DEVICE),
-                "attention_mask": torch.zeros(0, MAXLEN, dtype=torch.long, device=DEVICE),
+                "input_ids": torch.zeros(0, MAXLEN, dtype=torch.long, device=E.DEVICE),
+                "attention_mask": torch.zeros(0, MAXLEN, dtype=torch.long, device=E.DEVICE),
             })
             continue
 
@@ -382,8 +382,8 @@ def pretok_batch_notes(batch_notes: List[List[str]]):
         def _pad(x, L=MAXLEN, v=pad_id):
             return x + [v] * (L - len(x))
 
-        ids_mat  = torch.tensor([_pad(ch) for ch in all_ids],  dtype=torch.long, device=DEVICE)
-        attn_mat = torch.tensor([_pad(ch, MAXLEN, 0) for ch in all_attn], dtype=torch.long, device=DEVICE)
+        ids_mat  = torch.tensor([_pad(ch) for ch in all_ids],  dtype=torch.long, device=E.DEVICE)
+        attn_mat = torch.tensor([_pad(ch, MAXLEN, 0) for ch in all_attn], dtype=torch.long, device=E.DEVICE)
 
         out.append({"input_ids": ids_mat, "attention_mask": attn_mat})
     return out
@@ -415,8 +415,7 @@ def parse_args():
     )
     ap.add_argument("--task", type=str, default=_cfg("task_name", "pheno"),
                     choices=list(TASK_MAP.keys()))
-    ap.add_argument("--require_all_modalities", action="store_true", default=True,
-                    help="Only keep stays that have structured + notes + image.")
+    ap.add_argument("--require_all_modalities", action="store_true", default=False)
     ap.add_argument("--data_root", type=str, default=_cfg("data_root", "./data"))
     ap.add_argument("--ckpt_root", type=str, default=_cfg("ckpt_root", "./ckpts"))
     ap.add_argument("--epochs", type=int, default=100)
@@ -431,68 +430,87 @@ def parse_args():
                     help="Print training stats every N steps.")
     ap.add_argument("--precision", type=str, default="auto",
                     choices=["auto", "fp16", "bf16", "off"])
-    ap.add_argument("--peek_first_batch", action="store_true", default=True)
+    ap.add_argument("--peek_first_batch", action="store_true", default=False)
     ap.add_argument("--verbose_sanity", action="store_true", default=False)
     ap.add_argument("--route_debug", action="store_true")
     ap.add_argument("--calib_bins", type=int, default=10)
     return ap.parse_args()
 
 def _standardize_image_path_column(df: pd.DataFrame) -> pd.DataFrame:
-    # Accept common variants and normalize to "cxr_path"
-    candidates = [
-        "cxr_path", "CXR_PATH",
-        "image_path", "img_path", "path",
-        "dicom_path", "png_path", "jpg_path",
-    ]
-    found = None
+    needed = {"dicom_id", "subject_id", "study_id"}
+    if needed.issubset(set(df.columns)):
+        if "cxr_path" not in df.columns:
+            df = df.copy()
+            df["cxr_path"] = ""
+        return df
+
+    candidates = ["cxr_path","CXR_PATH","image_path","img_path","path","dicom_path","png_path","jpg_path"]
     for c in candidates:
         if c in df.columns:
-            found = c
-            break
-    if found is None:
-        raise ValueError(
-            f"[ICUStayDataset] images.parquet missing an image path column. "
-            f"Tried: {candidates}. Found columns: {list(df.columns)[:50]}"
-        )
-    if found != "cxr_path":
-        df = df.rename(columns={found: "cxr_path"})
-    return df
+            if c != "cxr_path":
+                df = df.rename(columns={c: "cxr_path"})
+            return df
+
+    raise ValueError(
+        f"[ICUStayDataset] images parquet missing a path column AND missing dicom triple. "
+        f"Tried: {candidates}. Found columns: {list(df.columns)[:50]}"
+    )
 
 
 def _detect_notes_schema(notes_df: pd.DataFrame):
-    chunk_cols = sorted([c for c in notes_df.columns if str(c).startswith("chunk_")])
+    cols = list(notes_df.columns)
 
-    input_id_cols = sorted([c for c in notes_df.columns if str(c).startswith("input_ids_")])
-    attn_cols = sorted([c for c in notes_df.columns if str(c).startswith("attention_mask_")])
+    # 1) Your original "chunk_*" raw text columns
+    chunk_cols = sorted([c for c in cols if str(c).startswith("chunk_")])
+    if len(chunk_cols) > 0:
+        return ("text_cols", chunk_cols, None)
+
+    # 2) Your original "input_ids_*" + mask_* columns
+    input_id_cols = sorted([c for c in cols if str(c).startswith("input_ids_")])
+    attn_cols = sorted([c for c in cols if str(c).startswith("attention_mask_")])
     if len(attn_cols) == 0:
-        attn_cols = sorted([c for c in notes_df.columns if str(c).startswith("attn_mask_")])
+        attn_cols = sorted([c for c in cols if str(c).startswith("attn_mask_")])
 
     if len(input_id_cols) > 0 and len(attn_cols) > 0:
-        # match by suffix (e.g., _000)
-        def suf(x): return str(x).split("input_ids_")[-1] if "input_ids_" in str(x) else str(x).split("mask_")[-1]
         id_sufs = {c.split("input_ids_")[-1] for c in input_id_cols}
-        mk_sufs = {c.split("_")[-1] for c in attn_cols}  # works for attention_mask_XXX or attn_mask_XXX
+        mk_sufs = {c.split("_")[-1] for c in attn_cols}
         common = sorted(list(id_sufs & mk_sufs))
         if len(common) == 0:
-            raise ValueError("[ICUStayDataset] Found input_ids_* and *_mask_* but no matching suffixes.")
-        # rebuild aligned lists in common order
-        aligned_ids = [f"input_ids_{s}" for s in common if f"input_ids_{s}" in notes_df.columns]
-        # prefer attention_mask_*
+            raise ValueError("[notes] Found input_ids_* and *_mask_* but no matching suffixes.")
+        aligned_ids = [f"input_ids_{s}" for s in common if f"input_ids_{s}" in cols]
         aligned_attn = []
         for s in common:
-            if f"attention_mask_{s}" in notes_df.columns:
+            if f"attention_mask_{s}" in cols:
                 aligned_attn.append(f"attention_mask_{s}")
-            elif f"attn_mask_{s}" in notes_df.columns:
+            elif f"attn_mask_{s}" in cols:
                 aligned_attn.append(f"attn_mask_{s}")
-        return ("pretokenized", aligned_ids, aligned_attn)
+        return ("pretokenized_cols", aligned_ids, aligned_attn)
 
-    if len(chunk_cols) > 0:
-        return ("text", chunk_cols, None)
+    # 3) NEW: non-suffixed pretokenized columns
+    if ("input_ids" in cols) and (("attention_mask" in cols) or ("attn_mask" in cols)):
+        attn = "attention_mask" if "attention_mask" in cols else "attn_mask"
+        return ("pretokenized_single", ["input_ids"], [attn])
+
+    # 4) NEW: single-column raw text
+    for c in ["text", "note_text", "note", "clean_text"]:
+        if c in cols:
+            return ("text_single", [c], None)
+
+    # 5) NEW: single-column list-of-strings chunks
+    for c in ["chunks", "note_chunks", "chunk_texts"]:
+        if c in cols:
+            return ("text_list", [c], None)
 
     raise ValueError(
-        "[ICUStayDataset] notes.parquet must contain either chunk_* text columns "
-        "OR (input_ids_* + attention_mask_* / attn_mask_*) columns."
+        "[ICUStayDataset] notes parquet must contain either:\n"
+        "  - chunk_* columns, OR\n"
+        "  - input_ids_* + attention_mask_* / attn_mask_* columns, OR\n"
+        "  - input_ids + attention_mask (non-suffixed), OR\n"
+        "  - a single text column (text/note_text/note/clean_text), OR\n"
+        "  - a single list-of-texts column (chunks/note_chunks/chunk_texts).\n"
+        f"Found columns: {cols[:80]}"
     )
+
 
 
 def _cell_to_list(x):
@@ -560,31 +578,13 @@ def _pick_existing(root: str, candidates: List[str]) -> str:
             return p
     raise FileNotFoundError(f"None of these files exist under {root}: {candidates}")
 
-def _standardize_id_column(df: pd.DataFrame, *, want: str = "stay_id") -> pd.DataFrame:
-    """
-    Unify ID column naming to `stay_id`.
-    Common in partial preprocessing: `sample_id`.
-    """
+def _standardize_key_column(df: pd.DataFrame, want: str = "sample_id") -> pd.DataFrame:
     if want in df.columns:
-        df[want] = df[want].astype(int)
+        df[want] = df[want].astype(str)
         return df
-
-    # common alternatives
-    candidates = ["sample_id", "icustay_id", "hadm_id"]
-    found = None
-    for c in candidates:
-        if c in df.columns:
-            found = c
-            break
-    if found is None:
-        raise ValueError(
-            f"[dataset] No id column found. Expected '{want}' or one of {candidates}. "
-            f"Found columns: {list(df.columns)[:50]}"
-        )
-
-    df = df.rename(columns={found: want})
-    df[want] = df[want].astype(int)
+    # DON'T rename stay_id -> sample_id (breaks joins)
     return df
+
 
 class ICUStayDataset(Dataset):
     def __init__(self, root: str, split: str = "train", use_partial: Optional[bool] = None):
@@ -609,10 +609,13 @@ class ICUStayDataset(Dataset):
 
         # parquet files
         structured_path = _pick_existing(root, [
-            "structured_partial_medfuse.parquet" if use_partial else "structured_partial_medfuse.parquet",
+            "structured_partial_medfuse.parquet" if use_partial else "structured_medfuse.parquet",
             "structured_partial_medfuse.parquet",
-            "structured_partial_medfuse.parquet",
+            "structured_medfuse.parquet",
+            "structured_partial.parquet",
+            "structured.parquet",
         ])
+
 
         notes_path = _pick_existing(root, [
             "notes_partial.parquet" if use_partial else "notes.parquet",
@@ -655,41 +658,63 @@ class ICUStayDataset(Dataset):
                 f"[ICUStayDataset] split '{split}' not in {os.path.basename(splits_path)} keys: {list(splits.keys())}"
             )
 
-        split_ids = []
-        bad_split_ids = []
-        for x in splits[split]:
-            try:
-                # handles int, "123", 123.0, "123.0"
-                xi = int(float(x))
-                split_ids.append(xi)
-            except Exception:
-                bad_split_ids.append(str(x))
-
-        if bad_split_ids:
-            print(f"[dataset:{split}] WARNING: dropped {len(bad_split_ids)} non-numeric split ids (e.g. {bad_split_ids[:3]})")
-
+        # splits are sample_id strings like "subject_hadm_stay"
+        split_ids = [str(x) for x in splits[split]]
         ids_set = set(split_ids)
+
 
         self.struct = pd.read_parquet(structured_path)
         self.notes  = pd.read_parquet(notes_path)
         self.images = pd.read_parquet(images_path)
         self.labels = pd.read_parquet(labels_path)
 
-        self.struct = _standardize_id_column(self.struct, want="stay_id")
-        self.notes  = _standardize_id_column(self.notes,  want="stay_id")
-        self.images = _standardize_id_column(self.images, want="stay_id")
-        self.labels = _standardize_id_column(self.labels, want="stay_id")
+        # --- ensure structured has sample_id as string (this is your master key) ---
+        if "sample_id" not in self.struct.columns:
+            raise ValueError("[structured] missing sample_id")
+        self.struct["sample_id"] = self.struct["sample_id"].astype(str)
+
+        # --- build stay_id -> sample_id mapping from structured ---
+        if "stay_id" in self.struct.columns:
+            stay_to_sample = (
+                self.struct[["stay_id", "sample_id"]]
+                .dropna()
+                .drop_duplicates()
+                .copy()
+            )
+            stay_to_sample["stay_id"] = stay_to_sample["stay_id"].astype(str)
+            stay_to_sample["sample_id"] = stay_to_sample["sample_id"].astype(str)
+        else:
+            stay_to_sample = None
+
+        def _attach_sample_id(df: pd.DataFrame, name: str) -> pd.DataFrame:
+            df = df.copy()
+            if "sample_id" in df.columns:
+                df["sample_id"] = df["sample_id"].astype(str)
+                return df
+            if stay_to_sample is not None and ("stay_id" in df.columns):
+                df["stay_id"] = df["stay_id"].astype(str)
+                df = df.merge(stay_to_sample, on="stay_id", how="left")
+                if "sample_id" not in df.columns:
+                    raise ValueError(f"[{name}] failed to attach sample_id via stay_id merge")
+                return df
+            raise ValueError(f"[{name}] missing sample_id and cannot map from stay_id")
+
+        # attach/standardize keys
+        self.notes  = _attach_sample_id(self.notes,  "notes")
+        self.images = _attach_sample_id(self.images, "images")
+        self.labels = _attach_sample_id(self.labels, "labels")
+
 
         # normalize image path column to cxr_path
         self.images = _standardize_image_path_column(self.images)
 
         # structured feature columns
-        base_cols = {"stay_id", "hour"}
-        self.feat_cols: List[str] = [c for c in self.struct.columns if c not in base_cols]
+        base_cols = {"sample_id", "stay_id", "bin_id"}
+        self.feat_cols = [c for c in self.struct.columns if c not in base_cols]
         self.feat_cols.sort()
-        if hasattr(CFG, "structured_n_feats"):
-            assert len(self.feat_cols) == CFG.structured_n_feats, \
-                f"CFG.structured_n_feats={CFG.structured_n_feats}, " \
+        if hasattr(E.CFG, "structured_n_feats"):
+            assert len(self.feat_cols) == E.CFG.structured_n_feats, \
+                f"E.CFG.structured_n_feats={E.CFG.structured_n_feats}, " \
                 f"found {len(self.feat_cols)} in {structured_path}"
 
         # notes schema
@@ -703,113 +728,148 @@ class ICUStayDataset(Dataset):
             print(f"[dataset:{split}] notes_mode=pretokenized (chunks={len(self.input_id_cols)})")
 
         # phenotype label columns
-        self.label_cols: List[str] = [c for c in self.labels.columns if c != "stay_id"]
+        self.label_cols = [c for c in self.labels.columns if c != "sample_id"]
         self.label_cols.sort()
         if len(self.label_cols) == 0:
             raise ValueError("[ICUStayDataset] labels parquet must contain at least one phenotype column.")
         self.num_labels = len(self.label_cols)
         print(f"[dataset:{split}] found {len(self.label_cols)} phenotype labels: {self.label_cols[:5]}{' ...' if len(self.label_cols) > 5 else ''}")
 
-        # tri-modal filtering (same as your existing logic)
-        struct_ids = set(self.struct["stay_id"].astype(int).unique().tolist())
-        label_ids  = set(self.labels["stay_id"].astype(int).unique().tolist())
+        # tri-modal filtering by sample_id
+        base = ids_set
 
+        # L present if any structured rows exist for that sample_id
+        struct_ids = set(self.struct["sample_id"].astype(str).unique().tolist())
+
+        # labels present if row exists in labels for that sample_id
+        label_ids  = set(self.labels["sample_id"].astype(str).unique().tolist())
+
+        # N present if notes are non-empty for that sample_id
         if self.notes_mode == "text":
             nonempty = np.zeros(len(self.notes), dtype=bool)
             for c in self.chunk_cols:
-                if c in self.notes.columns:
-                    nonempty |= self.notes[c].fillna("").astype(str).str.strip().ne("")
-            note_ids = set(self.notes.loc[nonempty, "stay_id"].astype(int).unique().tolist())
+                nonempty |= self.notes[c].fillna("").astype(str).str.strip().ne("")
+            note_ids = set(self.notes.loc[nonempty, "sample_id"].astype(str).unique().tolist())
         else:
             nonempty = np.zeros(len(self.notes), dtype=bool)
             for c_id, c_m in zip(self.input_id_cols, self.attn_mask_cols):
                 ids_len = self.notes[c_id].apply(lambda x: len(_cell_to_list(x)))
                 msk_len = self.notes[c_m].apply(lambda x: len(_cell_to_list(x)))
                 nonempty |= (ids_len > 0) & (msk_len > 0)
-            note_ids = set(self.notes.loc[nonempty, "stay_id"].astype(int).unique().tolist())
+            note_ids = set(self.notes.loc[nonempty, "sample_id"].astype(str).unique().tolist())
 
-        img_ids = set(
-            self.images.loc[
-                self.images["cxr_path"].fillna("").astype(str).str.strip().ne(""),
-                "stay_id"
-            ].astype(int).unique().tolist()
-        )
+        # I present if cxr exists OR dicom triple exists
+        img_ids = set()
+        if "cxr_path" in self.images.columns:
+            ok = self.images["cxr_path"].fillna("").astype(str).str.strip().ne("")
+            img_ids |= set(self.images.loc[ok, "sample_id"].astype(str).unique().tolist())
 
-        base = ids_set & label_ids
+        # if your images parquet instead stores dicom identifiers
+        needed = {"dicom_id", "subject_id", "study_id"}
+        if needed.issubset(set(self.images.columns)):
+            ok2 = self.images[list(needed)].notna().all(axis=1)
+            img_ids |= set(self.images.loc[ok2, "sample_id"].astype(str).unique().tolist())
+
+        base = base & label_ids
 
         has_L = base & struct_ids
         has_N = base & note_ids
         has_I = base & img_ids
 
-        # counts per id (set-based)
         keep_2of3 = (has_L & has_N) | (has_L & has_I) | (has_N & has_I)
-
         self.ids = sorted(list(keep_2of3))
         print(f"[dataset:{split}] >=2 modalities -> kept {len(self.ids)} / {len(ids_set)}")
+
 
     def __len__(self) -> int:
         return len(self.ids)
 
     def __getitem__(self, idx: int):
-        stay_id = self.ids[idx]
+        sample_id = self.ids[idx]
 
-        # structured EHR
-        df_s = self.struct[self.struct.stay_id == stay_id].sort_values("hour")
+        # structured
+        df_s = self.struct[self.struct.sample_id == sample_id].sort_values("bin_id")
         xs_np = (
             df_s[self.feat_cols]
             .astype("float32")
             .fillna(0.0)
             .to_numpy()
         )
-        xs = torch.from_numpy(xs_np)  # [<=T,F]
+        xs = torch.from_numpy(xs_np)
 
-        # notes: use the first row for this stay_id (you can change policy later if needed)
-        df_n = self.notes[self.notes.stay_id == stay_id]
-        notes_payload = None
-
+        # notes
+        df_n = self.notes[self.notes.sample_id == sample_id]
         if df_n.empty:
-            notes_payload = {"mode": "text", "chunks": []}  # missing notes
+            notes_payload = {"mode": "text", "chunks": []}
         else:
             row = df_n.iloc[0]
-            if self.notes_mode == "text":
+
+            if self.notes_mode in ("text_cols",):
                 notes_list = []
-                for c in self.chunk_cols:
+                for c in self.note_a_cols:
                     val = row.get(c, "")
                     if pd.notna(val) and str(val).strip():
                         notes_list.append(str(val))
                 notes_payload = {"mode": "text", "chunks": notes_list}
-            else:
+
+            elif self.notes_mode in ("text_single",):
+                txt = row.get(self.note_a_cols[0], "")
+                notes_payload = {"mode": "text", "chunks": [str(txt)] if pd.notna(txt) and str(txt).strip() else []}
+
+            elif self.notes_mode in ("text_list",):
+                # cell is list[str] (or stringified list) -> normalize
+                cell = row.get(self.note_a_cols[0], None)
+                chunks = _cell_to_list(cell)
+                chunks = [str(t) for t in chunks if t and str(t).strip()]
+                notes_payload = {"mode": "text", "chunks": chunks}
+
+            elif self.notes_mode in ("pretokenized_cols", "pretokenized_single"):
                 ids_chunks, attn_chunks = [], []
-                for c_id, c_m in zip(self.input_id_cols, self.attn_mask_cols):
+                for c_id, c_m in zip(self.note_a_cols, self.note_b_cols):
                     ids = _cell_to_list(row.get(c_id, None))
                     msk = _cell_to_list(row.get(c_m, None))
                     if len(ids) > 0 and len(msk) > 0:
                         ids_chunks.append(ids)
                         attn_chunks.append(msk)
                 notes_payload = {"mode": "pretokenized", "input_ids": ids_chunks, "attention_mask": attn_chunks}
+            else:
+                notes_payload = {"mode": "text", "chunks": []}
 
-        # images: use last path
-        df_i = self.images[self.images.stay_id == stay_id]
-        img_paths = []
+        # image pointer: prefer cxr_path if present
+        cxr_path = ""
+        df_i = self.images[self.images.sample_id == sample_id]
         if not df_i.empty:
-            img_paths = df_i.cxr_path.dropna().astype(str).tolist()
-            img_paths = [p for p in img_paths if str(p).strip()]
-        img_paths = img_paths[-1:]  # last only (or empty)
+            if "cxr_path" in df_i.columns:
+                p = df_i["cxr_path"].fillna("").astype(str).str.strip()
+                # pick last non-empty
+                p = p[p.ne("")]
+                if len(p) > 0:
+                    cxr_path = p.iloc[-1]
+            # else fallback to dicom triple if available
+            elif {"dicom_id", "subject_id", "study_id"}.issubset(set(df_i.columns)):
+                df_i2 = df_i.dropna(subset=["dicom_id", "subject_id", "study_id"])
+                if not df_i2.empty:
+                    r = df_i2.iloc[-1]
+                    cxr_path = dicom_to_path(
+                        {"dicom_id": r["dicom_id"], "subject_id": r["subject_id"], "study_id": r["study_id"]},
+                        E.CFG.cxr_root,
+                    )
 
-        # multi-label phenotype target [K]
-        lab_row = self.labels[self.labels.stay_id == stay_id]
+        # labels
+        lab_row = self.labels[self.labels.sample_id == sample_id]
         if lab_row.empty:
-            raise RuntimeError(f"[ICUStayDataset] Missing labels for stay_id={stay_id}")
+            raise RuntimeError(f"[ICUStayDataset] Missing labels for sample_id={sample_id}")
         y_vec = lab_row[self.label_cols].iloc[0].to_numpy()
-        y = torch.tensor(y_vec, dtype=torch.float32)  # [K]
+        y = torch.tensor(y_vec, dtype=torch.float32)
 
         return {
-            "stay_id": stay_id,
+            "sample_id": sample_id,
             "x_struct": xs,
             "notes": notes_payload,
-            "image_paths": img_paths,
+            "cxr_path": cxr_path,   # <<<<<< use this
             "y": y,
         }
+
 
 
 def pad_or_trim_struct(x: torch.Tensor, T: int, F: int) -> torch.Tensor:
@@ -819,18 +879,33 @@ def pad_or_trim_struct(x: torch.Tensor, T: int, F: int) -> torch.Tensor:
     pad = torch.zeros(T - t, F, dtype=x.dtype)
     return torch.cat([pad, x], dim=0)
 
+def dicom_to_path(rec: dict, root: str, exts=(".jpg", ".jpeg", ".png")) -> str:
+    sid = int(rec["subject_id"])
+    study = int(rec["study_id"])
+    dicom = str(rec["dicom_id"])
 
-def load_cxr_tensor(paths: List[str], tfms: T.Compose, return_path: bool = False):
-    if not paths:
+    subdir = f"p{str(sid)[:2]}/p{sid}/s{study}"
+    base = os.path.join(root, "files", subdir, dicom)
+
+    for ext in exts:
+        p = base + ext
+        if os.path.exists(p):
+            return p
+    return ""  # not found
+
+def load_cxr_tensor(cxr_path: str, tfms: T.Compose, return_path: bool = False):
+    if not cxr_path:
         tensor = torch.zeros(3, 224, 224)
         return (tensor, "<none>") if return_path else tensor
 
-    p = paths[-1]
+    # if path is relative, make it relative to E.CFG.cxr_root
+    p_full = cxr_path
+    if not os.path.isabs(p_full):
+        p_full = os.path.join(E.CFG.cxr_root, cxr_path)
 
-    if not os.path.isabs(p):
-        p_full = os.path.join(CFG.data_root, p)
-    else:
-        p_full = p
+    if not os.path.exists(p_full):
+        tensor = torch.zeros(3, 224, 224)
+        return (tensor, "<missing>") if return_path else tensor
 
     try:
         with Image.open(p_full) as img:
@@ -840,6 +915,8 @@ def load_cxr_tensor(paths: List[str], tfms: T.Compose, return_path: bool = False
         tensor = torch.zeros(3, 224, 224)
 
     return (tensor, p_full) if return_path else tensor
+
+
 
 
 def build_route_mask(has_L, has_N, has_I):
@@ -858,7 +935,7 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
     first_print = {"done": False}
 
     def _collate(batch: List[Dict[str, Any]]):
-        T_len, F_dim = CFG.structured_seq_len, CFG.structured_n_feats
+        T_len, F_dim = E.CFG.structured_seq_len, E.CFG.structured_n_feats
         xL_batch = torch.stack(
             [pad_or_trim_struct(b["x_struct"], T_len, F_dim) for b in batch], dim=0
         )
@@ -866,36 +943,38 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
 
         notes_batch = [b["notes"] for b in batch]
         has_N = torch.tensor(
-            [ (nb.get("mode")=="text" and len(nb.get("chunks",[]))>0) or
-              (nb.get("mode")!="text" and len(nb.get("input_ids",[]))>0)
-              for nb in notes_batch ],
-            dtype=torch.float32, device=DEVICE
+            [((nb.get("mode")=="text" and len(nb.get("chunks",[]))>0) or
+              (nb.get("mode")!="text" and len(nb.get("input_ids",[]))>0))
+             for nb in notes_batch],
+            dtype=torch.float32  # no device here
         )
 
         imgs_list, img_paths_list = [], []
         has_I_list = []
         for b in batch:
-            paths = b["image_paths"]
-            has_I_list.append(1.0 if (paths and str(paths[-1]).strip()) else 0.0)
-            img_t, path = load_cxr_tensor(paths, img_tfms, return_path=True)
+            cxr_path = b.get("cxr_path", "")
+            has_I_list.append(1.0 if (isinstance(cxr_path, str) and cxr_path.strip() != "") else 0.0)
+            img_t, path = load_cxr_tensor(cxr_path, img_tfms, return_path=True)
             imgs_list.append(img_t)
             img_paths_list.append(path)
 
+
         imgs_batch = torch.stack(imgs_list, dim=0)
-        has_I = torch.tensor(has_I_list, dtype=torch.float32, device=DEVICE)
+        has_I = torch.tensor(has_I_list, dtype=torch.float32)  # CPU
 
         # structured always present in your current pipeline
-        has_L = torch.ones(len(batch), dtype=torch.float32, device=DEVICE)
+        has_L = (mL_batch.sum(dim=1) > 0).float()              # CPU
 
         y_batch = torch.stack([b["y"].float().view(-1) for b in batch], dim=0)
 
         dbg = {
-            "stay_ids": [b["stay_id"] for b in batch],
+            "sample_ids": [b["sample_id"] for b in batch],
             "img_paths": img_paths_list,
             "has_L": has_L.detach().cpu().tolist(),
             "has_N": has_N.detach().cpu().tolist(),
             "has_I": has_I.detach().cpu().tolist(),
         }
+
 
         if not first_print["done"]:
             first_print["done"] = True
@@ -924,7 +1003,7 @@ def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
 
     print("\n[sample-inspect] ---- Top few samples ----")
     for i in range(k):
-        sid = dbg.get("stay_ids", ["<id?>"] * B)[i]
+        sid = dbg.get("sample_ids", ["<id?>"] * B)[i]
         imgp = dbg.get("img_paths", ["<path?>"] * B)[i]
 
         nz_rows = (mL[i] > 0.5).nonzero(as_tuple=False).flatten().tolist()
@@ -1036,11 +1115,16 @@ def evaluate_epoch(
 
 
     for bidx, (xL, mL, notes, imgs, y, dbg, has_L, has_N, has_I) in enumerate(loader):
-        xL = xL.to(DEVICE, non_blocking=True)
-        mL = mL.to(DEVICE, non_blocking=True)
-        imgs = imgs.to(DEVICE, non_blocking=True)
-        y   = y.to(DEVICE,   non_blocking=True)
+        xL = xL.to(E.DEVICE, non_blocking=True)
+        mL = mL.to(E.DEVICE, non_blocking=True)
+        imgs = imgs.to(E.DEVICE, non_blocking=True)
+        y   = y.to(E.DEVICE,   non_blocking=True)
 
+        # IMPORTANT: route availability must be on same device
+        has_L = has_L.to(E.DEVICE, non_blocking=True)
+        has_N = has_N.to(E.DEVICE, non_blocking=True)
+        has_I = has_I.to(E.DEVICE, non_blocking=True)
+        
         with amp_ctx:
             zL = behrt(xL, mask=mL)
             zN = bbert(prepare_notes_batch(notes))
@@ -1051,7 +1135,8 @@ def evaluate_epoch(
             zI = _safe_tensor(zI, "eval.zI")
 
             z = {"L": zL, "N": zN, "I": zI}
-            route_mask = build_route_mask(has_L, has_N, has_I)
+            route_mask = build_route_mask(has_L, has_N, has_I).to(dtype=torch.float32, device=E.DEVICE)
+
 
 
             out = _capsule_forward_safe(
@@ -1157,11 +1242,15 @@ def collect_epoch_outputs(loader, behrt, bbert, imgenc, fusion, projector, cap_h
 
     y_true, p1, ids = [], [], []
     for xL, mL, notes, imgs, y, dbg, has_L, has_N, has_I in loader:
-        xL = xL.to(DEVICE, non_blocking=True)
-        mL = mL.to(DEVICE, non_blocking=True)
-        imgs = imgs.to(DEVICE, non_blocking=True)
-        y   = y.to(DEVICE,   non_blocking=True)
+        xL = xL.to(E.DEVICE, non_blocking=True)
+        mL = mL.to(E.DEVICE, non_blocking=True)
+        imgs = imgs.to(E.DEVICE, non_blocking=True)
+        y   = y.to(E.DEVICE,   non_blocking=True)
 
+        has_L = has_L.to(E.DEVICE, non_blocking=True)
+        has_N = has_N.to(E.DEVICE, non_blocking=True)
+        has_I = has_I.to(E.DEVICE, non_blocking=True)
+        
         with amp_ctx:
             zL = behrt(xL, mask=mL)
             zN = bbert(prepare_notes_batch(notes))
@@ -1183,7 +1272,7 @@ def collect_epoch_outputs(loader, behrt, bbert, imgenc, fusion, projector, cap_h
         probs = torch.sigmoid(logits)
         y_true.append(y.detach().cpu())
         p1.append(probs.detach().cpu())
-        ids += dbg.get("stay_ids", [])
+        ids += dbg.get("sample_ids", [])
 
     y_true = torch.cat(y_true, dim=0).numpy()
     p1     = torch.cat(p1, dim=0).numpy()
@@ -1363,16 +1452,33 @@ def reliability_plot(bin_centers, bin_conf, bin_acc, out_path):
     plt.savefig(out_path, dpi=150)
     plt.close()
 
-def _set_all_seeds():
-    seed = int(_cfg("seed", 42))
-    import random
+def _set_all_seeds_strict(seed: int, deterministic: bool):
+    import os, random
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
     random.seed(seed)
     np.random.seed(seed)
+
     torch.manual_seed(seed)
     if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = bool(CFG.deterministic)
-    torch.backends.cudnn.benchmark = bool(CFG.use_cudnn_benchmark and not CFG.deterministic)
+
+    if deterministic:
+        # deterministic CuDNN + disable benchmark autotune
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception as e:
+            print(f"[warn] deterministic_algorithms not fully supported: {e}")
+
+        # deterministic matmul on Ampere+ (set BEFORE heavy matmuls start)
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
 
 
 def find_best_thresholds(y_true, p, n_steps: int = 50):
@@ -1479,23 +1585,40 @@ def save_split_thresholds(
 def main():
     args = parse_args()
 
+    # Load config properly (this sets CFG + DEVICE)
+    load_cfg(yaml_path=None, overrides={
+        "data_root": args.data_root,
+        "ckpt_root": args.ckpt_root,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "max_epochs_tri": args.epochs,
+    })
+
     apply_cli_overrides(args)
 
     if hasattr(args, "finetune_text") and args.finetune_text:
-        CFG.finetune_text = True
+        E.CFG.finetune_text = True
 
-    print("[env_config] Device:", DEVICE)
-    print("[env_config] CFG:", json.dumps(asdict(CFG), indent=2))
+    print("[env_config_partial] Device:", E.DEVICE)
+    print("[env_config_partial] CFG:", json.dumps(asdict(E.CFG), indent=2))
 
-    _set_all_seeds()
+    _set_all_seeds_strict(
+        seed=int(_cfg("seed", 42)),
+        deterministic=bool(E.CFG.deterministic),
+    )
+
+    # Dedicated RNG for route dropout (keeps route dropping identical across runs)
+    route_g = torch.Generator(device="cpu")
+    route_g.manual_seed(int(_cfg("seed", 42)) + 999)
+
 
     global TOKENIZER, MAXLEN
-    TOKENIZER = AutoTokenizer.from_pretrained(CFG.text_model_name)
+    TOKENIZER = AutoTokenizer.from_pretrained(E.CFG.text_model_name)
     MAXLEN = int(_cfg("max_text_len", 512))
 
-    print(f"[setup] DEVICE={DEVICE} | batch_size={args.batch_size} | epochs={args.epochs}")
+    print(f"[setup] DEVICE={E.DEVICE} | batch_size={args.batch_size} | epochs={args.epochs}")
 
-    use_cuda = (str(DEVICE).startswith("cuda") and torch.cuda.is_available())
+    use_cuda = (str(E.DEVICE).startswith("cuda") and torch.cuda.is_available())
     if use_cuda:
         if args.precision == "fp16":
             amp_ctx = torch_amp.autocast(device_type="cuda", dtype=torch.float16)
@@ -1514,7 +1637,7 @@ def main():
 
     # Class-balancing pos_weight from TRAIN
     train_label_df = train_ds.labels[
-        train_ds.labels["stay_id"].isin(tri_ids)
+        train_ds.labels["sample_id"].isin(tri_ids)
     ][train_ds.label_cols].astype(float)
     N_train = train_label_df.shape[0]
 
@@ -1526,7 +1649,7 @@ def main():
     pos_counts = train_label_df.sum(axis=0).values
     neg_counts = N_train - pos_counts
     pos_weight = neg_counts / (pos_counts + 1e-6)
-    pos_weight_tensor = torch.tensor(pos_weight, dtype=torch.float32, device=DEVICE)
+    pos_weight_tensor = torch.tensor(pos_weight, dtype=torch.float32, device=E.DEVICE)
 
     val_ds   = ICUStayDataset(args.data_root, split="val",   use_partial=True)
     test_ds  = ICUStayDataset(args.data_root, split="test",  use_partial=True)
@@ -1543,21 +1666,53 @@ def main():
     collate_eval  = collate_fn_factory(tidx=TASK_MAP[args.task], img_tfms=build_image_transform("val"))
     pin = use_cuda
 
+    def _seed_worker(worker_id: int):
+        seed = int(_cfg("seed", 42)) + worker_id
+        np.random.seed(seed)
+        import random
+        random.seed(seed)
+        torch.manual_seed(seed)
+
+    g = torch.Generator()
+    g.manual_seed(int(_cfg("seed", 42)))
+
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=pin,
-        collate_fn=collate_train, drop_last=False
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,                 # OK, still deterministic now
+        num_workers=args.num_workers,
+        pin_memory=pin,
+        collate_fn=collate_train,
+        drop_last=False,
+        worker_init_fn=_seed_worker,
+        generator=g,
+        persistent_workers=(args.num_workers > 0),
     )
+
     val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=pin,
-        collate_fn=collate_eval
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=pin,
+        collate_fn=collate_eval,
+        worker_init_fn=_seed_worker,
+        generator=g,
+        persistent_workers=(args.num_workers > 0),
     )
+
     test_loader = DataLoader(
-        test_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=pin,
-        collate_fn=collate_eval
+        test_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=pin,
+        collate_fn=collate_eval,
+        worker_init_fn=_seed_worker,
+        generator=g,
+        persistent_workers=(args.num_workers > 0),
     )
+
 
     # Encoders
     enc_cfg = EncoderConfig(
@@ -1575,36 +1730,36 @@ def main():
         vision_num_classes=14,
         vision_pretrained=True,
     )
-    behrt, bbert, imgenc = build_encoders(enc_cfg, device=DEVICE)
+    behrt, bbert, imgenc = build_encoders(enc_cfg, device=E.DEVICE)
     print(
-        f"[encoders] d={CFG.d} | BEHRT out_dim={behrt.out_dim} | "
+        f"[encoders] d={E.CFG.d} | BEHRT out_dim={behrt.out_dim} | "
         f"BERT→out_dim={bbert.out_dim} | IMG out_dim={getattr(imgenc.proj, 'out_features', 'NA')}"
     )
 
-    if not CFG.finetune_text and getattr(bbert, "bert", None) is not None:
+    if not E.CFG.finetune_text and getattr(bbert, "bert", None) is not None:
         for p in bbert.bert.parameters():
             p.requires_grad = False
         bbert.bert.eval()
         print("[encoders] Bio_ClinicalBERT frozen (feature extractor mode)")
 
     # Fusions + capsule head
-    fusion = build_fusions(d=CFG.d, feature_mode=CFG.feature_mode, p_drop=CFG.dropout)
+    fusion = build_fusions(d=E.CFG.d, feature_mode=E.CFG.feature_mode, p_drop=E.CFG.dropout)
     for k in fusion.keys():
-        fusion[k].to(DEVICE)
-    projector = RoutePrimaryProjector(d_in=CFG.d, pc_dim=CFG.capsule_pc_dim).to(DEVICE)
+        fusion[k].to(E.DEVICE)
+    projector = RoutePrimaryProjector(d_in=E.CFG.d, pc_dim=E.CFG.capsule_pc_dim).to(E.DEVICE)
     cap_head = CapsuleMortalityHead(
-        pc_dim=CFG.capsule_pc_dim,
-        mc_caps_dim=CFG.capsule_mc_caps_dim,
-        num_routing=CFG.capsule_num_routing,
-        dp=CFG.dropout,
-        act_type=CFG.capsule_act_type,
-        layer_norm=CFG.capsule_layer_norm,
-        dim_pose_to_vote=CFG.capsule_dim_pose_to_vote,
+        pc_dim=E.CFG.capsule_pc_dim,
+        mc_caps_dim=E.CFG.capsule_mc_caps_dim,
+        num_routing=E.CFG.capsule_num_routing,
+        dp=E.CFG.dropout,
+        act_type=E.CFG.capsule_act_type,
+        layer_norm=E.CFG.capsule_layer_norm,
+        dim_pose_to_vote=E.CFG.capsule_dim_pose_to_vote,
         num_classes=num_phenos,  # <<< K=25 phenotypes
-    ).to(DEVICE)
+    ).to(E.DEVICE)
     print(
-        f"[capsule] pc_dim={CFG.capsule_pc_dim} mc_caps_dim={CFG.capsule_mc_caps_dim} "
-        f"iters={CFG.capsule_num_routing} act_type={CFG.capsule_act_type} "
+        f"[capsule] pc_dim={E.CFG.capsule_pc_dim} mc_caps_dim={E.CFG.capsule_mc_caps_dim} "
+        f"iters={E.CFG.capsule_num_routing} act_type={E.CFG.capsule_act_type} "
         f"out_caps={num_phenos}"
     )
 
@@ -1658,7 +1813,7 @@ def main():
 
         behrt.train()
         imgenc.train()
-        if CFG.finetune_text and getattr(bbert, "bert", None) is not None:
+        if E.CFG.finetune_text and getattr(bbert, "bert", None) is not None:
             bbert.bert.train()
 
         total_loss, total_correct, total = 0.0, 0, 0
@@ -1677,9 +1832,15 @@ def main():
             batch_size = y.size(0)
             seen_patients += batch_size
 
-            xL, mL = xL.to(DEVICE), mL.to(DEVICE)
-            imgs   = imgs.to(DEVICE)
-            y      = y.to(DEVICE)
+            xL = xL.to(E.DEVICE, non_blocking=True)
+            mL = mL.to(E.DEVICE, non_blocking=True)
+            imgs = imgs.to(E.DEVICE, non_blocking=True)
+            y = y.to(E.DEVICE, non_blocking=True)
+
+            has_L = has_L.to(E.DEVICE, non_blocking=True)
+            has_N = has_N.to(E.DEVICE, non_blocking=True)
+            has_I = has_I.to(E.DEVICE, non_blocking=True)
+
 
             if (epoch == start_epoch) and (step == 0):
                 pretty_print_small_batch(xL, mL, notes, dbg, k=3)
@@ -1719,19 +1880,20 @@ def main():
                                 f"||zI||={zI[i].norm().item():.3f}"
                             )
 
-                # has_L/has_N/has_I already on DEVICE from collate
+                # has_L/has_N/has_I already on E.DEVICE from collate
                 route_mask = build_route_mask(has_L, has_N, has_I)
 
 
                 # Route dropout for regularization
                 if route_dropout_p > 0.0:
-                    if torch.rand(()) < route_dropout_p:
-                        drop_idx = int(torch.randint(low=0, high=7, size=(1,)))
+                    # draw on CPU generator so it's independent of CUDA nondeterminism
+                    if torch.rand((), generator=route_g).item() < route_dropout_p:
+                        drop_idx = int(torch.randint(0, 7, (1,), generator=route_g).item())
                         route_mask[:, drop_idx] = 0.0
 
                     # second drop with smaller prob in early epochs
-                    if (epoch - start_epoch) < 2 and (torch.rand(()) < route_dropout_p * 0.5):
-                        drop_idx2 = int(torch.randint(low=0, high=7, size=(1,)))
+                    if (epoch - start_epoch) < 2 and (torch.rand((), generator=route_g).item() < route_dropout_p * 0.5):
+                        drop_idx2 = int(torch.randint(0, 7, (1,), generator=route_g).item())
                         route_mask[:, drop_idx2] = 0.0
 
                 detach_priors_flag = (epoch - start_epoch) < routing_warmup_epochs
@@ -1816,7 +1978,7 @@ def main():
 
 
             if args.log_every > 0 and ((step + 1) % args.log_every == 0):
-                avg_loss_step = total_loss / max(1, total // num_phenos)
+                avg_loss_step = total_loss / max(1, num_samples)
                 avg_acc_step  = total_correct / max(1, total)
                 avg_act = (act_sum / max(1, num_samples)).tolist()
 
@@ -1846,7 +2008,7 @@ def main():
                     )
 
         # Epoch summary (TRAIN)
-        train_loss = total_loss / max(1, total // num_phenos)
+        train_loss = total_loss / max(1, num_samples)
         train_acc  = total_correct / max(1, total)
 
         train_avg_act = (act_sum / max(1, num_samples)).tolist()
