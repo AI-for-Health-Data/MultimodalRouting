@@ -460,12 +460,17 @@ def _standardize_image_path_column(df: pd.DataFrame) -> pd.DataFrame:
 def _detect_notes_schema(notes_df: pd.DataFrame):
     cols = list(notes_df.columns)
 
-    # 1) Your original "chunk_*" raw text columns
+    # 1) Raw text chunk columns
+    # Support both chunk_* and note_chunk_* (your file is note_chunk_*)
     chunk_cols = sorted([c for c in cols if str(c).startswith("chunk_")])
+    note_chunk_cols = sorted([c for c in cols if str(c).startswith("note_chunk_")])
+
     if len(chunk_cols) > 0:
         return ("text_cols", chunk_cols, None)
+    if len(note_chunk_cols) > 0:
+        return ("text_cols", note_chunk_cols, None)
 
-    # 2) Your original "input_ids_*" + mask_* columns
+    # 2) Pretokenized suffixed columns
     input_id_cols = sorted([c for c in cols if str(c).startswith("input_ids_")])
     attn_cols = sorted([c for c in cols if str(c).startswith("attention_mask_")])
     if len(attn_cols) == 0:
@@ -486,32 +491,30 @@ def _detect_notes_schema(notes_df: pd.DataFrame):
                 aligned_attn.append(f"attn_mask_{s}")
         return ("pretokenized_cols", aligned_ids, aligned_attn)
 
-    # 3) NEW: non-suffixed pretokenized columns
+    # 3) Non-suffixed pretokenized columns
     if ("input_ids" in cols) and (("attention_mask" in cols) or ("attn_mask" in cols)):
         attn = "attention_mask" if "attention_mask" in cols else "attn_mask"
         return ("pretokenized_single", ["input_ids"], [attn])
 
-    # 4) NEW: single-column raw text
+    # 4) Single-column raw text
     for c in ["text", "note_text", "note", "clean_text"]:
         if c in cols:
             return ("text_single", [c], None)
 
-    # 5) NEW: single-column list-of-strings chunks
+    # 5) Single-column list-of-strings chunks
     for c in ["chunks", "note_chunks", "chunk_texts"]:
         if c in cols:
             return ("text_list", [c], None)
 
     raise ValueError(
         "[ICUStayDataset] notes parquet must contain either:\n"
-        "  - chunk_* columns, OR\n"
+        "  - chunk_* columns, OR note_chunk_* columns, OR\n"
         "  - input_ids_* + attention_mask_* / attn_mask_* columns, OR\n"
         "  - input_ids + attention_mask (non-suffixed), OR\n"
         "  - a single text column (text/note_text/note/clean_text), OR\n"
         "  - a single list-of-texts column (chunks/note_chunks/chunk_texts).\n"
         f"Found columns: {cols[:80]}"
     )
-
-
 
 def _cell_to_list(x):
     """Normalize a parquet cell to a python list of ints (or empty list)."""
@@ -584,6 +587,60 @@ def _standardize_key_column(df: pd.DataFrame, want: str = "sample_id") -> pd.Dat
         return df
     # DON'T rename stay_id -> sample_id (breaks joins)
     return df
+def _clean_binary_label_cols(labels_df: pd.DataFrame, key_col: str = "sample_id"):
+    """
+    Keep only columns that are binary labels (0/1 or True/False).
+    Drops datetime columns, all-null columns, and non-binary numeric columns.
+    Returns: (clean_df, kept_cols, dropped_info)
+    """
+    df = labels_df.copy()
+    dropped = []
+
+    # drop datetime-like columns immediately
+    for c in list(df.columns):
+        if c == key_col:
+            continue
+        if np.issubdtype(df[c].dtype, np.datetime64):
+            dropped.append((c, str(df[c].dtype)))
+            df.drop(columns=[c], inplace=True)
+
+    kept = []
+    for c in df.columns:
+        if c == key_col:
+            continue
+
+        s = df[c]
+
+        # bool is fine
+        if s.dtype == bool:
+            kept.append(c)
+            continue
+
+        # try coerce to numeric
+        sn = pd.to_numeric(s, errors="coerce")
+
+        # all missing => drop
+        if sn.notna().sum() == 0:
+            dropped.append((c, f"{s.dtype} -> all NaN after numeric coercion"))
+            continue
+
+        # check if values are binary (allow NaN)
+        vals = sn.dropna().unique()
+        # allow {0,1} only
+        if len(vals) <= 2 and set(vals).issubset({0.0, 1.0}):
+            # replace the column with cleaned numeric 0/1
+            df[c] = sn.fillna(0.0).astype(np.float32)
+            kept.append(c)
+        else:
+            # not binary => drop
+            vmin = float(np.nanmin(sn.values))
+            vmax = float(np.nanmax(sn.values))
+            dropped.append((c, f"non-binary numeric (min={vmin:.4g}, max={vmax:.4g})"))
+
+    # ensure key col is str
+    df[key_col] = df[key_col].astype(str)
+
+    return df, kept, dropped
 
 
 class ICUStayDataset(Dataset):
@@ -698,6 +755,23 @@ class ICUStayDataset(Dataset):
                     raise ValueError(f"[{name}] failed to attach sample_id via stay_id merge")
                 return df
             raise ValueError(f"[{name}] missing sample_id and cannot map from stay_id")
+        # --- CLEAN LABELS: keep only real binary label columns ---
+        self.labels, kept_cols, dropped_info = _clean_binary_label_cols(self.labels, key_col="sample_id")
+
+        if len(dropped_info) > 0:
+            print(f"[dataset:{split}] dropped non-label cols from labels parquet:")
+            for c, why in dropped_info:
+                print(f"   - {c} ({why})")
+
+        self.label_cols = kept_cols
+        self.label_cols.sort()
+
+        if len(self.label_cols) == 0:
+            raise ValueError("[ICUStayDataset] After cleaning, no binary phenotype label columns remain.")
+        self.num_labels = len(self.label_cols)
+
+        print(f"[dataset:{split}] using {len(self.label_cols)} phenotype labels: {self.label_cols[:5]}{' ...' if len(self.label_cols) > 5 else ''}")
+
 
         # attach/standardize keys
         self.notes  = _attach_sample_id(self.notes,  "notes")
@@ -719,21 +793,47 @@ class ICUStayDataset(Dataset):
 
         # notes schema
         self.notes_mode, self.note_a_cols, self.note_b_cols = _detect_notes_schema(self.notes)
-        if self.notes_mode == "text":
+        if self.notes_mode in ("text_cols", "text_single", "text_list"):
             self.chunk_cols = self.note_a_cols
-            print(f"[dataset:{split}] notes_mode=text (chunks={len(self.chunk_cols)})")
+            print(f"[dataset:{split}] notes_mode={self.notes_mode} (chunks={len(self.chunk_cols)})")
         else:
             self.input_id_cols = self.note_a_cols
             self.attn_mask_cols = self.note_b_cols
-            print(f"[dataset:{split}] notes_mode=pretokenized (chunks={len(self.input_id_cols)})")
+            print(f"[dataset:{split}] notes_mode={self.notes_mode} (chunks={len(self.input_id_cols)})")
 
         # phenotype label columns
-        self.label_cols = [c for c in self.labels.columns if c != "sample_id"]
-        self.label_cols.sort()
+        # phenotype label columns (keep only numeric/bool or convertible-to-numeric)
+        cand = [c for c in self.labels.columns if c != "sample_id"]
+
+        good, bad = [], []
+
+        for c in cand:
+            s = self.labels[c]
+
+            # coerce to numeric where possible
+            s_num = pd.to_numeric(s, errors="coerce")
+            vals = s_num.dropna().unique()
+
+            # accept only binary {0,1} (or bool)
+            if len(vals) == 0:
+                bad.append((c, "all-NaN"))
+                continue
+
+            vals_set = set(np.unique(vals))
+            if vals_set.issubset({0, 1}):
+                good.append(c)
+            else:
+                bad.append((c, f"non-binary: min={np.nanmin(vals):.3g}, max={np.nanmax(vals):.3g}"))
+
+        self.label_cols = sorted(good)
+
+        if bad:
+            print("[dataset:%s] dropped non-binary label cols:" % split)
+            for c, why in bad:
+                print(f"   - {c} ({why})")
+
         if len(self.label_cols) == 0:
-            raise ValueError("[ICUStayDataset] labels parquet must contain at least one phenotype column.")
-        self.num_labels = len(self.label_cols)
-        print(f"[dataset:{split}] found {len(self.label_cols)} phenotype labels: {self.label_cols[:5]}{' ...' if len(self.label_cols) > 5 else ''}")
+            raise ValueError("[ICUStayDataset] no valid binary phenotype label columns found after filtering.")
 
         # tri-modal filtering by sample_id
         base = ids_set
@@ -745,12 +845,14 @@ class ICUStayDataset(Dataset):
         label_ids  = set(self.labels["sample_id"].astype(str).unique().tolist())
 
         # N present if notes are non-empty for that sample_id
-        if self.notes_mode == "text":
+        if self.notes_mode in ("text_cols", "text_single", "text_list"):
             nonempty = np.zeros(len(self.notes), dtype=bool)
-            for c in self.chunk_cols:
+            for c in self.chunk_cols:  # note_chunk_* columns in your case
                 nonempty |= self.notes[c].fillna("").astype(str).str.strip().ne("")
             note_ids = set(self.notes.loc[nonempty, "sample_id"].astype(str).unique().tolist())
+
         else:
+            # pretokenized modes: ("pretokenized_cols", "pretokenized_single")
             nonempty = np.zeros(len(self.notes), dtype=bool)
             for c_id, c_m in zip(self.input_id_cols, self.attn_mask_cols):
                 ids_len = self.notes[c_id].apply(lambda x: len(_cell_to_list(x)))
@@ -779,6 +881,18 @@ class ICUStayDataset(Dataset):
         keep_2of3 = (has_L & has_N) | (has_L & has_I) | (has_N & has_I)
         self.ids = sorted(list(keep_2of3))
         print(f"[dataset:{split}] >=2 modalities -> kept {len(self.ids)} / {len(ids_set)}")
+
+        n_all = len(has_L & has_N & has_I)
+        n_LN  = len((has_L & has_N) - has_I)
+        n_LI  = len((has_L & has_I) - has_N)
+        n_NI  = len((has_N & has_I) - has_L)
+
+        print(f"[dataset:{split}] composition:")
+        print(f"  L+N+I: {n_all}")
+        print(f"  L+N  : {n_LN}")
+        print(f"  L+I  : {n_LI}")
+        print(f"  N+I  : {n_NI}  (structured-missing but kept if exists)")
+
 
 
     def __len__(self) -> int:
