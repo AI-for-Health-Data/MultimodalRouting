@@ -6,20 +6,19 @@ import numpy as np
 
 class CapsuleFC(nn.Module):
     r"""
-    Fully-connected capsule layer with safe, symmetric initialization and
-    routing-by-agreement.
+    Fully-connected capsule layer with safe, symmetric initialization and routing-by-agreement.
 
     Args:
-        in_n_capsules (int):   Number of input capsules (N_in, e.g., 7 routes).
-        in_d_capsules (int):   Dimensionality of each input capsule (A, e.g., pc_dim).
-        out_n_capsules (int):  Number of output capsules (N_out, e.g., #classes).
-        out_d_capsules (int):  Dimensionality of each output capsule (D, e.g., mc_caps_dim).
-        n_rank (int):          Not used directly here (kept for API compatibility).
-        dp (float):            Dropout rate (currently disabled, kept for API compatibility).
+        in_n_capsules (int): Number of input capsules (N_in, e.g., 7 routes).
+        in_d_capsules (int): Dimensionality of each input capsule (A, e.g., pc_dim).
+        out_n_capsules (int): Number of output capsules (N_out, e.g., #classes).
+        out_d_capsules (int): Dimensionality of each output capsule (D, e.g., mc_caps_dim).
+        n_rank (int): Not used directly here (kept for API compatibility).
+        dp (float): Dropout rate (currently disabled, kept for API compatibility).
         dim_pose_to_vote (int): Unused, kept for compatibility.
         uniform_routing_coefficient (bool): If True, forces uniform routing (for debugging).
-        act_type (str):        Activation/routing type, e.g. "EM", "Hubert", "ONES".
-        small_std (bool):      Unused in this implementation (kept for compatibility).
+        act_type (str): Activation/routing type, e.g. "EM", "Hubert", "ONES".
+        small_std (bool): Unused in this implementation (kept for compatibility).
     """
 
     def __init__(
@@ -38,32 +37,42 @@ class CapsuleFC(nn.Module):
         super(CapsuleFC, self).__init__()
 
         # Basic geometry
-        self.in_n_capsules = in_n_capsules   # N_in (7 routes)
-        self.in_d_capsules = in_d_capsules   # A   (pc_dim)
-        self.out_n_capsules = out_n_capsules # N_out (#phenotypes)
-        self.out_d_capsules = out_d_capsules # D   (mc_caps_dim)
-        self.n_rank = n_rank                 
-        
+        self.in_n_capsules = in_n_capsules      # N_in (7 routes)
+        self.in_d_capsules = in_d_capsules      # A (pc_dim)
+        self.out_n_capsules = out_n_capsules    # N_out (#phenotypes)
+        self.out_d_capsules = out_d_capsules    # D (mc_caps_dim)
+        self.n_rank = n_rank
+
         # Weight initialization: scaled normal, symmetric across capsules
         # Shape: [N_in, A, N_out, D]
-        self.weight_init_const = np.sqrt(out_n_capsules / (in_d_capsules * in_n_capsules))
+        self.weight_init_const = np.sqrt(
+            out_n_capsules / (in_d_capsules * in_n_capsules)
+        )
         self.w = nn.Parameter(
             self.weight_init_const
-            * torch.randn(in_n_capsules, in_d_capsules, out_n_capsules, out_d_capsules)
+            * torch.randn(
+                in_n_capsules,
+                in_d_capsules,
+                out_n_capsules,
+                out_d_capsules,
+            )
         )
 
-        # Dropout OFF for now
+        # Dropout (currently disabled)
         self.dropout_rate = float(dp)
         self.drop = nn.Identity()
 
-        # Nonlinearity
+        # extra nonlinearity on poses (currently none)
         self.nonlinear_act = nn.Sequential()
 
         # Scale factor used before softmax to keep logits in a reasonable range
         self.scale = 1.0 / (out_d_capsules ** 0.5)
 
-        # Routing/activation type parameters (kept for possible extension)
+        # Routing / activation configuration
         self.act_type = act_type
+        self.uniform_routing_coefficient = bool(uniform_routing_coefficient)
+
+        # Parameters for different act_type modes (kept for future extension)
         if act_type == "EM":
             # Symmetric, unbiased initialization (all capsules equal at start)
             self.beta_u = nn.Parameter(torch.zeros(out_n_capsules))
@@ -73,8 +82,9 @@ class CapsuleFC(nn.Module):
             self.beta = nn.Parameter(
                 torch.zeros(in_n_capsules, in_d_capsules, out_n_capsules)
             )
-
-        self.uniform_routing_coefficient = uniform_routing_coefficient
+        else:
+            # "ONES" or any other custom mode: no extra parameters required
+            pass
 
     def extra_repr(self) -> str:
         return (
@@ -99,37 +109,56 @@ class CapsuleFC(nn.Module):
         next_act: torch.Tensor = None,
         uniform_routing: bool = False,
     ):
-        """
+        r"""
         Forward pass through the capsule layer with routing-by-agreement.
 
         Args:
-            input:              [B, N_in, A]    primary capsule poses.
-            current_act:        [B, N_in, 1]    primary capsule activations.
-            num_iter:           (int) routing iteration index (unused here, kept for API).
-            next_capsule_value: [B, N_out, D] or None; previous iteration's output poses.
-            next_act:           [B, N_out] or None; previous iteration's output activations.
-            uniform_routing:    If True, force uniform routing (ignores agreement).
+            input:
+                [B, N_in, A] primary capsule poses.
+            current_act:
+                [B, N_in, 1] or [B, N_in] primary capsule activations.
+            num_iter:
+                (int) routing iteration index (unused here; kept for API compatibility).
+            next_capsule_value:
+                [B, N_out, D] or None; previous iteration's output poses.
+            next_act:
+                [B, N_out] or None; previous iteration's output activations.
+            uniform_routing:
+                If True, force uniform routing (ignores agreement / current_act).
 
         Returns:
             next_capsule_value: [B, N_out, D]
-            next_act:           [B, N_out]
-            query_key:          [B, N_in, N_out] routing coefficients (per batch, route, label).
+            next_act:          [B, N_out]
+            query_key:         [B, N_in, N_out] routing coefficients
+                               (per batch, route, label).
         """
         B = input.shape[0]
         device = input.device
         dtype = input.dtype
 
-        # Match W to current device/dtype 
+        # Match W to current device/dtype
         W = self.w.to(device=device, dtype=dtype)
 
-        # current_act: [B, N_in]
-        current_act = current_act.view(B, -1)
+        # current_act: [B, N_in] (flatten last dimension if [B, N_in, 1])
+        if current_act.dim() == 3 and current_act.size(-1) == 1:
+            current_act = current_act.view(B, -1)
+        elif current_act.dim() == 2:
+            current_act = current_act
+        else:
+            raise ValueError(
+                f"current_act must be [B, N_in] or [B, N_in, 1], got {tuple(current_act.shape)}"
+            )
+
+        # Initialization of next_capsule_value and next_act if not provided
 
         if next_capsule_value is None:
             # Start from a uniform distribution over output capsules for each input capsule.
             # query_key_unif: [N_in, N_out] -> softmax over N_out
             query_key_unif = torch.zeros(
-                self.in_n_capsules, self.out_n_capsules, device=device, dtype=dtype
+                self.in_n_capsules,
+                self.out_n_capsules,
+                device=device,
+                dtype=dtype,
             )
             query_key_unif = F.softmax(query_key_unif, dim=1)  # uniform probs
 
@@ -152,11 +181,15 @@ class CapsuleFC(nn.Module):
             # Ensure provided next_act lives on the correct device/dtype.
             next_act = next_act.to(device=device, dtype=dtype)
 
-        # ROUTING STEP 
+        # ROUTING STEP
         if uniform_routing or self.uniform_routing_coefficient:
             # Completely uniform routing over N_out for each (b, n).
             query_key = torch.zeros(
-                B, self.in_n_capsules, self.out_n_capsules, device=device, dtype=dtype
+                B,
+                self.in_n_capsules,
+                self.out_n_capsules,
+                device=device,
+                dtype=dtype,
             )
             query_key = F.softmax(query_key, dim=2)  # [B, N_in, N_out]
         else:
@@ -184,30 +217,34 @@ class CapsuleFC(nn.Module):
             denom = query_key.sum(dim=2, keepdim=True) + 1e-10
             query_key = query_key / denom
 
-        # AGGREGATE VOTES TO PRODUCE NEXT OUTPUT POSES 
-        #
+        # AGGREGATE VOTES TO PRODUCE NEXT OUTPUT POSES
         # next_capsule_value: [B, N_out, D]
-        #
         # Einsum indices:
         #   query_key:  b,n,m
         #   input:      b,n,a
         #   W:          n,a,m,d
-        #   current_act: b,n
+        #   current_act:b,n
         #   output:     b,m,d
         next_capsule_value = torch.einsum(
             "bnm, bna, namd, bn->bmd", query_key, input, W, current_act
         )
 
-        # ACTIVATION TYPE HANDLING 
+        # ACTIVATION TYPE HANDLING
         if self.act_type == "ONES":
             # Simple fixed activation of 1 for all output capsules
             next_act = torch.ones(
                 next_capsule_value.shape[:2], device=device, dtype=dtype
             )
+        else:
+            # For now, we don't implement EM/Hubert-specific activation updates.
+            # They can be extended here if needed.
+            # As a fallback, just keep next_act as-is (already set above).
+            pass
 
+        # dropout and nonlinearity on poses
         next_capsule_value = self.drop(next_capsule_value)
         if next_capsule_value.shape[-1] != 1:
             next_capsule_value = self.nonlinear_act(next_capsule_value)
 
-        # query_key: [B, N_in, N_out]  (routing coefficients per route/phenotype)
+        # query_key: [B, N_in, N_out] (routing coefficients per route/phenotype)
         return next_capsule_value, next_act, query_key
