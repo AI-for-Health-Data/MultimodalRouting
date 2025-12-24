@@ -1,23 +1,46 @@
+# env_config.py (UPDATED: whole-stay ready + safe env vars)
+
 from __future__ import annotations
+
 import os
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import json
 import random
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Any
+
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  
 
 try:
-    import lightning as L  
+    import lightning as L  # optional
 except Exception:
     L = None
 try:
-    import yaml  
+    import yaml  # optional
 except Exception:
     yaml = None
-from typing import Any
+
+
+def configure_reproducibility(seed: int, deterministic: bool, cudnn_benchmark: bool) -> None:
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    try:
+        torch.use_deterministic_algorithms(bool(deterministic))
+    except Exception:
+        pass
+
+    torch.backends.cudnn.deterministic = bool(deterministic)
+    torch.backends.cudnn.benchmark = False if deterministic else bool(cudnn_benchmark)
 
 
 ROUTES: List[str] = ["L", "N", "I", "LN", "LI", "NI", "LNI"]
@@ -29,53 +52,55 @@ BLOCKS: Dict[str, List[str]] = {
 TASKS: List[str] = ["pheno"]
 
 PHENO_NAMES: List[str] = [
-    "Acute and unspecified renal failure",                         
-    "Acute cerebrovascular disease",                                
-    "Acute myocardial infarction",                                 
-    "Cardiac dysrhythmias",                                       
-    "Chronic kidney disease",                                      
-    "Chronic obstructive pulmonary disease and bronchiectasis",     
-    "Complications of surgical or medical care",                    
-    "Conduction disorders",                                        
-    "Congestive heart failure; nonhypertensive",                    
-    "Coronary atherosclerosis and other heart disease",             
-    "Diabetes mellitus with complications",                        
-    "Diabetes mellitus without complication",                       
-    "Disorders of lipid metabolism",                               
-    "Essential hypertension",                                       
-    "Fluid and electrolyte disorders",                             
-    "Gastrointestinal hemorrhage",                                  
-    "Hypertension with complications and secondary hypertension",   
-    "Other liver diseases",                                         
-    "Other lower respiratory disease",                            
-    "Other upper respiratory disease",                             
-    "Pneumonia (including viral and aspiration)",                  
-    "Respiratory failure; insufficiency; arrest",                  
-    "Septicemia (sepsis)",                                         
-    "Shock",                                                      
-    "Urinary tract infections",                                    
+    "Acute and unspecified renal failure",
+    "Acute cerebrovascular disease",
+    "Acute myocardial infarction",
+    "Cardiac dysrhythmias",
+    "Chronic kidney disease",
+    "Chronic obstructive pulmonary disease and bronchiectasis",
+    "Complications of surgical or medical care",
+    "Conduction disorders",
+    "Congestive heart failure; nonhypertensive",
+    "Coronary atherosclerosis and other heart disease",
+    "Diabetes mellitus with complications",
+    "Diabetes mellitus without complication",
+    "Disorders of lipid metabolism",
+    "Essential hypertension",
+    "Fluid and electrolyte disorders",
+    "Gastrointestinal hemorrhage",
+    "Hypertension with complications and secondary hypertension",
+    "Other liver diseases",
+    "Other lower respiratory disease",
+    "Other upper respiratory disease",
+    "Pneumonia (including viral and aspiration)",
+    "Respiratory failure; insufficiency; arrest",
+    "Septicemia (sepsis)",
+    "Shock",
+    "Urinary tract infections",
 ]
 
 
 @dataclass
 class Config:
-    d: int = 256                 
+    d: int = 256
     dropout: float = 0.0
     lr: float = 2e-4
     batch_size: int = 16
-    max_epochs_uni: int = 5
-    max_epochs_bi: int = 5
-    max_epochs_tri: int = 5
+    max_epochs_uni: int = 0
+    max_epochs_bi: int = 0
+    max_epochs_tri: int = 50
     num_workers: int = 4
     steps_per_epoch_hint: int = 500
 
     # Text encoder
     finetune_text: bool = False
     text_model_name: str = "emilyalsentzer/Bio_ClinicalBERT"
-    max_text_len: int = 512
+    max_text_len: int = 512                  # per chunk token length
+    notes_chunk_len: int = 512               # keep consistent with pretokenization
+    notes_max_chunks: int = -1               # -1 => keep all chunks (whole stay)
 
     # Structured
-    structured_seq_len: int = 24
+    structured_seq_len: int = -1             # -1 => keep all time bins (whole stay)
     structured_n_feats: int = 17
     structured_layers: int = 2
     structured_heads: int = 8
@@ -91,11 +116,11 @@ class Config:
     # Capsule head hyperparams
     capsule_pc_dim: int = 32
     capsule_mc_caps_dim: int = 64
-    capsule_num_routing: int = 3     
+    capsule_num_routing: int = 3
     capsule_act_type: str = "EM"
     capsule_layer_norm: bool = False
     capsule_dim_pose_to_vote: int = 0
-    loss_type: str = "ce"
+    loss_type: str = "bce"
 
     # Paths & misc
     data_root: str = "./data"
@@ -103,35 +128,34 @@ class Config:
     task_name: str = "pheno"
 
     # System
-    use_cudnn_benchmark: bool = True
-    precision_amp: str = "auto"  
-    deterministic: bool = False
+    use_cudnn_benchmark: bool = False
+    precision_amp: str = "auto"
+    deterministic: bool = True
     seed: int = 42
     verbose: bool = True
 
     debug_samples: int = 3
     routing_print_every: int = 50
 
-    route_entropy_lambda = 0.0        
-    route_entropy_warmup_epochs: float = 0.0     
+    route_entropy_lambda: float = 0.0
+    route_entropy_warmup_epochs: float = 0.0
 
-    route_uniform_lambda = 0.0   
-    route_uniform_warmup_epochs: float = 0.0      
+    route_uniform_lambda: float = 0.0
+    route_uniform_warmup_epochs: float = 0.0
 
     # Dropout / warmup
-    route_dropout_p: float = 0.0             
-    routing_warmup_epochs: float = 0.0            
+    route_dropout_p: float = 0.0
+    routing_warmup_epochs: int = 5
 
     # Priors & misc
-    route_prior_floor: float = 1e-3           # min clamp for primary acts
-    route_prior_ceiling: float = 0.999        # max clamp to avoid saturations
-    label_smoothing: float = 0.05             # CE smoothing
-    entropy_use_rc: bool = False              # prefer routing_coef for entropy; fallback to prim_acts
-
+    route_prior_floor: float = 0.02
+    route_prior_ceiling: float = 0.98
+    label_smoothing: float = 0.0
+    entropy_use_rc: bool = False
 
 
 CFG: Config = Config()
-DEVICE: str = "cpu"  
+DEVICE: str = "cpu"
 TASK2IDX: Dict[str, int] = {name: i for i, name in enumerate(TASKS)}
 SELECTED_TASK_IDX: int = TASK2IDX.get(CFG.task_name, 0)
 
@@ -150,18 +174,9 @@ def _pick_device() -> str:
                 return want
             except Exception:
                 return "cuda"
-        else:
-            return "cpu"
+        return "cpu"
 
     return "cuda" if torch.cuda.is_available() else "cpu"
-
-
-def set_global_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 
 def set_deterministic(enabled: bool) -> None:
@@ -170,7 +185,7 @@ def set_deterministic(enabled: bool) -> None:
     except Exception:
         pass
     torch.backends.cudnn.deterministic = bool(enabled)
-    torch.backends.cudnn.benchmark = bool(not enabled and CFG.use_cudnn_benchmark)
+    torch.backends.cudnn.benchmark = False if enabled else bool(CFG.use_cudnn_benchmark)
 
 
 def amp_autocast_dtype(precision_amp: str) -> Optional[torch.dtype]:
@@ -181,7 +196,7 @@ def amp_autocast_dtype(precision_amp: str) -> Optional[torch.dtype]:
         return torch.float16
     if p == "bf16":
         return torch.bfloat16
-    return torch.float16 
+    return torch.float16
 
 
 def autocast_context():
@@ -273,12 +288,11 @@ def load_cfg(yaml_path: Optional[str] = None,
         "MIMICIV_CKPT_ROOT": ("ckpt_root", str),
         "MIMICIV_TASK": ("task_name", str),
 
-        "MIMICIV_FINETUNE_TEXT": (
-            "finetune_text",
-            lambda s: str(s).lower() in {"1", "true", "yes"},
-        ),
+        "MIMICIV_FINETUNE_TEXT": ("finetune_text", lambda s: str(s).lower() in {"1", "true", "yes"}),
         "MIMICIV_TEXT_MODEL": ("text_model_name", str),
         "MIMICIV_MAX_TEXT_LEN": ("max_text_len", int),
+        "MIMICIV_NOTES_CHUNK_LEN": ("notes_chunk_len", int),
+        "MIMICIV_NOTES_MAX_CHUNKS": ("notes_max_chunks", int),
 
         "MIMICIV_STRUCT_SEQ_LEN": ("structured_seq_len", int),
         "MIMICIV_STRUCT_N_FEATS": ("structured_n_feats", int),
@@ -290,10 +304,7 @@ def load_cfg(yaml_path: Optional[str] = None,
         "MIMICIV_CAP_MC_DIM": ("capsule_mc_caps_dim", int),
         "MIMICIV_CAP_ITERS": ("capsule_num_routing", int),
         "MIMICIV_CAP_ACT": ("capsule_act_type", str),
-        "MIMICIV_CAP_LN": (
-            "capsule_layer_norm",
-            lambda s: str(s).lower() in {"1", "true", "yes"},
-        ),
+        "MIMICIV_CAP_LN": ("capsule_layer_norm", lambda s: str(s).lower() in {"1", "true", "yes"}),
         "MIMICIV_CAP_DPOSE2VOTE": ("capsule_dim_pose_to_vote", int),
 
         "MIMICIV_LOSS": ("loss_type", str),
@@ -302,23 +313,17 @@ def load_cfg(yaml_path: Optional[str] = None,
         "MIMICIV_DROPOUT": ("dropout", float),
         "MIMICIV_NUM_WORKERS": ("num_workers", int),
         "MIMICIV_PRECISION": ("precision_amp", str),
-        "MIMICIV_DETERMINISTIC": (
-            "deterministic",
-            lambda s: str(s).lower() in {"1", "true", "yes"},
-        ),
+        "MIMICIV_DETERMINISTIC": ("deterministic", lambda s: str(s).lower() in {"1", "true", "yes"}),
         "MIMICIV_SEED": ("seed", int),
-        "MIMICIV_VERBOSE": (
-            "verbose",
-            lambda s: str(s).lower() in {"1", "true", "yes"},
-        ),
+        "MIMICIV_VERBOSE": ("verbose", lambda s: str(s).lower() in {"1", "true", "yes"}),
         "MIMICIV_DEBUG_SAMPLES": ("debug_samples", int),
         "MIMICIV_ROUTING_PRINT_EVERY": ("routing_print_every", int),
 
         "MIMICIV_ROUTE_ENTROPY_LAMBDA": ("route_entropy_lambda", float),
-        "MIMICIV_ROUTE_ENTROPY_WARM": ("route_entropy_warmup_epochs", int),
+        "MIMICIV_ROUTE_ENTROPY_WARM": ("route_entropy_warmup_epochs", float),
 
         "MIMICIV_ROUTE_UNIFORM_LAMBDA": ("route_uniform_lambda", float),
-        "MIMICIV_ROUTE_UNIFORM_WARM": ("route_uniform_warmup_epochs", int),
+        "MIMICIV_ROUTE_UNIFORM_WARM": ("route_uniform_warmup_epochs", float),
 
         "MIMICIV_ROUTE_DROPOUT_P": ("route_dropout_p", float),
         "MIMICIV_ROUTING_WARMUP_EPOCHS": ("routing_warmup_epochs", int),
@@ -327,10 +332,7 @@ def load_cfg(yaml_path: Optional[str] = None,
         "MIMICIV_ROUTE_PRIOR_CEILING": ("route_prior_ceiling", float),
 
         "MIMICIV_LABEL_SMOOTHING": ("label_smoothing", float),
-        "MIMICIV_ENTROPY_USE_RC": (
-            "entropy_use_rc",
-            lambda s: str(s).lower() in {"1", "true", "yes"},
-        ),
+        "MIMICIV_ENTROPY_USE_RC": ("entropy_use_rc", lambda s: str(s).lower() in {"1", "true", "yes"}),
     }
 
     for env_key, (cfg_key, caster) in env_map.items():
@@ -342,17 +344,17 @@ def load_cfg(yaml_path: Optional[str] = None,
 
     CFG = Config(**cfg_dict)
 
-    set_global_seed(int(CFG.seed))
-    set_deterministic(bool(CFG.deterministic))
-
     DEVICE = _pick_device()
 
-    torch.backends.cudnn.benchmark = bool(CFG.use_cudnn_benchmark and not CFG.deterministic)
+    configure_reproducibility(
+        seed=int(CFG.seed),
+        deterministic=bool(CFG.deterministic),
+        cudnn_benchmark=bool(CFG.use_cudnn_benchmark),
+    )
 
     TASK2IDX = {name: i for i, name in enumerate(TASKS)}
     SELECTED_TASK_IDX = TASK2IDX.get(CFG.task_name, 0)
 
-    # Ensure dirs
     ensure_dir(CFG.ckpt_root)
     ensure_dir(CFG.data_root)
 
@@ -364,6 +366,7 @@ def load_cfg(yaml_path: Optional[str] = None,
             print("[env_config] CFG loaded (json serialization skipped)")
 
     return CFG
+
 
 def apply_cli_overrides(args) -> None:
     global CFG
@@ -377,8 +380,26 @@ def apply_cli_overrides(args) -> None:
         CFG.lr = float(args.lr)
     if hasattr(args, "batch_size") and args.batch_size is not None:
         CFG.batch_size = int(args.batch_size)
+    if hasattr(args, "num_workers") and args.num_workers is not None:
+        CFG.num_workers = int(args.num_workers)
+
+    if hasattr(args, "precision") and args.precision is not None:
+        CFG.precision_amp = str(args.precision)
+
+    if hasattr(args, "structured_seq_len") and args.structured_seq_len is not None:
+        CFG.structured_seq_len = int(args.structured_seq_len)
+
+    if hasattr(args, "notes_max_chunks") and args.notes_max_chunks is not None:
+        CFG.notes_max_chunks = int(args.notes_max_chunks)
+
+    if hasattr(args, "notes_chunk_len") and args.notes_chunk_len is not None:
+        CFG.notes_chunk_len = int(args.notes_chunk_len)
+
+    if hasattr(args, "max_text_len") and args.max_text_len is not None:
+        CFG.max_text_len = int(args.max_text_len)
+
     if hasattr(args, "epochs") and args.epochs is not None:
-        CFG.max_epochs_tri = int(args.epochs)  
+        CFG.max_epochs_tri = int(args.epochs)
 
     if hasattr(args, "route_dropout_p") and args.route_dropout_p is not None:
         CFG.route_dropout_p = float(args.route_dropout_p)
@@ -387,11 +408,12 @@ def apply_cli_overrides(args) -> None:
     if hasattr(args, "route_entropy_warmup_epochs") and args.route_entropy_warmup_epochs is not None:
         CFG.route_entropy_warmup_epochs = int(args.route_entropy_warmup_epochs)
 
-    if hasattr(args, "finetune_text") and args.finetune_text:
+    if hasattr(args, "finetune_text") and getattr(args, "finetune_text"):
         CFG.finetune_text = True
 
     ensure_dir(CFG.ckpt_root)
     ensure_dir(CFG.data_root)
+
 
 def get_pheno_name(idx: int) -> str:
     if 0 <= idx < len(PHENO_NAMES):
@@ -399,10 +421,9 @@ def get_pheno_name(idx: int) -> str:
     return f"pheno_{idx:02d}"
 
 
-load_cfg(yaml_path=None, overrides=None)
-
 def get_device() -> torch.device:
     return torch.device(DEVICE)
+
 
 def bfloat16_supported() -> bool:
     try:
