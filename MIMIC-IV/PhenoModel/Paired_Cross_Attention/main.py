@@ -44,7 +44,7 @@ from routing_and_heads import (
 )
 
 ROUTE_NAMES = ["L", "N", "I", "LN", "NL", "LI", "IL", "NI", "IN", "LNI"]
-N_ROUTES = len(ROUTE_NAMES)  # 10
+N_ROUTES = len(ROUTE_NAMES) 
 
 def grads_are_finite(param_list):
     for p in param_list:
@@ -89,7 +89,7 @@ def print_route_matrix_detailed(
         pa = prim_acts.detach().float().cpu()     # [B,N_ROUTES]
 
         B, R, K = rc.shape
-      
+
         # Average over batch
         rc_mean = rc.mean(dim=0).numpy()          # [N_ROUTES,K]
         pa_mean = pa.mean(dim=0).numpy()          # [N_ROUTES]
@@ -172,12 +172,10 @@ def debug_routing_tensor(
             routes_dim = 1
             k_dim = 2
             print(f"[debug] {name}: WARNING could not find routes axis by size={expect_routes}, using dim=1 as routes.")
-
         if expect_k is not None:
             K_found = rc.shape[k_dim]
             if int(K_found) != int(expect_k):
                 print(f"[debug] {name}: WARNING K mismatch: got K={K_found} but expect_k={expect_k} (k_dim={k_dim})")
-
         s_routes = rc.sum(dim=routes_dim)
         print(f"[debug] sum_over_routes(dim={routes_dim}): mean={s_routes.float().mean().item():.6f} "
               f"min={s_routes.float().min().item():.6f} max={s_routes.float().max().item():.6f}")
@@ -194,14 +192,6 @@ def normalize_routing_coef_auto(
     expect_routes: int = N_ROUTES,
     eps: float = 1e-12,
 ):
-    """
-    Ensures output is [B, R, K] where R==expect_routes, and normalized over routes (dim=1).
-
-    Handles common cases:
-      - rc is [B, R, K] (R==expect_routes)  
-      - rc is [B, K, R] (dim=2==expect_routes) 
-      - fallback: heuristic by which dim sums closer to 1 (last resort)
-    """
     if rc is None or rc.ndim != 3:
         return rc, {"ok": False, "reason": "rc None or not 3D"}
 
@@ -218,7 +208,6 @@ def normalize_routing_coef_auto(
         rc = rc.transpose(1, 2)
         transposed = True
     else:
-        # 2) Fallback heuristic (rare): prefer axis whose sum is closest to 1 to detect simplex,
         s1 = rc.sum(dim=1)  # [B, D2]
         s2 = rc.sum(dim=2)  # [B, D1]
         err1 = (s1 - 1.0).abs().mean().item()
@@ -242,19 +231,11 @@ def normalize_routing_coef_auto(
 
 
 def renorm_over_routes(rc: torch.Tensor, routes_dim: int = 1, eps: float = 1e-12) -> torch.Tensor:
-    """
-    Fallback normalization when you only have routing coefficients (not logits).
-    Ensures sum over routes (dim=1) equals 1 for every (B,K).
-    rc: [B,R,K]
-    """
     denom = rc.sum(dim=routes_dim, keepdim=True).clamp_min(eps)
     return rc / denom
 
 
 def assert_routing_over_routes(rc: torch.Tensor, routes_dim: int = 1, atol: float = 1e-3, name: str = "routing_coef"):
-    """
-    Hard assert that sum over routes == 1 for each (B,K).
-    """
     if rc.ndim != 3:
         raise AssertionError(f"{name}: expected [B,R,K], got {tuple(rc.shape)}")
 
@@ -413,7 +394,6 @@ def save_routing_heatmap(
 from matplotlib.colors import LinearSegmentedColormap
 
 def _light_yellow_to_light_blue_cmap():
-    # Low = light yellow, High = light blue
     return LinearSegmentedColormap.from_list(
         "yl_to_lb",
         ["#fff7cc", "#d6ecff"],  
@@ -422,6 +402,7 @@ def _light_yellow_to_light_blue_cmap():
 
 def normalize_minmax(arr: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     arr = np.asarray(arr, dtype=np.float32)
+
     a_min = float(np.nanmin(arr))
     a_max = float(np.nanmax(arr))
 
@@ -434,10 +415,6 @@ def normalize_minmax(arr: np.ndarray, eps: float = 1e-12) -> np.ndarray:
 
 
 def normalize_routes_per_phenotype(mat: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    """
-    Row-wise normalization: each phenotype row sums to 1.
-    Use for KxN_ROUTES matrices (phenotype x route).
-    """
     mat = np.asarray(mat, dtype=np.float32)
     row_sum = mat.sum(axis=1, keepdims=True)
     row_sum = np.maximum(row_sum, eps)
@@ -450,14 +427,8 @@ def save_array_with_versions(
     row_names: Optional[List[str]] = None,
     col_names: Optional[List[str]] = None,
     print_title: str = "",
-    norm_fn = None,   # <-- ADD THIS
+    norm_fn = None,  
 ):
-    """
-    Saves:
-      - raw:  base_name_raw.npy + base_name_raw.csv
-      - norm: base_name_norm.npy + base_name_norm.csv
-    Prints both (4 decimals).
-    """
     os.makedirs(out_dir, exist_ok=True)
     arr_raw = np.asarray(arr_raw, dtype=np.float32)
     if norm_fn is None:
@@ -490,6 +461,7 @@ def save_array_with_versions(
     df_raw.to_csv(raw_csv, float_format="%.4f")
     df_nrm.to_csv(norm_csv, float_format="%.4f")
 
+    # Print tables (4 decimals)
     if print_title:
         print(f"\n{'='*120}\n{print_title}\n{'='*120}")
     print(f"[saved] {raw_npy}\n[saved] {raw_csv}")
@@ -501,7 +473,7 @@ def save_array_with_versions(
 
 def save_heatmap_with_numbers(
     mat_norm: np.ndarray,                
-    mat_raw: np.ndarray,              
+    mat_raw: np.ndarray,                 
     row_names: List[str],
     col_names: List[str],
     title: str,
@@ -643,7 +615,6 @@ def prepare_notes_batch(notes_batch: List[Dict[str, Any]]):
         seq = _flatten_if_nested(seq)
         out_ints = []
         for v in seq:
-            # handle numpy scalars etc.
             if isinstance(v, (np.integer,)):
                 out_ints.append(int(v))
             elif isinstance(v, (int,)):
@@ -651,11 +622,9 @@ def prepare_notes_batch(notes_batch: List[Dict[str, Any]]):
             elif isinstance(v, float) and np.isnan(v):
                 continue
             else:
-                # last resort: try cast
                 try:
                     out_ints.append(int(v))
                 except Exception:
-                    # if it's still a list/object, skip it
                     continue
         return out_ints
 
@@ -680,7 +649,6 @@ def prepare_notes_batch(notes_batch: List[Dict[str, Any]]):
         ids_chunks  = [_to_int_list(x) for x in ids_chunks]
         attn_chunks = [_to_int_list(x) for x in attn_chunks]
 
-        # Keep only non-empty aligned pairs AND require at least one attended token
         paired = [
             (a, b) for a, b in zip(ids_chunks, attn_chunks)
             if len(a) > 0 and len(b) > 0 and (np.sum(np.asarray(b, dtype=np.int64)) > 0)
@@ -691,6 +659,7 @@ def prepare_notes_batch(notes_batch: List[Dict[str, Any]]):
                 "attention_mask": torch.zeros(0, L, dtype=torch.long, device=DEVICE),
             })
             continue
+
 
         ids_chunks, attn_chunks = zip(*paired)
 
@@ -830,7 +799,6 @@ def resolve_image_path(p: str, dataset_root: str) -> str:
         return ""
     if os.path.isabs(p):
         return p
-
     image_root = str(getattr(CFG, "image_root", "") or "").strip()
     if p.startswith("mimic-cxr-jpg/"):
         base = image_root if image_root else dataset_root
@@ -838,9 +806,7 @@ def resolve_image_path(p: str, dataset_root: str) -> str:
 
     if image_root:
         return os.path.join(image_root, p)
-
     return os.path.join(dataset_root, p)
-
 
 
 def is_probably_image_file(p: str) -> bool:
@@ -879,6 +845,7 @@ def _detect_notes_schema(notes_df: pd.DataFrame):
 
         return ("pretokenized", aligned_ids, aligned_attn)
 
+    # text mode 
     chunk_cols = sorted([c for c in notes_df.columns if str(c).startswith("chunk_")])
     if len(chunk_cols) > 0:
         return ("text", chunk_cols, None)
@@ -891,22 +858,31 @@ def _detect_notes_schema(notes_df: pd.DataFrame):
 
 
 def _cell_to_list(x):
-    """Normalize a parquet cell to a python list of ints (or empty list)."""
     import ast
 
     if x is None:
         return []
+
+    # pandas may give NaN float
     if isinstance(x, float) and np.isnan(x):
         return []
+
+    # already a list
     if isinstance(x, list):
         return x
+
+    # numpy array
     if isinstance(x, np.ndarray):
         return x.tolist()
+
+    # pyarrow scalar / other scalar wrappers
     if hasattr(x, "as_py"):
         try:
             return _cell_to_list(x.as_py())
         except Exception:
             pass
+
+    # strings: try parse
     if isinstance(x, (str, bytes)):
         s = x.decode("utf-8") if isinstance(x, bytes) else x
         s = s.strip()
@@ -919,6 +895,7 @@ def _cell_to_list(x):
                 return v
         except Exception:
             pass
+        # try python literal list: "[1,2,3]"
         try:
             v = ast.literal_eval(s)
             if isinstance(v, list):
@@ -927,6 +904,7 @@ def _cell_to_list(x):
             pass
         return []
 
+    # generic iterable (but not string)
     if hasattr(x, "__iter__"):
         try:
             return list(x)
@@ -987,11 +965,12 @@ class ICUStayDataset(Dataset):
         self.images = _standardize_image_path_column(self.images)
         self.labels = _standardize_id_column(pd.read_parquet(labels_fp))
 
+
         sample = self.images["cxr_path"].dropna().astype(str)
         sample = sample[sample.str.strip().ne("")]
 
         if len(sample) > 0:
-            testp = resolve_image_path(sample.iloc[0], self.root)  # self.root is args.data_root
+            testp = resolve_image_path(sample.iloc[0], self.root)  
             if not os.path.exists(testp):
                 raise RuntimeError(
                     f"[ICUStayDataset] Image root mismatch.\n"
@@ -1002,18 +981,19 @@ class ICUStayDataset(Dataset):
                 )
 
 
+        # unify stay_id dtype
         for attr in ["struct", "notes", "images", "labels"]:
             df = getattr(self, attr)
             if "stay_id" in df.columns:
                 df["stay_id"] = df["stay_id"].astype(int)
 
+        # structured feature columns
         base_cols = {"stay_id", "hour"}
         self.feat_cols: List[str] = [c for c in self.struct.columns if c not in base_cols]
         self.feat_cols.sort()
         if hasattr(CFG, "structured_feat_cols") and CFG.structured_feat_cols:
             self.feat_cols = list(CFG.structured_feat_cols)
         else:
-            # fallback: numeric-only, exclude obvious ID columns
             exclude = {"stay_id", "hour", "subject_id", "hadm_id", "icustay_id"}
             self.feat_cols = [
                 c for c in self.struct.columns
@@ -1021,6 +1001,7 @@ class ICUStayDataset(Dataset):
             ]
         self.feat_cols.sort()
 
+        # notes schema: text chunks OR pretokenized ids/masks
         self.notes_mode, self.note_a_cols, self.note_b_cols = _detect_notes_schema(self.notes)
         if self.notes_mode == "text":
             self.chunk_cols = self.note_a_cols
@@ -1046,7 +1027,6 @@ class ICUStayDataset(Dataset):
 
         # notes ids with actual usable content
         if self.notes_mode == "text":
-            # any non-empty chunk_* across the row
             nonempty = np.zeros(len(self.notes), dtype=bool)
             for c in self.chunk_cols:
                 if c in self.notes.columns:
@@ -1097,9 +1077,7 @@ class ICUStayDataset(Dataset):
         )
 
         split_img_candidates = split_img_candidates & ids_set  # limit to split ids
-
         img_ids = set([sid for sid in split_img_candidates if _has_existing_image(sid)])
-
 
         print(f"[dataset:{split}] ids_set={len(ids_set)}")
         print(f"[dataset:{split}] struct_ids={len(struct_ids)}")
@@ -1107,7 +1085,11 @@ class ICUStayDataset(Dataset):
         print(f"[dataset:{split}] note_ids={len(note_ids)}")
         print(f"[dataset:{split}] img_ids={len(img_ids)}")
 
+
+        # Always require structured + labels
         keep_ids = ids_set & struct_ids & label_ids & img_ids & note_ids
+
+
         dropped_total = len(ids_set) - len(keep_ids)
         dropped_no_notes = len(ids_set & struct_ids & label_ids & img_ids) - len(keep_ids)
         self.ids = sorted(list(keep_ids))
@@ -1117,6 +1099,7 @@ class ICUStayDataset(Dataset):
         if len(self.ids) == 0:
             raise RuntimeError(f"[ICUStayDataset] After filtering, split '{self.split}' is empty.")
 
+        # small summary
         print(
             f"[dataset:{split}] root={root} ids={len(self.ids)} "
             f"| struct rows={len(self.struct)} (F={len(self.feat_cols)}) "
@@ -1129,6 +1112,9 @@ class ICUStayDataset(Dataset):
         return len(self.ids)
 
     def audit_images(self, n: int = 200, seed: int = 0) -> None:
+        """
+        Checks raw cxr_path values, resolved paths, extensions, and existence.
+        """
         rng = np.random.default_rng(seed)
         ids = self.ids if len(self.ids) > 0 else self.images["stay_id"].astype(int).unique().tolist()
         if len(ids) == 0:
@@ -1136,6 +1122,7 @@ class ICUStayDataset(Dataset):
             return
 
         pick = ids if len(ids) <= n else rng.choice(ids, size=n, replace=False).tolist()
+
         total = ok = bad_ext = missing = empty = 0
         exts = {}
 
@@ -1150,6 +1137,7 @@ class ICUStayDataset(Dataset):
                 continue
 
             cand = [resolve_image_path(p, self.root) for p in raw_paths]
+
             for p in cand:
                 ext = os.path.splitext(p.lower())[1]
                 exts[ext] = exts.get(ext, 0) + 1
@@ -1222,7 +1210,6 @@ class ICUStayDataset(Dataset):
             attn_chunks: List[List[int]] = []
 
             for j, (c_id, c_m) in enumerate(zip(self.input_id_cols, self.attn_mask_cols)):
-                # If we know how many chunks are real, stop early
                 if n_chunks > 0 and j >= n_chunks:
                     break
 
@@ -1325,7 +1312,6 @@ def load_cxr_tensor(paths: List[str], tfms: T.Compose, return_path: bool = False
 
     try:
         if ext == ".dcm":
-            # Optional DICOM support
             try:
                 import pydicom
                 ds = pydicom.dcmread(p_full)
@@ -1343,7 +1329,10 @@ def load_cxr_tensor(paths: List[str], tfms: T.Compose, return_path: bool = False
         else:
             img = Image.open(p_full)
 
+        # Make sure PIL image is in a consistent mode
+        # (your transforms start with Grayscale->3ch; still good to ensure load works)
         img = img.convert("RGB")
+
         tensor = tfms(img)
 
     except Exception as e:
@@ -1401,18 +1390,15 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
             imgs_list.append(img_t)
             img_paths_list.append(path)
         imgs_batch = torch.stack(imgs_list, dim=0)
-        # Quick health check: detect if images are all zeros (means load failures)
+        # Quick health check: detect if images are all zeros 
         if not first_print["done"]:
             zero_frac = float((imgs_batch.abs().sum(dim=(1,2,3)) == 0).float().mean().item())
             print(f"[collate] image_zero_fraction(first batch) = {zero_frac:.3f}")
             print(f"[collate] xL_batch: {tuple(xL_batch.shape)} | ...")
             first_print["done"] = True
 
-
         y_batch = torch.stack([b["y"].float().view(-1) for b in batch], dim=0)
-
         dbg = {"stay_ids": [b["stay_id"] for b in batch], "img_paths": img_paths_list}
-
         return xL_batch, mL_batch, notes_batch, imgs_batch, y_batch, dbg
 
     return _collate
@@ -1420,11 +1406,6 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
 
 @torch.no_grad()
 def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
-    """
-    notes is expected to be the collated notes_batch:
-      - List[{"mode":"text","chunks":[...]}]  OR
-      - List[{"mode":"pretokenized","input_ids":[[...],...],"attention_mask":[[...],...]}]
-    """
     B, T, F = xL.shape
     k = min(k, B)
 
@@ -1461,7 +1442,6 @@ def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
                 n_chunks = len(ids_chunks)
                 if n_chunks > 0:
                     first = ids_chunks[0]
-                    # first might already be list[int] here (CPU python list), but be defensive
                     first_list = list(first) if hasattr(first, "__iter__") else []
                     note_preview = (
                         f"<pretokenized: chunks={n_chunks}, len0={len(first_list)}, "
@@ -1472,22 +1452,18 @@ def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
 
             else:
                 note_preview = f"<unknown notes mode: {mode}>"
-
         except Exception as e:
             note_preview = f"<notes preview failed: {type(e).__name__}: {e}>"
-
         print(
             f"  • stay_id={sid} | ehr_rows(first2->first5feats)={ehr_rows} | "
             f'notes_preview="{note_preview}" | cxr="{imgp}"'
         )
-
     print("[sample-inspect] ---------------------------\n")
 
 def _enc_forward(enc, *args, **kwargs):
     try:
         return enc(*args, **kwargs)
     except TypeError as e:
-        # remove kwargs that some encoders don't support
         for k in ["return_seq", "return_attn", "return_mask"]:
             if k in kwargs:
                 kwargs.pop(k, None)
@@ -1527,12 +1503,6 @@ def _safe_tensor(x: torch.Tensor, name: str = "") -> torch.Tensor:
 
 
 def _ensure_encoder_dict(out, name: str, mask_fallback: Optional[torch.Tensor] = None):
-    """
-    Normalize encoder outputs to dict: {"seq","pool","mask"}.
-    Supports:
-      - dict already (pass-through)
-      - tensor (treated as pooled embedding)
-    """
     if isinstance(out, dict):
         return out
 
@@ -1552,7 +1522,6 @@ def _ensure_encoder_dict(out, name: str, mask_fallback: Optional[torch.Tensor] =
     raise TypeError(f"[{name}] unsupported encoder output type: {type(out)}")
 
 def _sanitize_encoder_out(out: Dict[str, torch.Tensor], name: str) -> Dict[str, torch.Tensor]:
-    # out has keys: "seq", "pool", "mask" (mask may be float/bool)
     out2 = dict(out)
 
     if "seq" in out2 and out2["seq"] is not None:
@@ -1612,7 +1581,7 @@ def evaluate_epoch(
         imgs = imgs.to(DEVICE, non_blocking=True)
         y   = y.to(DEVICE,   non_blocking=True)
 
-        # Encoders under autocast
+        # (A) Encoders under autocast
         with amp_ctx_enc:
             outL = _enc_forward(behrt, xL, mask=mL, return_seq=True)
             outN = _enc_forward(bbert, prepare_notes_batch(notes), return_seq=True)
@@ -1626,7 +1595,7 @@ def evaluate_epoch(
         outN = _sanitize_encoder_out(outN, "eval.N")
         outI = _sanitize_encoder_out(outI, "eval.I")
 
-        # Capsule forward + loss in FP32
+        # (B) Capsule forward + loss in FP32
         with amp_ctx_caps:
             z = {"L": outL, "N": outN, "I": outI}
             route_mask = torch.ones(xL.size(0), N_ROUTES, device=DEVICE, dtype=torch.float32)
@@ -1640,7 +1609,6 @@ def evaluate_epoch(
             logits, prim_acts, route_embs = out[0], out[1], out[2]
             routing_coef = out[3] if len(out) > 3 else None
 
-            # enforce correct normalization + shape (always) 
             if routing_coef is not None:
                 routing_coef, info = normalize_routing_coef_auto(routing_coef, expect_routes=N_ROUTES)
 
@@ -1668,7 +1636,6 @@ def evaluate_epoch(
             logits    = _safe_tensor(logits.float(),    "eval.logits(fp32)")
             prim_acts = _safe_tensor(prim_acts.float(), "eval.prim_acts(fp32)")
 
-            # accumulate routing coef stats (use the possibly-corrected routing_coef)
             if routing_coef is not None:
                 has_routing = True
                 rc = routing_coef.detach().float().cpu()   # [B, N_ROUTES, K]
@@ -1744,6 +1711,7 @@ def evaluate_epoch(
 
     return avg_loss, avg_acc, avg_act_dict, avg_rc_mat, avg_effective_mat, avg_pa
 
+
 def save_checkpoint(path: str, state: Dict):
     ensure_dir(os.path.dirname(path))
     torch.save(state, path)
@@ -1761,12 +1729,13 @@ def load_checkpoint(path: str, behrt, bbert, imgenc, fusion, projector, cap_head
     print(f"[ckpt] loaded epoch={ckpt.get('epoch', 0)} val_acc={ckpt.get('val_acc', -1):.4f}")
     return int(ckpt.get("epoch", 0))
 
+
 @torch.no_grad()
 def collect_epoch_logits(
     loader,
     behrt, bbert, imgenc, fusion, projector, cap_head,
-    amp_ctx_enc,   # <-- NEW
-    amp_ctx_caps,  # <-- NEW
+    amp_ctx_enc,   
+    amp_ctx_caps,  
 ):
     """
     Collect raw logits (NOT sigmoid) and y_true for temperature scaling & calibration.
@@ -1787,7 +1756,7 @@ def collect_epoch_logits(
         imgs = imgs.to(DEVICE, non_blocking=True)
         y   = y.to(DEVICE,   non_blocking=True)
 
-        # Encoders under autocast
+        # (A) Encoders under autocast
         with amp_ctx_enc:
             outL = _enc_forward(behrt, xL, mask=mL, return_seq=True)
             outN = _enc_forward(bbert, prepare_notes_batch(notes), return_seq=True)
@@ -1801,7 +1770,7 @@ def collect_epoch_logits(
         outN = _sanitize_encoder_out(outN, "collect_logits.N")
         outI = _sanitize_encoder_out(outI, "collect_logits.I")
 
-        # Capsule in fp32
+        # (B) Capsule in fp32
         with amp_ctx_caps:
             out = _capsule_forward_safe(
                 {"L": outL, "N": outN, "I": outI},
@@ -1833,6 +1802,7 @@ def fit_temperature_scalar_from_val(
     val_logits_t = torch.tensor(val_logits, dtype=torch.float32, device=DEVICE)
     val_y_t      = torch.tensor(val_y_true, dtype=torch.float32, device=DEVICE)
 
+    # optimize logT so T is always positive
     logT = torch.zeros((), device=DEVICE, requires_grad=True)
 
     opt = torch.optim.Adam([logT], lr=lr)
@@ -1871,7 +1841,7 @@ def sigmoid_np(x: np.ndarray) -> np.ndarray:
 def collect_epoch_outputs(
     loader,
     behrt, bbert, imgenc, fusion, projector, cap_head,
-    amp_ctx_enc,   
+    amp_ctx_enc,  
     amp_ctx_caps,  
 ):
     behrt.eval()
@@ -1886,7 +1856,6 @@ def collect_epoch_outputs(
         imgs = imgs.to(DEVICE, non_blocking=True)
         y   = y.to(DEVICE,   non_blocking=True)
 
-        # Encoders under autocast
         with amp_ctx_enc:
             outL = _enc_forward(behrt, xL, mask=mL, return_seq=True)
             outN = _enc_forward(bbert, prepare_notes_batch(notes), return_seq=True)
@@ -1901,7 +1870,6 @@ def collect_epoch_outputs(
         outI = _sanitize_encoder_out(outI, "collect.I")
 
 
-        # Capsule in fp32
         with amp_ctx_caps:
             out = _capsule_forward_safe(
                 {"L": outL, "N": outN, "I": outI},
@@ -2202,7 +2170,10 @@ def generate_split_heatmaps_and_tables(
     amp_ctx_caps,
     label_names: List[str],
     ckpt_dir: str,
+    T_cal: Optional[float] = None,          
+    thr_val: Optional[np.ndarray] = None,
 ):
+
     """
     Creates & saves (TRAIN/TEST only):
       1) Primary activations heatmap (1xN_ROUTES)  [raw + norm saved/printed]
@@ -2216,7 +2187,6 @@ def generate_split_heatmaps_and_tables(
     out_dir = os.path.join(ckpt_dir, "heatmaps", split_name.lower())
     os.makedirs(out_dir, exist_ok=True)
 
-    # Get routing stats (primary acts, routing coeff, effective)
     dummy_bce = nn.BCEWithLogitsLoss(reduction="mean")
     loss, acc, act_dict, rc_mat, eff_mat, pa_vec = evaluate_epoch(
         behrt, bbert, imgenc, fusion, projector, cap_head,
@@ -2232,24 +2202,35 @@ def generate_split_heatmaps_and_tables(
     if rc_mat is None or eff_mat is None:
         raise RuntimeError(f"[{split_name}] routing matrices are None; routing_coef not returned in forward.")
 
-    # Convert to heatmap-friendly orientation:
-    # We want phenotypes on rows (K) and routes on cols (N_ROUTES)
     K = rc_mat.shape[1]
     rc_k10  = rc_mat.T       # [K,N_ROUTES]
     eff_k10 = eff_mat.T      # [K,N_ROUTES]
 
-    # AUROC + prevalence from outputs
-    y_true, p, _ = collect_epoch_outputs(loader, behrt, bbert, imgenc, fusion, projector, cap_head, amp_ctx_enc, amp_ctx_caps)
-    prev = y_true.mean(axis=0)  # [K]
-    y_pred_05 = (p >= 0.5).astype(float)
-    m = epoch_metrics(y_true, p, y_pred_05)
-    auroc_per = m["AUROC_per_label"]  # [K] 
+    y_true_log, logits, _ = collect_epoch_logits(
+        loader, behrt, bbert, imgenc, fusion, projector, cap_head,
+        amp_ctx_enc, amp_ctx_caps
+    )
 
-    # Replace NaNs with 0.0 for visualization stability 
+    prev = y_true_log.mean(axis=0)  # [K]
+
+    if T_cal is not None:
+        p = sigmoid_np(apply_temperature(logits, float(T_cal)))
+    else:
+        p = sigmoid_np(logits)
+
+    if thr_val is not None:
+        thr_val = np.asarray(thr_val, dtype=np.float32).reshape(-1)
+        y_pred = (p >= thr_val[np.newaxis, :]).astype(float)
+    else:
+        y_pred = (p >= 0.5).astype(float)
+
+    m = epoch_metrics(y_true_log, p, y_pred)
+
+    auroc_per = m["AUROC_per_label"]  # [K] may include NaN
+
     auroc_vis = np.nan_to_num(auroc_per, nan=0.0).astype(np.float32)
     prev_vis  = np.nan_to_num(prev,      nan=0.0).astype(np.float32)
 
-    # Primary activations (1xN_ROUTES)
     pa_norm, _, _ = save_array_with_versions(
         pa_vec, out_dir, f"{split_name.lower()}_primary_activations",
         row_names=None, col_names=routes,
@@ -2262,7 +2243,6 @@ def generate_split_heatmaps_and_tables(
         fontsize_cell=12, fontsize_ticks=11
     )
 
-    # Effective weights (KxN_ROUTES)
     eff_norm, _, _ = save_array_with_versions(
         eff_k10, out_dir, f"{split_name.lower()}_effective_weights_kxN_ROUTES",
         row_names=label_names, col_names=routes,
@@ -2280,7 +2260,6 @@ def generate_split_heatmaps_and_tables(
         fontsize_ticks=9
     )
 
-    # Mean routing coeff (KxN_ROUTES)
     rc_norm, _, _ = save_array_with_versions(
         rc_k10, out_dir, f"{split_name.lower()}_mean_routing_coeff_kx10",
         row_names=label_names, col_names=routes,
@@ -2298,7 +2277,6 @@ def generate_split_heatmaps_and_tables(
         fontsize_ticks=9
     )
 
-    # AUROC per label (1xK)
     auroc_norm, _, _ = save_array_with_versions(
         auroc_per, out_dir, f"{split_name.lower()}_auroc_per_label",
         row_names=None, col_names=label_names,
@@ -2311,7 +2289,6 @@ def generate_split_heatmaps_and_tables(
         fontsize_cell=7, fontsize_ticks=7
     )
 
-    # Prevalence per label (1xK)
     prev_norm, _, _ = save_array_with_versions(
         prev, out_dir, f"{split_name.lower()}_prevalence_per_label",
         row_names=None, col_names=label_names,
@@ -2324,7 +2301,6 @@ def generate_split_heatmaps_and_tables(
         fontsize_cell=7, fontsize_ticks=7
     )
 
-    # Combined AUROC+Prevalence (2xK)
     combo_raw = np.vstack([auroc_vis.reshape(1, -1), prev_vis.reshape(1, -1)])  # [2,K]
     combo_norm, _, _ = save_array_with_versions(
         combo_raw, out_dir, f"{split_name.lower()}_auroc_and_prevalence_2xk",
@@ -2360,7 +2336,7 @@ def main():
     import env_config as E
 
     E.load_cfg()                    
-    args = parse_args()            
+    args = parse_args()             
     apply_cli_overrides(args)
 
     global CFG, DEVICE
@@ -2377,23 +2353,23 @@ def main():
     cudnn.benchmark = True
     cudnn.deterministic = False   
 
-
     if hasattr(args, "finetune_text") and args.finetune_text:
         CFG.finetune_text = True
 
     print("[env_config] Device:", DEVICE)
     print("[env_config] CFG:", json.dumps(asdict(CFG), indent=2))
-
     global TOKENIZER, MAXLEN
     TOKENIZER = AutoTokenizer.from_pretrained(CFG.text_model_name)
     MAXLEN = int(_cfg("max_text_len", 512))
-
     print(f"[setup] DEVICE={DEVICE} | batch_size={args.batch_size} | epochs={args.epochs}")
 
+
     use_cuda = (str(DEVICE).startswith("cuda") and torch.cuda.is_available())
+
     precision = str(args.precision).lower()
     use_amp = use_cuda and (precision != "off")
 
+    # Encoder autocast only 
     if use_amp:
         if precision == "fp16":
             amp_ctx_enc = torch_amp.autocast(device_type="cuda", dtype=torch.float16)
@@ -2415,14 +2391,13 @@ def main():
     train_ds = ICUStayDataset(args.data_root, split="train")
     tri_ids = set(train_ds.ids)
 
-    # Class-balancing pos_weight from TRAIN 
+    # Class-balancing pos_weight from TRAIN (tri-modal TRAIN only)
     train_label_df = (
         train_ds.labels[train_ds.labels["stay_id"].isin(tri_ids)]
         .loc[:, ["stay_id"] + train_ds.label_cols]
         .drop_duplicates(subset=["stay_id"], keep="first")
     )
     N_train = len(train_label_df)
-
 
     compute_split_prevalence(
         train_label_df[train_ds.label_cols].values,
@@ -2454,6 +2429,7 @@ def main():
     collate_eval  = collate_fn_factory(tidx=TASK_MAP[args.task], img_tfms=build_image_transform("val"))
     pin = use_cuda
 
+    # Deterministic DataLoader RNGs (shuffle order + worker randomness)
     g_train = torch.Generator()
     g_train.manual_seed(int(CFG.seed) + 123)
 
@@ -2527,8 +2503,8 @@ def main():
         print("[encoders] Bio_ClinicalBERT frozen (feature extractor mode)")
 
     # Fusions + capsule head
-    feature_mode = str(getattr(CFG, "feature_mode", "seq"))
-    fusion = build_fusions(d=CFG.d, feature_mode=feature_mode, p_drop=CFG.dropout)
+    fusion = build_fusions(d=CFG.d, p_drop=CFG.dropout)
+
 
     for k in fusion.keys():
         fusion[k].to(DEVICE)
@@ -2554,7 +2530,7 @@ def main():
     enc_params: List[torch.nn.Parameter] = []
     head_params: List[torch.nn.Parameter] = []
 
-    # encoders (these are the ones we warm up / freeze)
+    # encoders 
     enc_params += [p for p in behrt.parameters() if p.requires_grad]
     enc_params += [p for p in imgenc.parameters() if p.requires_grad]
 
@@ -2592,7 +2568,6 @@ def main():
 
     printed_once = False
 
-
     route_dropout_p       = float(_cfg("route_dropout_p", 0.0))
     routing_warmup_epochs = int(_cfg("routing_warmup_epochs", 5))
 
@@ -2603,8 +2578,6 @@ def main():
     route_uniform_lambda        = float(_cfg("route_uniform_lambda", 0.0))
     route_uniform_warmup_epochs = int(_cfg("route_uniform_warmup_epochs", 0))
 
-
-    # clamp
     routing_warmup_epochs        = max(0, int(routing_warmup_epochs))
     route_entropy_warmup_epochs  = max(0.0, float(route_entropy_warmup_epochs))
     route_uniform_warmup_epochs = max(0, route_uniform_warmup_epochs)
@@ -2620,7 +2593,7 @@ def main():
     epochs_no_improve = 0
 
     patience_epochs = int(_cfg("patience_epochs", 5))     
-    min_delta       = float(_cfg("min_delta", 1e-4))       
+    min_delta       = float(_cfg("min_delta", 1e-4))      
     min_epochs      = int(_cfg("min_epochs", 20))         
 
     patience_epochs = max(1, patience_epochs)
@@ -2648,11 +2621,7 @@ def main():
 
         behrt.train()
         imgenc.train()
-
-        # wrapper always in train mode 
         bbert.train()
-
-        # but if backbone is frozen, keep backbone in eval
         if getattr(bbert, "bert", None) is not None:
             if CFG.finetune_text:
                 bbert.bert.train()
@@ -2704,7 +2673,6 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
-
             with amp_ctx_caps:
                 B = xL.size(0)
                 route_mask = torch.ones(B, N_ROUTES, device=DEVICE, dtype=torch.float32)
@@ -2732,23 +2700,18 @@ def main():
 
                 if routing_coef is not None:
                     routing_coef, info = normalize_routing_coef_auto(routing_coef, expect_routes=N_ROUTES)
-
                     assert routing_coef is not None and routing_coef.ndim == 3, \
                         f"routing_coef must be 3D [B,R,K], got {None if routing_coef is None else tuple(routing_coef.shape)}"
-
                     assert int(routing_coef.shape[1]) == int(N_ROUTES), \
                         f"routing_coef must be [B,{N_ROUTES},K], got {tuple(routing_coef.shape)}"
-
                     if (epoch == start_epoch) and (step == 0):
                         print("[routing_norm][TRAIN]", info)
-
                     if bool(getattr(args, "route_debug", False)) and (epoch == start_epoch) and (step == 0):
                         debug_routing_tensor(
                             routing_coef,
                             name="TRAIN.routing_coef_postnorm",
                             expect_routes=N_ROUTES,
                         )
-
                     if bool(getattr(args, "route_debug", False)) and (epoch == start_epoch) and (step == 0):
                         debug_routing_tensor(
                             routing_coef,
@@ -2756,7 +2719,6 @@ def main():
                             expect_routes=N_ROUTES,
                             expect_k=int(y.size(1))
                         )
-
                 logits    = _safe_tensor(logits.float(),     "logits(fp32)")
                 prim_acts = _safe_tensor(prim_acts.float(), "prim_acts(fp32)")
 
@@ -2768,14 +2730,16 @@ def main():
 
                 loss = bce(logits, y.float())
 
-                cur_epoch = float(epoch + 1)  
+                cur_epoch = float(epoch + 1) 
 
+                # Entropy bonus (only during warmup window)
                 if route_entropy_lambda > 0.0 and (cur_epoch <= route_entropy_warmup_epochs):
                     pa = prim_acts / (prim_acts.sum(dim=1, keepdim=True) + 1e-6)
                     pa = torch.clamp(pa, 1e-6, 1.0)
                     H = -(pa * pa.log()).sum(dim=1).mean()
                     loss = loss - route_entropy_lambda * H
 
+                # Uniform bonus (only during warmup window)
                 if route_uniform_lambda > 0.0 and (cur_epoch <= route_uniform_warmup_epochs):
                     pa_dist = prim_acts / (prim_acts.sum(dim=1, keepdim=True) + 1e-6)
                     p_mean = pa_dist.mean(dim=0)
@@ -2785,7 +2749,6 @@ def main():
 
 
             grad_clip = float(_cfg("grad_clip", 0.3))
-
             if not torch.isfinite(loss):
                 print(f"[skip] non-finite loss at epoch={epoch+1} step={step+1} -> skip")
                 safe_zero_grad(optimizer)
@@ -2795,41 +2758,24 @@ def main():
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
-
-                # bring grads to fp32 before clipping/checking
                 scaler.unscale_(optimizer)
-
-                # clip
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=grad_clip)
-
-                # check grads
                 if not grads_are_finite(trainable_params):
                     print(f"[skip] non-finite grads (AMP) at epoch={epoch+1} step={step+1} -> skip")
                     safe_zero_grad(optimizer)
                     continue
 
-                # step
                 scaler.step(optimizer)
                 scaler.update()
-
             else:
                 loss.backward()
-
-                # clip
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=grad_clip)
-
-                # check grads
                 if not grads_are_finite(trainable_params):
                     print(f"[skip] non-finite grads at epoch={epoch+1} step={step+1} -> skip")
                     safe_zero_grad(optimizer)
                     continue
-
                 optimizer.step()
-
             safe_zero_grad(optimizer)
-
-
-            # Log running stats
             total_loss += float(loss.item()) * y.size(0)
 
             probs = torch.sigmoid(logits)
@@ -2839,7 +2785,6 @@ def main():
 
             act_sum += prim_acts.detach().cpu().sum(dim=0)
             num_samples += y.size(0)
-
 
             if args.log_every > 0 and ((step + 1) % args.log_every == 0):
                 avg_loss_step = total_loss / max(1, num_samples)
@@ -2855,9 +2800,8 @@ def main():
                         f"{r}:{avg_act[i]:.3f}" for i, r in enumerate(routes)
                     )
                 )
-
-
                 if routing_coef is not None:
+                    # routing_coef is guaranteed [B,R,K] from the asserts above
                     rc_route_mean = routing_coef.detach().float().mean(dim=(0, 2))  # [R]
                     rc_route_mean = rc_route_mean.cpu().tolist()
 
@@ -2896,11 +2840,11 @@ def main():
             routing_out_dir=os.path.join(ckpt_dir, "routing"),
         )
 
-
         # Routing importance: global and per-phenotype (VAL) 
         routes = ["L","N","I","LN","NL","LI","IL","NI","IN","LNI"]
 
         if val_rc_mat is not None:
+            # Data-derived mean routing coefficients per route (averaged over phenotypes)
             rc_mean_val = val_rc_mat.mean(axis=1)   # [N_ROUTES]
             print("\n[epoch %d] [VAL] mean routing coefficient per route (data-derived):" % (epoch + 1))
             for i, r in enumerate(routes):
@@ -2917,7 +2861,6 @@ def main():
                     for k in range(K)
                 )
                 print(f"  {r}: {row}")
-            # also print per-phenotype EFFECTIVE weights:
             if val_eff_mat is not None and val_eff_mat.shape == val_rc_mat.shape:
                 print("\n[epoch %d] [VAL] per-route, per-phenotype routing importance (EFFECTIVE = rc × primary_act):" % (epoch + 1))
                 for i, r in enumerate(routes):
@@ -3014,7 +2957,6 @@ def main():
                     f"→ not counting patience yet."
                 )
 
-
         # Calibration
         ece, centers, bconf, bacc, bcnt = expected_calibration_error(
             p1.reshape(-1), y_true.reshape(-1), n_bins=args.calib_bins
@@ -3039,8 +2981,8 @@ def main():
             "projector": projector.state_dict(),
             "cap_head": cap_head.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "val_acc": float(val_acc),  # this is still useful to store
-            "val_auroc": float(val_score),    # ✅ store what you select on
+            "val_acc": float(val_acc),  
+            "val_auroc": float(val_score),    
             "best_thr": torch.from_numpy(best_thr.astype(np.float32)),
         }
         save_checkpoint(os.path.join(ckpt_dir, "last.pt"), ckpt)
@@ -3075,18 +3017,15 @@ def main():
         f"avg_prim_act={', '.join(f'{k}:{v:.3f}' for k, v in test_act.items())}"
     )
 
-
     # Routing importance: global and per-phenotype (TEST) 
     routes = ["L","N","I","LN","NL","LI","IL","NI","IN","LNI"]
 
     if test_rc_mat is not None:
-        # Data-derived mean routing coefficients per route (averaged over phenotypes)
         rc_mean_test = test_rc_mat.mean(axis=1)
         print("\n[TEST] mean routing coefficient per route (data-derived):")
         for i, r in enumerate(routes):
             print(f"  rc_mean_{r} = {rc_mean_test[i]:.4f}")
 
-        # Per-route, per-phenotype routing importance on TEST (N_ROUTES x K)
         K = test_rc_mat.shape[1]
         pheno_names = [get_pheno_name(i) for i in range(K)]
 
@@ -3124,17 +3063,14 @@ def main():
         amp_ctx_enc, amp_ctx_caps
     )
 
-    # Fit temperature on VAL only 
+    # Fit temperature on VAL only (post-hoc, no training change)
     T_star = fit_temperature_scalar_from_val(logits_v, y_true_v_log, max_iter=300, lr=0.05)
     print(f"[calibration] Fitted temperature on VAL only: T={T_star:.4f}")
 
-    # Threshold selection (VAL only, frozen) 
-    p_v = sigmoid_np(apply_temperature(logits_v, T_star))  
+    p_v = sigmoid_np(apply_temperature(logits_v, T_star))  # use calibrated probs for threshold search
     prev_val = compute_split_prevalence(y_true_v_log, split_name="VAL", label_names=label_names)
     thr_val, f1_val_thr = grid_search_thresholds(y_true_v_log, p_v, n_steps=101)
     save_split_thresholds(thr_val, ckpt_dir, split_name="VAL")  
-
-    # Collect TEST logits 
     y_true_t_log, logits_t, _ = collect_epoch_logits(
         test_loader, behrt, bbert, imgenc, fusion, projector, cap_head, amp_ctx_enc, amp_ctx_caps
     )
@@ -3152,7 +3088,6 @@ def main():
         f"AUPRC={mt['AUPRC']:.4f} F1={mt['F1']:.4f} Recall={mt['Recall']:.4f}"
     )
 
-    # ECE reporting (uncalibrated vs calibrated) 
     ece_unc, centers_unc, bconf_unc, bacc_unc, _ = expected_calibration_error(
         p_test_uncal.reshape(-1), y_true_t_log.reshape(-1), n_bins=args.calib_bins
     )
@@ -3176,6 +3111,8 @@ def main():
         amp_ctx_caps=amp_ctx_caps,
         label_names=label_names,
         ckpt_dir=ckpt_dir,
+        T_cal=T_star,         
+        thr_val=thr_val,      
     )
 
     generate_split_heatmaps_and_tables(
@@ -3187,8 +3124,9 @@ def main():
         amp_ctx_caps=amp_ctx_caps,
         label_names=label_names,
         ckpt_dir=ckpt_dir,
+        T_cal=T_star,        
+        thr_val=thr_val,      
     )
-
 
 if __name__ == "__main__":
     main()
