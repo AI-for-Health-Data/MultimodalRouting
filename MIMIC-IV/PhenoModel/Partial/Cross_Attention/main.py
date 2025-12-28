@@ -44,7 +44,26 @@ from routing_and_heads import (
 )
 
 ROUTE_NAMES = ["L", "N", "I", "LN", "NL", "LI", "IL", "NI", "IN", "LNI"]
-N_ROUTES = len(ROUTE_NAMES) 
+N_ROUTES = len(ROUTE_NAMES)
+
+def build_route_mask_from_modalities(hasN: torch.Tensor, hasI: torch.Tensor) -> torch.Tensor:
+    """
+    hasN, hasI: [B] float/bool (1=available, 0=missing)
+    returns route_mask: [B, 10]
+    """
+    hasN = hasN.float()
+    hasI = hasI.float()
+    B = hasN.shape[0]
+    rm = torch.ones(B, N_ROUTES, device=hasN.device, dtype=torch.float32)
+
+    # Routes that require notes (N): N, LN, NL, NI, IN, LNI
+    n_idx = [1, 3, 4, 7, 8, 9]
+    # Routes that require image (I): I, LI, IL, NI, IN, LNI
+    i_idx = [2, 5, 6, 7, 8, 9]
+
+    rm[:, n_idx] *= hasN[:, None]
+    rm[:, i_idx] *= hasI[:, None]
+    return rm
 
 def grads_are_finite(param_list):
     for p in param_list:
@@ -739,6 +758,10 @@ def parse_args():
     ap.add_argument("--num_workers", type=int, default=_cfg("num_workers", 4))
     ap.add_argument("--finetune_text", action="store_true",
                     help="Unfreeze Bio_ClinicalBERT if set.")
+    ap.add_argument("--eval_drop_mode", type=str, default="none", choices=["none", "drop_notes", "drop_img", "drop_one_random"],
+                    help="Ablation: drop a modality at eval time (VAL/TEST).")
+    ap.add_argument("--eval_drop_p", type=float, default=1.0,
+                    help="Probability to apply eval drop per-sample (used when mode != none).")
     ap.add_argument("--resume", type=str, default="", help="Path to checkpoint (.pt).")
     ap.add_argument("--log_every", type=int, default=300,
                     help="Print training stats every N steps.")
@@ -1343,8 +1366,17 @@ def load_cxr_tensor(paths: List[str], tfms: T.Compose, return_path: bool = False
 
 
 
-def collate_fn_factory(tidx: int, img_tfms: T.Compose):
+def collate_fn_factory(
+    tidx: int,
+    img_tfms: T.Compose,
+    eval_drop_mode: str = "none",
+    eval_drop_p: float = 1.0,
+):
     first_print = {"done": False}
+    eval_drop_mode = str(eval_drop_mode).lower().strip()
+
+    def _empty_notes_like(note_obj: Dict[str, Any]) -> Dict[str, Any]:
+        return {"mode": "pretokenized", "input_ids": [], "attention_mask": []}
 
     def _collate(batch: List[Dict[str, Any]]):
         F_dim = int(CFG.structured_n_feats)
@@ -1354,18 +1386,14 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
         if T_len_cfg is not None and T_len_cfg > 0:
             T_len = T_len_cfg
         else:
-            # dynamic pad-to-batch-max when seq_len is -1 / unset
             T_len = max(int(b["x_struct"].shape[0]) for b in batch)
-            T_len = max(T_len, 1)  # safety
+            T_len = max(T_len, 1)
 
         xL_batch = torch.stack(
             [pad_or_trim_struct(b["x_struct"], T_len, F_dim) for b in batch], dim=0
         )
 
-        # mask: valid timesteps = any non-zero feature at that t
         mL_batch = (xL_batch.abs().sum(dim=2) > 0).float()
-
-        # safety: ensure mask not all-zero
         mask_sum = mL_batch.sum(dim=1)
         bad = (mask_sum == 0)
         if bad.any():
@@ -1373,36 +1401,66 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
             xL_batch[bad, -1, 0] = 1e-6
             print(f"[collate] fixed {int(bad.sum())} samples with empty structured mask")
 
+        # Start as "present"
+        B = len(batch)
+        hasN = torch.ones(B, dtype=torch.float32)
+        hasI = torch.ones(B, dtype=torch.float32)
 
-        # notes payloads are already in the exact format prepare_notes_batch expects
+        # Base payloads
         notes_batch = [b["notes"] for b in batch]
-        for b in notes_batch:
-            if b.get("mode") == "text":
-                assert len(b.get("chunks", [])) > 0, "[collate] empty text chunks"
-            else:
-                assert len(b.get("input_ids", [])) > 0, "[collate] empty pretokenized chunks"
 
+        # Load images (normal) first
         imgs_list, img_paths_list = [], []
         for b in batch:
-            assert len(b["image_paths"]) > 0 and str(b["image_paths"][-1]).strip(), \
-                "[collate] tri-modal strict: missing image path for a sample"
-            img_t, path = load_cxr_tensor(b["image_paths"], img_tfms, return_path=True)
+            paths = b.get("image_paths", []) or []
+            img_t, path = load_cxr_tensor(paths, img_tfms, return_path=True)
             imgs_list.append(img_t)
             img_paths_list.append(path)
         imgs_batch = torch.stack(imgs_list, dim=0)
-        # Quick health check: detect if images are all zeros 
+
+        if eval_drop_mode != "none" and float(eval_drop_p) > 0.0:
+            p = float(eval_drop_p)
+
+            for i in range(B):
+                if random.random() > p:
+                    continue
+
+                if eval_drop_mode == "drop_notes":
+                    hasN[i] = 0.0
+                    notes_batch[i] = _empty_notes_like(notes_batch[i])
+
+                elif eval_drop_mode == "drop_img":
+                    hasI[i] = 0.0
+                    imgs_batch[i].zero_()
+                    img_paths_list[i] = "<dropped-image>"
+
+                elif eval_drop_mode == "drop_one_random":
+                    if random.random() < 0.5:
+                        hasN[i] = 0.0
+                        notes_batch[i] = _empty_notes_like(notes_batch[i])
+                    else:
+                        hasI[i] = 0.0
+                        imgs_batch[i].zero_()
+                        img_paths_list[i] = "<dropped-image>"
+
         if not first_print["done"]:
             zero_frac = float((imgs_batch.abs().sum(dim=(1,2,3)) == 0).float().mean().item())
             print(f"[collate] image_zero_fraction(first batch) = {zero_frac:.3f}")
-            print(f"[collate] xL_batch: {tuple(xL_batch.shape)} | ...")
+            print(f"[collate] eval_drop_mode={eval_drop_mode} eval_drop_p={float(eval_drop_p):.3f}")
             first_print["done"] = True
 
         y_batch = torch.stack([b["y"].float().view(-1) for b in batch], dim=0)
-        dbg = {"stay_ids": [b["stay_id"] for b in batch], "img_paths": img_paths_list}
+
+        dbg = {
+            "stay_ids": [b["stay_id"] for b in batch],
+            "img_paths": img_paths_list,
+            "hasN": hasN.tolist(),
+            "hasI": hasI.tolist(),
+            "eval_drop_mode": eval_drop_mode,
+        }
         return xL_batch, mL_batch, notes_batch, imgs_batch, y_batch, dbg
 
     return _collate
-
 
 @torch.no_grad()
 def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
@@ -1598,7 +1656,9 @@ def evaluate_epoch(
         # (B) Capsule forward + loss in FP32
         with amp_ctx_caps:
             z = {"L": outL, "N": outN, "I": outI}
-            route_mask = torch.ones(xL.size(0), N_ROUTES, device=DEVICE, dtype=torch.float32)
+            hasN = torch.tensor(dbg.get("hasN", [1.0] * xL.size(0)), device=DEVICE, dtype=torch.float32)
+            hasI = torch.tensor(dbg.get("hasI", [1.0] * xL.size(0)), device=DEVICE, dtype=torch.float32)
+            route_mask = build_route_mask_from_modalities(hasN, hasI)
 
             out = _capsule_forward_safe(
                 z, fusion, projector, cap_head,
@@ -1772,13 +1832,30 @@ def collect_epoch_logits(
 
         # (B) Capsule in fp32
         with amp_ctx_caps:
+            B = xL.size(0)
+
+            hasN = torch.tensor(
+                dbg.get("hasN", [1.0] * B),
+                device=DEVICE,
+                dtype=torch.float32,
+            )
+            hasI = torch.tensor(
+                dbg.get("hasI", [1.0] * B),
+                device=DEVICE,
+                dtype=torch.float32,
+            )
+
+            route_mask = build_route_mask_from_modalities(hasN, hasI)
+
             out = _capsule_forward_safe(
                 {"L": outL, "N": outN, "I": outI},
                 fusion, projector, cap_head,
-                route_mask=torch.ones(xL.size(0), N_ROUTES, device=DEVICE, dtype=torch.float32),
-                act_temperature=1.0, detach_priors=False, return_routing=False
+                route_mask=route_mask,
+                act_temperature=1.0,
+                detach_priors=False,
+                return_routing=True,
             )
-            logits = _safe_tensor(out[0].float(), "collect_logits.logits(fp32)")
+            logits = _safe_tensor(out[0].float(), "collect.logits(fp32)")
 
         ys.append(y.detach().cpu())
         ls.append(logits.detach().cpu())
@@ -1870,12 +1947,30 @@ def collect_epoch_outputs(
         outI = _sanitize_encoder_out(outI, "collect.I")
 
 
+        # (B) Capsule in fp32
         with amp_ctx_caps:
+            B = xL.size(0)
+
+            hasN = torch.tensor(
+                dbg.get("hasN", [1.0] * B),
+                device=DEVICE,
+                dtype=torch.float32,
+            )
+            hasI = torch.tensor(
+                dbg.get("hasI", [1.0] * B),
+                device=DEVICE,
+                dtype=torch.float32,
+            )
+
+            route_mask = build_route_mask_from_modalities(hasN, hasI)
+
             out = _capsule_forward_safe(
                 {"L": outL, "N": outN, "I": outI},
                 fusion, projector, cap_head,
-                route_mask=torch.ones(xL.size(0), N_ROUTES, device=DEVICE, dtype=torch.float32),
-                act_temperature=1.0, detach_priors=False, return_routing=True
+                route_mask=route_mask,
+                act_temperature=1.0,
+                detach_priors=False,
+                return_routing=True,
             )
             logits = _safe_tensor(out[0].float(), "collect.logits(fp32)")
 
@@ -2426,7 +2521,12 @@ def main():
     print("[loss] BCEWithLogitsLoss with per-label pos_weight")
 
     collate_train = collate_fn_factory(tidx=TASK_MAP[args.task], img_tfms=build_image_transform("train"))
-    collate_eval  = collate_fn_factory(tidx=TASK_MAP[args.task], img_tfms=build_image_transform("val"))
+    collate_eval = collate_fn_factory(
+        tidx=TASK_MAP[args.task],
+        img_tfms=build_image_transform("val"),
+        eval_drop_mode=args.eval_drop_mode,
+        eval_drop_p=args.eval_drop_p,
+    )
     pin = use_cuda
 
     # Deterministic DataLoader RNGs (shuffle order + worker randomness)
