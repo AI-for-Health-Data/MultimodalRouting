@@ -1,48 +1,35 @@
 from __future__ import annotations
-
 import os
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-
 import json
 import random
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Any
-
 import numpy as np
 import torch
 import torch.nn as nn
-
 try:
-    import lightning as L  # optional
+    import lightning as L 
 except Exception:
     L = None
 try:
-    import yaml  # optional
+    import yaml  
 except Exception:
     yaml = None
 
 
 def configure_reproducibility(seed: int, deterministic: bool, cudnn_benchmark: bool) -> None:
-    """
-    Best-effort reproducibility setup.
-
-    Important: CUBLAS_WORKSPACE_CONFIG must be set BEFORE the first CUDA op.
-    Putting this in env_config (import-time / early in main) is ideal.
-    """
     if deterministic:
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
     try:
         torch.use_deterministic_algorithms(bool(deterministic))
     except Exception:
         pass
-
     torch.backends.cudnn.deterministic = bool(deterministic)
     torch.backends.cudnn.benchmark = False if deterministic else bool(cudnn_benchmark)
 
@@ -104,11 +91,14 @@ class Config:
     max_text_len: int = 512                  # per chunk token length
     notes_chunk_len: int = 512               # keep consistent with pretokenization
     notes_max_chunks: int = -1               # -1 => keep all chunks (whole stay)
+    bert_chunk_bs: int = 8
+
 
     # Structured
     feature_mode: str = "seq"   # "seq" or "pool" 
 
     structured_seq_len: int = -1             # -1 => keep all time bins (whole stay)
+    structured_pos_max_len: int = 2048
     structured_n_feats: int = 17
     structured_layers: int = 2
     structured_heads: int = 8
@@ -120,13 +110,26 @@ class Config:
     routing_backend: str = "cross_attn"
 
     use_gates: bool = True
-    # Routing / fusion bookkeeping
-    route_num: int = len(ROUTES)          # 10 (keeps in sync with ROUTES)
+
+    # NO-DROPOUT anti-collapse routing controls 
+    route_gate_temp: float = 3.0          # sigmoid temperature for primary activations
+    route_gate_min: float = 0.05          # clamp floor
+    route_gate_max: float = 0.95          # clamp ceiling
+
+    # Regularizers 
+    lambda_route_entropy: float = 0.01    # maximize entropy of routing coeff
+    lambda_route_balance: float = 0.10    # push effective usage toward uniform
+
+    # Optim stability
+    grad_clip_norm: float = 1.0           # stability
+
+    # Routing/fusion bookkeeping
+    route_num: int = len(ROUTES)          
 
     # Cross-attention fusion (for directed bimodal + tri)
     cross_attn_heads: int = 8
     cross_attn_dropout: float = 0.0
-    cross_attn_pool: str = "mean"        
+    cross_attn_pool: str = "mean"         # "mean" | "first"
 
     # Capsule head hyperparams
     capsule_pc_dim: int = 32
@@ -260,7 +263,7 @@ def _coerce_types(d: Dict[str, Any]) -> Dict[str, Any]:
                 return int(s)
             except ValueError:
                 try:
-                    return float(s)   
+                    return float(s)   # handles 1e-4, 2.0, etc.
                 except ValueError:
                     return x
         return x
@@ -311,6 +314,8 @@ def load_cfg(yaml_path: Optional[str] = None,
         "MIMICIV_MAX_TEXT_LEN": ("max_text_len", int),
         "MIMICIV_NOTES_CHUNK_LEN": ("notes_chunk_len", int),
         "MIMICIV_NOTES_MAX_CHUNKS": ("notes_max_chunks", int),
+        "MIMICIV_BERT_CHUNK_BS": ("bert_chunk_bs", int),
+
 
         "MIMICIV_STRUCT_SEQ_LEN": ("structured_seq_len", int),
         "MIMICIV_STRUCT_N_FEATS": ("structured_n_feats", int),
@@ -320,6 +325,14 @@ def load_cfg(yaml_path: Optional[str] = None,
         "MIMICIV_CROSS_ATTN_POOL": ("cross_attn_pool", str),
 
         "MIMICIV_USE_GATES": ("use_gates", lambda s: str(s).lower() in {"1","true","yes"}),
+        "MIMICIV_ROUTE_GATE_TEMP": ("route_gate_temp", float),
+        "MIMICIV_ROUTE_GATE_MIN": ("route_gate_min", float),
+        "MIMICIV_ROUTE_GATE_MAX": ("route_gate_max", float),
+
+        "MIMICIV_LAMBDA_ROUTE_ENTROPY": ("lambda_route_entropy", float),
+        "MIMICIV_LAMBDA_ROUTE_BALANCE": ("lambda_route_balance", float),
+
+        "MIMICIV_GRAD_CLIP_NORM": ("grad_clip_norm", float),
 
 
         "MIMICIV_CAP_PC_DIM": ("capsule_pc_dim", int),
@@ -365,6 +378,15 @@ def load_cfg(yaml_path: Optional[str] = None,
                 cfg_dict[cfg_key] = os.environ[env_key]
 
     CFG = Config(**cfg_dict)
+
+    # Backward/alias support: if user sets lambda_* but route_* are still zero, copy them.
+    if getattr(CFG, "route_entropy_lambda", 0.0) == 0.0 and getattr(CFG, "lambda_route_entropy", 0.0) > 0.0:
+        CFG.route_entropy_lambda = float(CFG.lambda_route_entropy)
+
+    if getattr(CFG, "route_uniform_lambda", 0.0) == 0.0 and getattr(CFG, "lambda_route_balance", 0.0) > 0.0:
+        CFG.route_uniform_lambda = float(CFG.lambda_route_balance)
+
+    # Sanity: keep route count consistent
     if CFG.routing_backend != "cross_attn":
         if CFG.verbose:
             print(f"[env_config] Warning: routing_backend={CFG.routing_backend}; forcing to 'cross_attn'.")
@@ -375,17 +397,16 @@ def load_cfg(yaml_path: Optional[str] = None,
         print(f"[env_config] Warning: route_num={CFG.route_num} but len(ROUTES)={len(ROUTES)}; forcing to {len(ROUTES)}.")
     CFG.route_num = len(ROUTES)
 
+
     # Cross-attention sanity checks
     if CFG.cross_attn_heads <= 0:
         if CFG.verbose:
             print("[env_config] Warning: cross_attn_heads must be > 0; setting to 8.")
         CFG.cross_attn_heads = 8
-
     if not (0.0 <= CFG.cross_attn_dropout < 1.0):
         if CFG.verbose:
             print("[env_config] Warning: cross_attn_dropout must be in [0,1); setting to 0.0.")
         CFG.cross_attn_dropout = 0.0
-
     if CFG.cross_attn_pool not in {"mean", "first"}:
         if CFG.verbose:
             print(f"[env_config] Warning: invalid cross_attn_pool={CFG.cross_attn_pool}; defaulting to 'mean'.")
@@ -422,40 +443,62 @@ def apply_cli_overrides(args) -> None:
         CFG.data_root = args.data_root
     if hasattr(args, "ckpt_root") and args.ckpt_root is not None:
         CFG.ckpt_root = args.ckpt_root
+
     if hasattr(args, "lr") and args.lr is not None:
         CFG.lr = float(args.lr)
     if hasattr(args, "batch_size") and args.batch_size is not None:
         CFG.batch_size = int(args.batch_size)
     if hasattr(args, "num_workers") and args.num_workers is not None:
         CFG.num_workers = int(args.num_workers)
+
     if hasattr(args, "precision") and args.precision is not None:
         CFG.precision_amp = str(args.precision)
+
     if hasattr(args, "structured_seq_len") and args.structured_seq_len is not None:
         CFG.structured_seq_len = int(args.structured_seq_len)
+
     if hasattr(args, "notes_max_chunks") and args.notes_max_chunks is not None:
         CFG.notes_max_chunks = int(args.notes_max_chunks)
+
     if hasattr(args, "notes_chunk_len") and args.notes_chunk_len is not None:
         CFG.notes_chunk_len = int(args.notes_chunk_len)
+
     if hasattr(args, "max_text_len") and args.max_text_len is not None:
         CFG.max_text_len = int(args.max_text_len)
+
+    if hasattr(args, "bert_chunk_bs") and args.bert_chunk_bs is not None:
+        CFG.bert_chunk_bs = int(args.bert_chunk_bs)
+
+
     if hasattr(args, "cross_attn_heads") and args.cross_attn_heads is not None:
         CFG.cross_attn_heads = int(args.cross_attn_heads)
+
     if hasattr(args, "cross_attn_dropout") and args.cross_attn_dropout is not None:
         CFG.cross_attn_dropout = float(args.cross_attn_dropout)
+
     if hasattr(args, "cross_attn_pool") and args.cross_attn_pool is not None:
         CFG.cross_attn_pool = str(args.cross_attn_pool)
+
     if hasattr(args, "use_gates") and args.use_gates is not None:
         CFG.use_gates = bool(args.use_gates)
+
     if hasattr(args, "epochs") and args.epochs is not None:
         CFG.max_epochs_tri = int(args.epochs)
+
     if hasattr(args, "route_dropout_p") and args.route_dropout_p is not None:
         CFG.route_dropout_p = float(args.route_dropout_p)
-    if hasattr(args, "route_entropy_lambda") and args.route_entropy_lambda is not None:
-        CFG.route_entropy_lambda = float(args.route_entropy_lambda)
+    if getattr(CFG, "route_entropy_lambda", 0.0) == 0.0 and getattr(CFG, "lambda_route_entropy", 0.0) > 0.0:
+        CFG.route_entropy_lambda = float(CFG.lambda_route_entropy)
+
+    if getattr(CFG, "route_uniform_lambda", 0.0) == 0.0 and getattr(CFG, "lambda_route_balance", 0.0) > 0.0:
+        CFG.route_uniform_lambda = float(CFG.lambda_route_balance)
+
     if hasattr(args, "route_entropy_warmup_epochs") and args.route_entropy_warmup_epochs is not None:
         CFG.route_entropy_warmup_epochs = int(args.route_entropy_warmup_epochs)
+
     if hasattr(args, "finetune_text") and getattr(args, "finetune_text"):
         CFG.finetune_text = True
+    
     CFG.route_num = len(ROUTES)
 
     ensure_dir(CFG.ckpt_root)
@@ -466,6 +509,7 @@ def get_pheno_name(idx: int) -> str:
     if 0 <= idx < len(PHENO_NAMES):
         return PHENO_NAMES[idx]
     return f"pheno_{idx:02d}"
+
 
 def get_device() -> torch.device:
     return torch.device(DEVICE)
