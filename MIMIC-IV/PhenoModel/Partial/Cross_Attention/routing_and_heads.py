@@ -201,12 +201,13 @@ def build_fusions(d: int, feature_mode: str = "seq", p_drop: float = 0.0):
             print(f"[build_fusions] invalid cross_attn_pool={pool}; using 'mean'")
         pool = "mean"
 
-    LN  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p_drop, pool=getattr(CFG, "cross_attn_pool", "mean")).to(dev)
-    NL  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p_drop, pool=getattr(CFG, "cross_attn_pool", "mean")).to(dev)
-    LI  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p_drop, pool=getattr(CFG, "cross_attn_pool", "mean")).to(dev)
-    IL  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p_drop, pool=getattr(CFG, "cross_attn_pool", "mean")).to(dev)
-    NI  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p_drop, pool=getattr(CFG, "cross_attn_pool", "mean")).to(dev)
-    IN  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p_drop, pool=getattr(CFG, "cross_attn_pool", "mean")).to(dev)
+    # Use p (from CFG) consistently, not p_drop
+    LN  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p, pool=pool).to(dev)
+    NL  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p, pool=pool).to(dev)
+    LI  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p, pool=pool).to(dev)
+    IL  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p, pool=pool).to(dev)
+    NI  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p, pool=pool).to(dev)
+    IN  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p, pool=pool).to(dev)
     LNI = TriTokenAttentionFusion(d, n_heads=h, attn_dropout=p).to(dev)
 
     return {"LN": LN, "NL": NL, "LI": LI, "IL": IL, "NI": NI, "IN": IN, "LNI": LNI}
