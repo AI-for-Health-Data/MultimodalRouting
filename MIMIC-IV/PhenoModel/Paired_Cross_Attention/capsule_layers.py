@@ -5,22 +5,6 @@ import numpy as np
 
 
 class CapsuleFC(nn.Module):
-    r"""
-    Fully-connected capsule layer with safe, symmetric initialization and routing-by-agreement.
-
-    Args:
-        in_n_capsules (int): Number of input capsules (N_in, e.g., 7 routes).
-        in_d_capsules (int): Dimensionality of each input capsule (A, e.g., pc_dim).
-        out_n_capsules (int): Number of output capsules (N_out, e.g., #classes).
-        out_d_capsules (int): Dimensionality of each output capsule (D, e.g., mc_caps_dim).
-        n_rank (int): Not used directly here (kept for API compatibility).
-        dp (float): Dropout rate (currently disabled, kept for API compatibility).
-        dim_pose_to_vote (int): Unused, kept for compatibility.
-        uniform_routing_coefficient (bool): If True, forces uniform routing (for debugging).
-        act_type (str): Activation/routing type, e.g. "EM", "Hubert", "ONES".
-        small_std (bool): Unused in this implementation (kept for compatibility).
-    """
-
     def __init__(
         self,
         in_n_capsules: int,
@@ -33,11 +17,16 @@ class CapsuleFC(nn.Module):
         uniform_routing_coefficient: bool = False,
         act_type: str = "EM",
         small_std: bool = False,
+        gate_temp: float = 1.0,
+        gate_min: float = 0.0,
+        gate_max: float = 1.0,
+        gate_eps: float = 1e-6,
     ):
+
         super(CapsuleFC, self).__init__()
 
         # Basic geometry
-        self.in_n_capsules = in_n_capsules      # N_in (10 routes)
+        self.in_n_capsules = in_n_capsules      # N_in (7 routes)
         self.in_d_capsules = in_d_capsules      # A (pc_dim)
         self.out_n_capsules = out_n_capsules    # N_out (#phenotypes)
         self.out_d_capsules = out_d_capsules    # D (mc_caps_dim)
@@ -58,7 +47,7 @@ class CapsuleFC(nn.Module):
             )
         )
 
-        # Dropout (currently disabled; kept for API compatibility)
+        # Dropout (currently disabled)
         self.dropout_rate = float(dp)
         self.drop = nn.Identity()
 
@@ -68,11 +57,18 @@ class CapsuleFC(nn.Module):
         # Scale factor used before softmax to keep logits in a reasonable range
         self.scale = 1.0 / (out_d_capsules ** 0.5)
 
-        # Routing / activation configuration
+        # Routing/activation configuration
         self.act_type = act_type
         self.uniform_routing_coefficient = bool(uniform_routing_coefficient)
 
-        # Parameters for different act_type modes 
+        # anti-collapse gate controls 
+        self.gate_temp = float(gate_temp)
+        self.gate_min = float(gate_min)
+        self.gate_max = float(gate_max)
+        self.gate_eps = float(gate_eps)
+
+
+        # Parameters for different act_type modes
         if act_type == "EM":
             # Symmetric, unbiased initialization (all capsules equal at start)
             self.beta_u = nn.Parameter(torch.zeros(out_n_capsules))
@@ -98,6 +94,22 @@ class CapsuleFC(nn.Module):
             self.weight_init_const,
             self.dropout_rate,
         )
+
+    def _apply_gate_temp_and_clamp(self, act: torch.Tensor) -> torch.Tensor:
+        eps = self.gate_eps
+        a = act.clamp(eps, 1.0 - eps)
+
+        # Temperature on logits (only meaningful if gate_temp != 1)
+        if self.gate_temp and self.gate_temp != 1.0:
+            logits = torch.log(a) - torch.log1p(-a)          # logit(a)
+            logits = logits / self.gate_temp
+            a = torch.sigmoid(logits)
+
+        # Final clamp to keep gates from saturating
+        if self.gate_min > 0.0 or self.gate_max < 1.0:
+            a = a.clamp(self.gate_min, self.gate_max)
+
+        return a
 
     def forward(
         self,
@@ -147,9 +159,11 @@ class CapsuleFC(nn.Module):
             raise ValueError(
                 f"current_act must be [B, N_in] or [B, N_in, 1], got {tuple(current_act.shape)}"
             )
+        # anti-collapse: re-temperature + clamp primary activations 
+        current_act = self._apply_gate_temp_and_clamp(current_act)
 
+        # Initialization of next_capsule_value and next_act if not provided
         if next_capsule_value is None:
-            # Start from a uniform distribution over output capsules for each input capsule.
             # query_key_unif: [N_in, N_out] -> softmax over N_out
             query_key_unif = torch.zeros(
                 self.in_n_capsules,
@@ -157,7 +171,7 @@ class CapsuleFC(nn.Module):
                 device=device,
                 dtype=dtype,
             )
-            query_key_unif = F.softmax(query_key_unif, dim=1)  
+            query_key_unif = F.softmax(query_key_unif, dim=1)  # uniform probs
 
             # votes: [B, N_out, D] via (N_in,N_out) ⊗ [B,N_in,A] ⊗ [N_in,A,N_out,D]
             # Einsum indices:
@@ -170,7 +184,6 @@ class CapsuleFC(nn.Module):
             )  # [B, N_out, D]
 
         if next_act is None:
-            # Seed from mean primary activations across routes.
             # current_act: [B, N_in] -> [B] -> [B, N_out]
             init_a = current_act.mean(dim=1)  # [B]
             next_act = init_a.unsqueeze(1).expand(B, self.out_n_capsules).contiguous()
@@ -178,7 +191,7 @@ class CapsuleFC(nn.Module):
             # Ensure provided next_act lives on the correct device/dtype.
             next_act = next_act.to(device=device, dtype=dtype)
 
-
+        # ROUTING STEP
         if uniform_routing or self.uniform_routing_coefficient:
             # Completely uniform routing over N_out for each (b, n).
             query_key = torch.zeros(
@@ -214,7 +227,7 @@ class CapsuleFC(nn.Module):
             denom = query_key.sum(dim=2, keepdim=True) + 1e-10
             query_key = query_key / denom
 
-
+        # AGGREGATE VOTES TO PRODUCE NEXT OUTPUT POSES
         # next_capsule_value: [B, N_out, D]
         #
         # Einsum indices:
@@ -227,8 +240,8 @@ class CapsuleFC(nn.Module):
             "bnm, bna, namd, bn->bmd", query_key, input, W, current_act
         )
 
+        # ACTIVATION TYPE HANDLING
         if self.act_type == "ONES":
-            # Simple fixed activation of 1 for all output capsules
             next_act = torch.ones(
                 next_capsule_value.shape[:2], device=device, dtype=dtype
             )
