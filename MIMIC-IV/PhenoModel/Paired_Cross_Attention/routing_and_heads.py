@@ -1,11 +1,9 @@
 from __future__ import annotations
 from typing import Dict, Tuple, Sequence, Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-
 from env_config import ROUTES, DEVICE, CFG
 import capsule_layers
 
@@ -13,7 +11,6 @@ import capsule_layers
 def _dbg(msg: str) -> None:
     if getattr(CFG, "verbose", False):
         print(msg)
-
 
 def _peek_tensor(name: str, x: torch.Tensor, k: int = 3) -> None:
     if not getattr(CFG, "verbose", False):
@@ -59,7 +56,7 @@ class CrossAttentionFusion(nn.Module):
         d: int,
         n_heads: int = 8,
         attn_dropout: float = 0.0,
-        pool: str = "mean",          
+        pool: str = "mean",        
         ff_mult: int = 4,
     ):
         super().__init__()
@@ -92,8 +89,6 @@ class CrossAttentionFusion(nn.Module):
 
         X = self.ln1(A + A2B)
         X = self.ln2(X + self.ff(X))
-
-        # --- pooling controlled by CFG.cross_attn_pool ---
         if self.pool == "first":
             # first valid token in A (fallback to 0 if all padded)
             has_any = (mA > 0.5).any(dim=1)
@@ -104,7 +99,6 @@ class CrossAttentionFusion(nn.Module):
             )
             z = X[torch.arange(X.size(0), device=X.device), idx]  # [B,D]
         else:
-            # default "mean"
             z = masked_mean(X, mA)
 
         return self.out(z)  # [B,D]
@@ -112,6 +106,9 @@ class CrossAttentionFusion(nn.Module):
 
 
 class TriTokenAttentionFusion(nn.Module):
+    """
+    Learned query token attends to concat([L_seq, N_seq, I_seq]) -> [B,D]
+    """
     def __init__(self, d: int, n_heads: int = 8, attn_dropout: float = 0.0):
         super().__init__()
         self.q = nn.Parameter(torch.zeros(1, 1, d))
@@ -123,17 +120,13 @@ class TriTokenAttentionFusion(nn.Module):
     def forward(self, L_seq, mL, N_seq, mN, I_seq, mI) -> torch.Tensor:
         B = L_seq.size(0)
         q = self.q.expand(B, 1, -1)  # [B,1,D]
-
         kv = torch.cat([L_seq, N_seq, I_seq], dim=1)  # [B, Tsum, D]
         kv = self.ln_kv(kv)
-
         m = torch.cat([mL, mN, mI], dim=1)            # [B, Tsum]
         kv_pad = (m < 0.5)
-
         out, _ = self.attn(query=q, key=kv, value=kv, key_padding_mask=kv_pad, need_weights=False)
         z = out[:, 0, :]  # [B,D]
         return self.out(z)
-
 
 
 def build_fusions(d: int, feature_mode: str = "seq", p_drop: float = 0.0):
@@ -141,19 +134,17 @@ def build_fusions(d: int, feature_mode: str = "seq", p_drop: float = 0.0):
     h = int(getattr(CFG, "cross_attn_heads", 8))
     p = float(getattr(CFG, "cross_attn_dropout", p_drop))
     pool = str(getattr(CFG, "cross_attn_pool", "mean")).lower().strip()
-
     if pool not in {"mean", "first"}:
         if getattr(CFG, "verbose", False):
             print(f"[build_fusions] invalid cross_attn_pool={pool}; using 'mean'")
         pool = "mean"
 
-    LN  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p, pool=pool).to(dev)
-    NL  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p, pool=pool).to(dev)
-    LI  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p, pool=pool).to(dev)
-    IL  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p, pool=pool).to(dev)
-    NI  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p, pool=pool).to(dev)
-    IN  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p, pool=pool).to(dev)
-
+    LN  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p_drop, pool=getattr(CFG, "cross_attn_pool", "mean")).to(dev)
+    NL  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p_drop, pool=getattr(CFG, "cross_attn_pool", "mean")).to(dev)
+    LI  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p_drop, pool=getattr(CFG, "cross_attn_pool", "mean")).to(dev)
+    IL  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p_drop, pool=getattr(CFG, "cross_attn_pool", "mean")).to(dev)
+    NI  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p_drop, pool=getattr(CFG, "cross_attn_pool", "mean")).to(dev)
+    IN  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p_drop, pool=getattr(CFG, "cross_attn_pool", "mean")).to(dev)
     LNI = TriTokenAttentionFusion(d, n_heads=h, attn_dropout=p).to(dev)
 
     return {"LN": LN, "NL": NL, "LI": LI, "IL": IL, "NI": NI, "IN": IN, "LNI": LNI}
@@ -162,24 +153,20 @@ def build_fusions(d: int, feature_mode: str = "seq", p_drop: float = 0.0):
 def _safe_clone(x: torch.Tensor) -> torch.Tensor:
     return x.clone()
 
-
 def make_route_inputs(z, fusion):
     Ls, Ns, Is = z["L"]["seq"], z["N"]["seq"], z["I"]["seq"]
     Lm, Nm, Im = z["L"]["mask"], z["N"]["mask"], z["I"]["mask"]
+
     routes = {
         "L":  z["L"]["pool"],
         "N":  z["N"]["pool"],
         "I":  z["I"]["pool"],
-
         "LN": fusion["LN"](Ls, Lm, Ns, Nm),
         "NL": fusion["NL"](Ns, Nm, Ls, Lm),
-
         "LI": fusion["LI"](Ls, Lm, Is, Im),
         "IL": fusion["IL"](Is, Im, Ls, Lm),
-
         "NI": fusion["NI"](Ns, Nm, Is, Im),
         "IN": fusion["IN"](Is, Im, Ns, Nm),
-
         "LNI": fusion["LNI"](Ls, Lm, Ns, Nm, Is, Im),
     }
     return routes
@@ -226,19 +213,16 @@ class CapsuleMortalityHead(nn.Module):
         num_routing: int,
         dp: float = 0.0,
         act_type: str = "ONES",
-        layer_norm: bool = False,   # kept for API compatibility (no LN here)
-        dim_pose_to_vote: int = 0,  # unused, for API compatibility
+        layer_norm: bool = False,   
+        dim_pose_to_vote: int = 0,  
         num_classes: int = 25,
     ):
         super().__init__()
-
         self.in_n_capsules = len(ROUTES)
         self.in_d_capsules = pc_dim
         self.out_n_capsules = num_classes
         self.out_d_capsules = mc_caps_dim
         self.num_routing = int(num_routing)
-
-        # Exact routing layer from Multimodal Routing (CapsuleFC)
         self.capsule = capsule_layers.CapsuleFC(
             in_n_capsules=self.in_n_capsules,
             in_d_capsules=self.in_d_capsules,
@@ -248,7 +232,7 @@ class CapsuleMortalityHead(nn.Module):
             dp=0.0,                        # NO dropout here
             dim_pose_to_vote=dim_pose_to_vote,
             uniform_routing_coefficient=False,
-            act_type=act_type,           
+            act_type=act_type,             # "EM", "Hubert", "ONES"
             small_std=False,
         )
 
@@ -257,8 +241,6 @@ class CapsuleMortalityHead(nn.Module):
             torch.zeros(self.out_n_capsules, self.out_d_capsules)
         )
         self.bias = nn.Parameter(torch.zeros(self.out_n_capsules))
-
-        # No extra nonlinearities / dropout on decision poses
         self.nonlinear_act = nn.Sequential()
 
     def forward(
@@ -279,7 +261,6 @@ class CapsuleMortalityHead(nn.Module):
         decision_act = None
         routing_coef = None
 
-        # Run routing for num_routing iterations, as in Multimodal Routing
         for it in range(self.num_routing):
             decision_pose, decision_act, routing_coef = self.capsule(
                 input=prim_pose,
@@ -296,6 +277,7 @@ class CapsuleMortalityHead(nn.Module):
         prim_act_out = prim_act.squeeze(-1)  # [B, len(ROUTES)]
         return logits, prim_act_out, routing_coef
 
+
 def forward_capsule_from_routes(
     z_unimodal: Dict[str, Dict[str, torch.Tensor]],          # {"L","N","I"} each [B,d]
     fusion: Dict[str, nn.Module],  # {"LN","NL","LI","IL","NI","IN","LNI"}
@@ -304,9 +286,9 @@ def forward_capsule_from_routes(
     *,
     acts_override: Optional[torch.Tensor] = None, # [B,len(ROUTES),1] (optional external priors)
     route_mask: Optional[torch.Tensor] = None,    # [B,len(ROUTES)]  (1=keep, 0=mask)
-    act_temperature: float = 1.0,                
+    act_temperature: float = 1.0,                 # >1 = softer, <1 = sharper
     detach_priors: bool = False, 
-    return_routing: bool = True,                  # kept for API compatibility
+    return_routing: bool = True,                  
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor]]:
     """
     Bridge from unimodal pooled embeddings → len(ROUTES)-route capsules → logits.
@@ -317,7 +299,6 @@ def forward_capsule_from_routes(
         route_embs:   dict of len(ROUTES) -> [B, d]
         routing_coef: [B, len(ROUTES), K] or None
     """
-
     if not hasattr(forward_capsule_from_routes, "_printed_once"):
         forward_capsule_from_routes._printed_once = True
         sizes = ", ".join(f"{k}:pool{tuple(v['pool'].shape)} seq{tuple(v['seq'].shape)}" for k,v in z_unimodal.items())
@@ -331,7 +312,6 @@ def forward_capsule_from_routes(
 
     # Build 10 route embeddings from unimodal
     route_embs = make_route_inputs(z_unimodal, fusion)
-
     expected = set(ROUTES)
     got = set(route_embs.keys())
     if expected != got:
@@ -352,12 +332,8 @@ def forward_capsule_from_routes(
     acts_prior = acts if acts_override is None else acts_override.to(
         device=acts.device, dtype=acts.dtype
     )
-
-    # Apply route mask (e.g., dropout or disabling routes)
     if route_mask is not None:
         acts_prior = acts_prior * route_mask.unsqueeze(-1) + 1e-6  # keep grads
-
-    # Temperature scaling in logit space
     if act_temperature != 1.0:
         eps = 1e-6
         acts_prior = torch.clamp(acts_prior, eps, 1.0 - eps)
@@ -402,4 +378,3 @@ __all__ = [
     "CapsuleMortalityHead",
     "forward_capsule_from_routes",
 ]
-
