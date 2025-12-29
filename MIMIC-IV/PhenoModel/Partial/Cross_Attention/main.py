@@ -46,24 +46,91 @@ from routing_and_heads import (
 ROUTE_NAMES = ["L", "N", "I", "LN", "NL", "LI", "IL", "NI", "IN", "LNI"]
 N_ROUTES = len(ROUTE_NAMES)
 
-def build_route_mask_from_modalities(hasN: torch.Tensor, hasI: torch.Tensor) -> torch.Tensor:
+
+def eval_suite_components(
+    behrt, bbert, imgenc, fusion, projector, cap_head,
+    loaders: dict, split_name: str,
+    amp_ctx_enc, amp_ctx_caps, loss_fn,
+    T_cal: Optional[float] = None,
+    thr_vec: Optional[np.ndarray] = None,
+):
     """
-    hasN, hasI: [B] float/bool (1=available, 0=missing)
-    returns route_mask: [B, 10]
+    Returns dict: condition -> metrics dict
+    Metrics are computed with:
+      - AUROC_macro, AUPRC_macro, F1_micro, F1_macro
+    using calibrated probs if T_cal is provided, and thresholds thr_vec if provided.
     """
+    out = {}
+    for cond, ld in loaders.items():
+        # collect logits + y for proper AUROC/AUPRC/F1 with thresholds
+        y_true, logits, _ = collect_epoch_logits(
+            ld, behrt, bbert, imgenc, fusion, projector, cap_head,
+            amp_ctx_enc, amp_ctx_caps
+        )
+
+        if T_cal is not None:
+            p = sigmoid_np(apply_temperature(logits, float(T_cal)))
+        else:
+            p = sigmoid_np(logits)
+
+        if thr_vec is not None:
+            thr_vec = np.asarray(thr_vec, dtype=np.float32).reshape(-1)
+            y_pred = (p >= thr_vec[np.newaxis, :]).astype(float)
+        else:
+            y_pred = (p >= 0.5).astype(float)
+
+        m = epoch_metrics(y_true, p, y_pred)
+
+        out[cond] = {
+            "auroc_macro": float(m["AUROC"]),
+            "auprc_macro": float(m["AUPRC"]),
+            "f1_micro": float(m["F1_micro"]),
+            "f1_macro": float(m["F1"]),
+        }
+    return out
+
+
+def print_drop_table(mdict, title):
+    keys = ["auroc_macro", "auprc_macro", "f1_micro", "f1_macro"]
+    base = mdict["full"]
+    print("\n" + "="*90)
+    print(title)
+    print("="*90)
+    header = f"{'Condition':10s} | " + " | ".join([f"{k:>10s}" for k in keys]) + " | " + " | ".join([f"Δ{k:>8s}" for k in keys])
+    print(header)
+    print("-"*len(header))
+    for cond in ["full","dropL","dropN","dropI","rand1"]:
+        m = mdict[cond]
+        row = f"{cond:10s} | " + " | ".join([f"{float(m.get(k, float('nan'))):10.4f}" for k in keys])
+        dlt = " | " + " | ".join([f"{(float(m.get(k,0))-float(base.get(k,0))):+10.4f}" for k in keys])
+        print(row + dlt)
+
+
+def build_route_mask_from_modalities(hasL: torch.Tensor, hasN: torch.Tensor, hasI: torch.Tensor) -> torch.Tensor:
+    """
+    hasL, hasN, hasI: [B] float/bool (1=available, 0=missing)
+    returns route_mask: [B, 10] corresponding to ROUTE_NAMES
+    """
+    hasL = hasL.float()
     hasN = hasN.float()
     hasI = hasI.float()
-    B = hasN.shape[0]
-    rm = torch.ones(B, N_ROUTES, device=hasN.device, dtype=torch.float32)
 
-    # Routes that require notes (N): N, LN, NL, NI, IN, LNI
+    B = hasL.shape[0]
+    rm = torch.ones(B, N_ROUTES, device=hasL.device, dtype=torch.float32)
+
+    # Route indices by requirement:
+    # requires L: L, LN, NL, LI, IL, LNI
+    l_idx = [0, 3, 4, 5, 6, 9]
+    # requires N: N, LN, NL, NI, IN, LNI
     n_idx = [1, 3, 4, 7, 8, 9]
-    # Routes that require image (I): I, LI, IL, NI, IN, LNI
+    # requires I: I, LI, IL, NI, IN, LNI
     i_idx = [2, 5, 6, 7, 8, 9]
 
+    rm[:, l_idx] *= hasL[:, None]
     rm[:, n_idx] *= hasN[:, None]
     rm[:, i_idx] *= hasI[:, None]
     return rm
+
 
 def grads_are_finite(param_list):
     for p in param_list:
@@ -648,12 +715,29 @@ def prepare_notes_batch(notes_batch: List[Dict[str, Any]]):
         return out_ints
 
     for item in notes_batch:
-        mode = item.get("mode", "text")
+        mode = str(item.get("mode", "text")).lower().strip()
 
         if mode == "text":
             tmp = pretok_batch_notes([item["chunks"]])[0]
             out.append(tmp)
             continue
+
+        # accept both names
+        if mode in {"pretok", "pretokenized", "tokenized"}:
+            ids_chunks  = item.get("input_ids", [])
+            attn_chunks = item.get("attention_mask", [])
+
+            # fall back if caller used "attn_mask"
+            if (not attn_chunks) and ("attn_mask" in item):
+                attn_chunks = item.get("attn_mask", [])
+        else:
+            # unknown mode => treat as empty
+            out.append({
+                "input_ids": torch.zeros(0, L, dtype=torch.long, device=DEVICE),
+                "attention_mask": torch.zeros(0, L, dtype=torch.long, device=DEVICE),
+            })
+            continue
+
 
         ids_chunks  = item.get("input_ids", [])
         attn_chunks = item.get("attention_mask", [])
@@ -667,6 +751,39 @@ def prepare_notes_batch(notes_batch: List[Dict[str, Any]]):
         # Normalize each chunk to flat List[int]
         ids_chunks  = [_to_int_list(x) for x in ids_chunks]
         attn_chunks = [_to_int_list(x) for x in attn_chunks]
+
+        def _sanitize_chunk(ids, msk):
+            # Keep only the aligned prefix if lengths mismatch
+            n = min(len(ids), len(msk))
+            ids, msk = ids[:n], msk[:n]
+
+            cls_id = int(getattr(TOKENIZER, "cls_token_id", 101) or 101)
+            sep_id = int(getattr(TOKENIZER, "sep_token_id", 102) or 102)
+
+            # Drop duplicate leading CLS: [CLS, CLS, ...] -> [CLS, ...]
+            while len(ids) >= 2 and ids[0] == cls_id and ids[1] == cls_id:
+                ids.pop(0)
+                msk.pop(0)
+
+            # Drop duplicate trailing SEP: [..., SEP, SEP] -> [..., SEP]
+            while len(ids) >= 2 and ids[-1] == sep_id and ids[-2] == sep_id:
+                ids.pop()
+                msk.pop()
+
+            return ids, msk
+
+        ids_chunks2, attn_chunks2 = [], []
+        for a, b in zip(ids_chunks, attn_chunks):
+            a, b = _sanitize_chunk(a, b)
+            if len(a) == 0 or len(b) == 0:
+                continue
+            if np.sum(np.asarray(b, dtype=np.int64)) <= 0:
+                continue
+            ids_chunks2.append(a)
+            attn_chunks2.append(b)
+
+        ids_chunks, attn_chunks = ids_chunks2, attn_chunks2
+
 
         paired = [
             (a, b) for a, b in zip(ids_chunks, attn_chunks)
@@ -758,8 +875,13 @@ def parse_args():
     ap.add_argument("--num_workers", type=int, default=_cfg("num_workers", 4))
     ap.add_argument("--finetune_text", action="store_true",
                     help="Unfreeze Bio_ClinicalBERT if set.")
-    ap.add_argument("--eval_drop_mode", type=str, default="none", choices=["none", "drop_notes", "drop_img", "drop_one_random"],
-                    help="Ablation: drop a modality at eval time (VAL/TEST).")
+    ap.add_argument(
+        "--eval_drop_mode",
+        type=str,
+        default="none",
+        choices=["none", "drop_L", "drop_N", "drop_I", "drop_one_random"],
+    )
+
     ap.add_argument("--eval_drop_p", type=float, default=1.0,
                     help="Probability to apply eval drop per-sample (used when mode != none).")
     ap.add_argument("--resume", type=str, default="", help="Path to checkpoint (.pt).")
@@ -1110,26 +1232,34 @@ class ICUStayDataset(Dataset):
 
 
         # Always require structured + labels
-        keep_ids = ids_set & struct_ids & label_ids & img_ids & note_ids
+        # Always require structured + labels
+        base_keep = ids_set & struct_ids & label_ids
 
+        # Train: respect CFG.require_all_modalities_train (you already want tri-modal train)
+        if str(self.split).lower() == "train" and bool(getattr(CFG, "require_all_modalities_train", True)):
+            keep_ids = base_keep & img_ids & note_ids
+        else:
+            # Eval: allow missing (require_all_modalities_eval = False)
+            if bool(getattr(CFG, "require_all_modalities_eval", False)):
+                keep_ids = base_keep & img_ids & note_ids
+            else:
+                keep_ids = base_keep
 
-        dropped_total = len(ids_set) - len(keep_ids)
-        dropped_no_notes = len(ids_set & struct_ids & label_ids & img_ids) - len(keep_ids)
+        # Save final ids
         self.ids = sorted(list(keep_ids))
+
+        # ---- store availability maps for later (used by __getitem__/collate) ----
+        note_ids_set = set(note_ids)
+        img_ids_set  = set(img_ids)
+
+        self.hasN_map = {int(sid): (int(sid) in note_ids_set) for sid in self.ids}
+        self.hasI_map = {int(sid): (int(sid) in img_ids_set)  for sid in self.ids}
+
+        dropped_total = len(ids_set) - len(self.ids)
         print(f"[dataset:{split}] kept {len(self.ids)} / {len(ids_set)}")
-        print(f"[dataset:{split}] dropped total={dropped_total} | dropped_missing_notes={dropped_no_notes}")
+        print(f"[dataset:{split}] dropped total={dropped_total}")
+        print(f"[dataset:{split}] among kept: hasN={sum(self.hasN_map.values())} hasI={sum(self.hasI_map.values())}")
 
-        if len(self.ids) == 0:
-            raise RuntimeError(f"[ICUStayDataset] After filtering, split '{self.split}' is empty.")
-
-        # small summary
-        print(
-            f"[dataset:{split}] root={root} ids={len(self.ids)} "
-            f"| struct rows={len(self.struct)} (F={len(self.feat_cols)}) "
-            f"| notes rows={len(self.notes)} "
-            f"| images rows={len(self.images)} "
-            f"| labels rows={len(self.labels)} (K={len(self.label_cols)})"
-        )
 
     def __len__(self) -> int:
         return len(self.ids)
@@ -1188,7 +1318,9 @@ class ICUStayDataset(Dataset):
     def __getitem__(self, idx: int):
         stay_id = self.ids[idx]
 
-        # structured EHR
+        # -------------------------
+        # (1) Structured EHR (L)
+        # -------------------------
         df_s = self.struct[self.struct.stay_id == stay_id].sort_values("hour")
         xs_np = (
             df_s[self.feat_cols]
@@ -1197,108 +1329,114 @@ class ICUStayDataset(Dataset):
             .to_numpy()
         )
         if xs_np.shape[1] != CFG.structured_n_feats:
-            raise ValueError(f"Structured feat dim mismatch: got {xs_np.shape[1]} but CFG.structured_n_feats={CFG.structured_n_feats}")
-
+            raise ValueError(
+                f"Structured feat dim mismatch: got {xs_np.shape[1]} "
+                f"but CFG.structured_n_feats={CFG.structured_n_feats}"
+            )
         xs = torch.from_numpy(xs_np)  # [<=T,F]
 
-        # notes: use the first row for this stay_id (you can change policy later if needed)
+        # -------------------------
+        # (2) Notes (N) - allow true missing
+        # -------------------------
+        hasN = bool(getattr(self, "hasN_map", {}).get(int(stay_id), False))
         df_n = self.notes[self.notes.stay_id == stay_id]
-        if df_n.empty:
-            raise RuntimeError(f"[ICUStayDataset] stay_id={stay_id} missing notes row")
-        row = df_n.iloc[0]
 
-        if self.notes_mode == "text":
-            notes_list: List[str] = []
-            for c in self.chunk_cols:
-                val = row.get(c, "")
-                if pd.notna(val) and str(val).strip():
-                    notes_list.append(str(val))
+        # Default: empty notes payload
+        notes_payload = {"mode": "pretok", "input_ids": [], "attention_mask": []}
 
-            if not notes_list:
-                raise RuntimeError(f"[ICUStayDataset] stay_id={stay_id} has no non-empty chunk_* text")
+        if hasN and (not df_n.empty):
+            row = df_n.iloc[0]
 
-            M = int(getattr(CFG, "notes_max_chunks", -1))
-            if M > 0:
-                notes_list = notes_list[:M]
+            if self.notes_mode == "text":
+                notes_list: List[str] = []
+                for c in self.chunk_cols:
+                    val = row.get(c, "")
+                    if pd.notna(val) and str(val).strip():
+                        notes_list.append(str(val))
 
-            notes_payload = {"mode": "text", "chunks": notes_list}
+                # If notes supposed to exist but are empty, treat as missing (do NOT crash)
+                if notes_list:
+                    M = int(getattr(CFG, "notes_max_chunks", -1))
+                    if M > 0:
+                        notes_list = notes_list[:M]
+                    notes_payload = {"mode": "text", "chunks": notes_list}
+                else:
+                    hasN = False  # downgrade to missing
 
-        else:
-            try:
-                n_chunks = int(row.get("n_chunks", 0) or 0)
-            except Exception:
-                n_chunks = 0
+            else:
+                # pretokenized
+                try:
+                    n_chunks = int(row.get("n_chunks", 0) or 0)
+                except Exception:
+                    n_chunks = 0
 
-            ids_chunks: List[List[int]] = []
-            attn_chunks: List[List[int]] = []
+                ids_chunks: List[List[int]] = []
+                attn_chunks: List[List[int]] = []
 
-            for j, (c_id, c_m) in enumerate(zip(self.input_id_cols, self.attn_mask_cols)):
-                if n_chunks > 0 and j >= n_chunks:
-                    break
+                for j, (c_id, c_m) in enumerate(zip(self.input_id_cols, self.attn_mask_cols)):
+                    if n_chunks > 0 and j >= n_chunks:
+                        break
 
-                ids = _cell_to_list(row.get(c_id, None))
-                msk = _cell_to_list(row.get(c_m, None))
+                    ids = _cell_to_list(row.get(c_id, None))
+                    msk = _cell_to_list(row.get(c_m, None))
 
-                # Must have content in both
-                if len(ids) == 0 or len(msk) == 0:
-                    continue
+                    # unwrap [[...]] -> [...]
+                    if len(ids) > 0 and isinstance(ids[0], (list, tuple, np.ndarray)):
+                        ids = ids[0]
+                    if len(msk) > 0 and isinstance(msk[0], (list, tuple, np.ndarray)):
+                        msk = msk[0]
 
-                # Safety: ids/mask should align
-                if len(ids) != len(msk):
-                    continue
+                    if len(ids) == 0 or len(msk) == 0:
+                        continue
+                    if len(ids) != len(msk):
+                        continue
+                    if np.sum(np.asarray(msk, dtype=np.int64)) <= 0:
+                        continue
 
-                # Key fix: ignore all-padding chunks (mask sum == 0)
-                if np.sum(np.asarray(msk, dtype=np.int64)) <= 0:
-                    continue
+                    ids_chunks.append(ids)
+                    attn_chunks.append(msk)
 
-                ids_chunks.append(ids)
-                attn_chunks.append(msk)
+                if ids_chunks:
+                    M = int(getattr(CFG, "notes_max_chunks", -1))
+                    if M > 0:
+                        ids_chunks = ids_chunks[:M]
+                        attn_chunks = attn_chunks[:M]
 
-            if len(ids_chunks) == 0:
-                raise RuntimeError(
-                    f"[ICUStayDataset] stay_id={stay_id} has no valid non-pad chunks "
-                    f"(all attention masks are zero or missing)"
-                )
+                    notes_payload = {
+                        "mode": "pretok",
+                        "input_ids": ids_chunks,
+                        "attention_mask": attn_chunks,
+                    }
+                else:
+                    hasN = False  # downgrade to missing
 
-            M = int(getattr(CFG, "notes_max_chunks", -1))
-            if M > 0:
-                ids_chunks = ids_chunks[:M]
-                attn_chunks = attn_chunks[:M]
+        # -------------------------
+        # (3) Images (I) - allow true missing
+        # -------------------------
+        hasI = bool(getattr(self, "hasI_map", {}).get(int(stay_id), False))
+        img_paths: List[str] = []
 
-            notes_payload = {
-                "mode": "pretokenized",
-                "input_ids": ids_chunks,
-                "attention_mask": attn_chunks,
-            }
-        # images: choose the last *valid existing* path for this stay
-        df_i = self.images[self.images.stay_id == stay_id]
-        if df_i.empty:
-            raise RuntimeError(f"[ICUStayDataset] stay_id={stay_id} missing images row")
+        if hasI:
+            df_i = self.images[self.images.stay_id == stay_id]
+            if not df_i.empty:
+                raw_paths = df_i.cxr_path.dropna().astype(str).tolist()
+                raw_paths = [p for p in raw_paths if str(p).strip()]
+                cand = [resolve_image_path(p, self.root) for p in raw_paths]
+                cand = [p for p in cand if is_probably_image_file(p) and os.path.exists(p)]
+                if cand:
+                    img_paths = [cand[-1]]
+                else:
+                    hasI = False  # downgrade if file missing
+            else:
+                hasI = False  # truly missing row -> missing modality
 
-        raw_paths = df_i.cxr_path.dropna().astype(str).tolist()
-        raw_paths = [p for p in raw_paths if str(p).strip()]
-
-        # resolve relative -> absolute using *dataset* root
-        cand = [resolve_image_path(p, self.root) for p in raw_paths]
-
-        # filter: looks like image + exists
-        cand = [p for p in cand if is_probably_image_file(p) and os.path.exists(p)]
-
-        if not cand:
-            # print a useful debug message before failing
-            sample_show = raw_paths[:3]
-            raise RuntimeError(
-                f"[ICUStayDataset] stay_id={stay_id} has no valid existing image files. "
-                f"Example raw paths: {sample_show} | dataset_root={self.root}"
-            )
-
-        img_paths = [cand[-1]]  # keep last valid only (stable policy)
-
-
-        # multi-label phenotype target [K]
+        # -------------------------
+        # (4) Labels
+        # -------------------------
         lab_row = self.labels[self.labels.stay_id == stay_id]
         if lab_row.empty:
             raise RuntimeError(f"[ICUStayDataset] Missing labels for stay_id={stay_id}")
+
         y_vec = lab_row[self.label_cols].iloc[0].to_numpy()
         y = torch.tensor(y_vec, dtype=torch.float32)  # [K]
 
@@ -1308,8 +1446,9 @@ class ICUStayDataset(Dataset):
             "notes": notes_payload,
             "image_paths": img_paths,
             "y": y,
+            "hasN": float(hasN),
+            "hasI": float(hasI),
         }
-
 
 def pad_or_trim_struct(x: torch.Tensor, T: int, F: int) -> torch.Tensor:
     t = x.shape[0]
@@ -1375,14 +1514,23 @@ def collate_fn_factory(
     first_print = {"done": False}
     eval_drop_mode = str(eval_drop_mode).lower().strip()
 
-    def _empty_notes_like(note_obj: Dict[str, Any]) -> Dict[str, Any]:
-        return {"mode": "pretokenized", "input_ids": [], "attention_mask": []}
+    def _empty_notes_like(note_obj):
+        mode = "text"
+        if isinstance(note_obj, dict):
+            mode = str(note_obj.get("mode", "text")).lower().strip()
+
+        if mode == "text":
+            return {"mode": "text", "chunks": []}
+
+        # for pretokenized / pretok
+        return {"mode": "pretok", "input_ids": [], "attention_mask": []}
+
 
     def _collate(batch: List[Dict[str, Any]]):
         F_dim = int(CFG.structured_n_feats)
 
         # choose T safely
-        T_len_cfg = int(getattr(CFG, "structured_seq_len", -1))
+        T_len_cfg = int(getattr(CFG, "structured_seq_len", 256))
         if T_len_cfg is not None and T_len_cfg > 0:
             T_len = T_len_cfg
         else:
@@ -1403,20 +1551,31 @@ def collate_fn_factory(
 
         # Start as "present"
         B = len(batch)
-        hasN = torch.ones(B, dtype=torch.float32)
-        hasI = torch.ones(B, dtype=torch.float32)
+        hasL = torch.ones(B, dtype=torch.float32)
+        hasN = torch.tensor([float(b.get("hasN", 1.0)) for b in batch], dtype=torch.float32)
+        hasI = torch.tensor([float(b.get("hasI", 1.0)) for b in batch], dtype=torch.float32)
+
 
         # Base payloads
         notes_batch = [b["notes"] for b in batch]
+        for i in range(B):
+            if float(hasN[i].item()) < 0.5:
+                notes_batch[i] = _empty_notes_like(notes_batch[i])
+
 
         # Load images (normal) first
         imgs_list, img_paths_list = [], []
-        for b in batch:
+        for i, b in enumerate(batch):
+            if float(hasI[i].item()) < 0.5:
+                imgs_list.append(torch.zeros(3, 224, 224))
+                img_paths_list.append("<missing-image>")
+                continue
             paths = b.get("image_paths", []) or []
             img_t, path = load_cxr_tensor(paths, img_tfms, return_path=True)
             imgs_list.append(img_t)
             img_paths_list.append(path)
         imgs_batch = torch.stack(imgs_list, dim=0)
+
 
         if eval_drop_mode != "none" and float(eval_drop_p) > 0.0:
             p = float(eval_drop_p)
@@ -1425,17 +1584,36 @@ def collate_fn_factory(
                 if random.random() > p:
                     continue
 
-                if eval_drop_mode == "drop_notes":
+                if eval_drop_mode == "drop_L":
+                    # Drop STRUCTURED (L)
+                    hasL[i] = 0.0
+                    xL_batch[i].zero_()
+                    mL_batch[i].zero_()
+                    # keep mask non-empty to avoid downstream "empty mask" issues
+                    mL_batch[i, -1] = 1.0
+                    xL_batch[i, -1, 0] = 1e-6
+
+                elif eval_drop_mode == "drop_N":
+                    # Drop NOTES (N)
                     hasN[i] = 0.0
                     notes_batch[i] = _empty_notes_like(notes_batch[i])
 
-                elif eval_drop_mode == "drop_img":
+                elif eval_drop_mode == "drop_I":
+                    # Drop IMAGE (I)
                     hasI[i] = 0.0
                     imgs_batch[i].zero_()
                     img_paths_list[i] = "<dropped-image>"
 
                 elif eval_drop_mode == "drop_one_random":
-                    if random.random() < 0.5:
+                    # Randomly drop exactly ONE modality among {L, N, I}
+                    r = random.random()
+                    if r < (1.0 / 3.0):
+                        hasL[i] = 0.0
+                        xL_batch[i].zero_()
+                        mL_batch[i].zero_()
+                        mL_batch[i, -1] = 1.0
+                        xL_batch[i, -1, 0] = 1e-6
+                    elif r < (2.0 / 3.0):
                         hasN[i] = 0.0
                         notes_batch[i] = _empty_notes_like(notes_batch[i])
                     else:
@@ -1454,6 +1632,7 @@ def collate_fn_factory(
         dbg = {
             "stay_ids": [b["stay_id"] for b in batch],
             "img_paths": img_paths_list,
+            "hasL": hasL.tolist(),
             "hasN": hasN.tolist(),
             "hasI": hasI.tolist(),
             "eval_drop_mode": eval_drop_mode,
@@ -1495,7 +1674,8 @@ def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
                 else:
                     note_preview = "<empty-text-chunks>"
 
-            elif mode == "pretokenized":
+            elif mode in {"pretokenized", "pretok"}:
+
                 ids_chunks = note_obj.get("input_ids", [])
                 n_chunks = len(ids_chunks)
                 if n_chunks > 0:
@@ -1518,15 +1698,133 @@ def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
         )
     print("[sample-inspect] ---------------------------\n")
 
-def _enc_forward(enc, *args, **kwargs):
-    try:
-        return enc(*args, **kwargs)
-    except TypeError as e:
-        for k in ["return_seq", "return_attn", "return_mask"]:
-            if k in kwargs:
-                kwargs.pop(k, None)
-        return enc(*args, **kwargs)
 
+def _enc_forward(enc, *args, **kwargs):
+    """
+    Robust encoder caller:
+      - If enc.forward is unimplemented, try known entrypoints and then fall back to child modules.
+      - Filters kwargs to what the callable accepts.
+      - If 'mask' isn't accepted, tries passing it positionally or dropping it.
+    """
+    import inspect
+    import torch.nn as nn
+
+    def _forward_is_unimplemented(m) -> bool:
+        try:
+            f = getattr(type(m), "forward", None)
+            return f is nn.Module.forward
+        except Exception:
+            return False
+
+    def _filter_kwargs(fn, kw):
+        try:
+            sig = inspect.signature(fn)
+            params = sig.parameters
+            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                return dict(kw)
+            return {k: v for k, v in kw.items() if k in params}
+        except Exception:
+            return dict(kw)
+
+    # -------------------------
+    # Build candidate callables
+    # -------------------------
+    cands = []
+    forward_unimpl = _forward_is_unimplemented(enc)
+
+    # If forward is implemented, calling enc(...) is allowed
+    if not forward_unimpl:
+        cands.append(("enc", enc))
+
+    # Try common explicit entrypoints (expand this list)
+    common_names = [
+        "encode", "encode_batch", "forward_impl",
+        "encoder", "model", "backbone", "net",
+        "transformer", "trunk", "base", "core",
+        "behrt", "behrt_model", "ehr", "ehr_encoder",
+        "module",
+    ]
+    for name in common_names:
+        if hasattr(enc, name):
+            obj = getattr(enc, name)
+            if callable(obj):
+                cands.append((name, obj))
+
+    # NEW: If forward is unimplemented (or even if it is), try child modules as fallback.
+    # This is what fixes your BEHRTLabEncoder case.
+    # We prioritize child modules whose class overrides forward().
+    child_modules = []
+    try:
+        for child_name, child in enc.named_children():
+            if not isinstance(child, nn.Module):
+                continue
+            # prioritize modules that override forward()
+            child_modules.append((child_name, child, _forward_is_unimplemented(child)))
+    except Exception:
+        child_modules = []
+
+    # Put children with implemented forward first
+    child_modules.sort(key=lambda t: (t[2], t[0]))  # False (implemented) first
+    for child_name, child, child_forward_unimpl in child_modules:
+        # Only useful if child is callable (nn.Module is callable)
+        if callable(child):
+            cands.append((f"child:{child_name}", child))
+
+    # If still empty, do a last-resort scan of attributes for nn.Module instances
+    if len(cands) == 0:
+        for attr in dir(enc):
+            if attr.startswith("_"):
+                continue
+            try:
+                obj = getattr(enc, attr)
+            except Exception:
+                continue
+            if isinstance(obj, nn.Module) and callable(obj):
+                cands.append((f"attr_module:{attr}", obj))
+
+    # -------------------------
+    # Try candidates
+    # -------------------------
+    last_err = None
+    for cname, fn in cands:
+        # Attempt 1: filtered kwargs
+        try:
+            kw1 = _filter_kwargs(fn, kwargs)
+            return fn(*args, **kw1)
+        except TypeError as e:
+            last_err = e
+
+            # Attempt 2: if 'mask' provided as kw but callee wants it positional
+            if "mask" in kwargs and len(args) >= 1:
+                try:
+                    kw2 = dict(kwargs)
+                    m = kw2.pop("mask", None)
+                    kw2 = _filter_kwargs(fn, kw2)
+                    return fn(args[0], m, *args[1:], **kw2)
+                except Exception as e2:
+                    last_err = e2
+
+            # Attempt 3: drop common optional flags
+            try:
+                kw3 = dict(kwargs)
+                for k in ["return_seq", "return_attn", "return_mask", "mask"]:
+                    kw3.pop(k, None)
+                kw3 = _filter_kwargs(fn, kw3)
+                return fn(*args, **kw3)
+            except Exception as e3:
+                last_err = e3
+                continue
+        except Exception as e:
+            last_err = e
+            continue
+
+    # Helpful debug if it still fails
+    raise TypeError(
+        f"_enc_forward: failed to call encoder={type(enc).__name__}. "
+        f"forward_unimplemented={forward_unimpl}. "
+        f"Tried candidates={[name for name,_ in cands][:15]}{'...' if len(cands)>15 else ''}. "
+        f"Last error: {type(last_err).__name__}: {last_err}"
+    )
 
 def _capsule_forward_safe(z, fusion, projector, cap_head,
                           route_mask=None, act_temperature=1.0,
@@ -1579,20 +1877,91 @@ def _ensure_encoder_dict(out, name: str, mask_fallback: Optional[torch.Tensor] =
 
     raise TypeError(f"[{name}] unsupported encoder output type: {type(out)}")
 
-def _sanitize_encoder_out(out: Dict[str, torch.Tensor], name: str) -> Dict[str, torch.Tensor]:
+
+def _fix_seq_pool_shapes(
+    out: Dict[str, torch.Tensor],
+    name: str,
+    mask_fallback: Optional[torch.Tensor] = None,
+    pool_mode: str = "cls",
+) -> Dict[str, torch.Tensor]:
+    out2 = dict(out)
+
+    seq = out2.get("seq", None)
+    pool = out2.get("pool", None)
+    
+    # 1. Standardize Sequence [B, T, D]
+    if seq is not None:
+        if seq.ndim == 4:
+            # Handle [B, 1, T, D] or [B, T, 1, D]
+            if seq.size(1) == 1: seq = seq.squeeze(1)
+            elif seq.size(2) == 1: seq = seq.squeeze(2)
+        if seq.ndim == 2:
+            seq = seq.unsqueeze(1)
+        out2["seq"] = seq
+
+    # 2. Standardize Mask [B, T]
+    # IMPORTANT: The mask MUST match the sequence length T
+    if seq is not None:
+        B, T, _ = seq.shape
+        mask = out2.get("mask", None)
+        
+        if mask is None:
+            mask = torch.ones(B, T, device=seq.device, dtype=torch.float32)
+        else:
+            # Flatten any weird middle dims [B, 1, T] or [B, T, 1]
+            if mask.ndim > 2:
+                mask = mask.view(B, -1)
+            
+            # If mask length doesn't match sequence length, 
+            # it's usually because the mask was only for the CLS token
+            if mask.size(1) != T:
+                if mask.size(1) == 1:
+                    mask = mask.expand(-1, T)
+                else:
+                    # Fallback: create a dummy mask if they are totally unaligned
+                    mask = torch.ones(B, T, device=seq.device, dtype=torch.float32)
+        
+        out2["mask"] = mask.float()
+
+    # 3. Standardize Pooled [B, D]
+    if pool is not None:
+        if pool.ndim == 3:
+            pool = pool[:, 0, :] # Take CLS
+        elif pool.ndim == 4:
+            pool = pool.view(pool.size(0), -1, pool.size(-1))[:, 0, :]
+        out2["pool"] = pool
+
+    return out2
+
+def _sanitize_encoder_out(out: Dict[str, torch.Tensor], name: str, max_norm: float = 20.0) -> Dict[str, torch.Tensor]:
+    """
+    Safety wrapper for encoder outputs:
+      - clamps vector norms (prevents explosion)
+      - replaces NaN/Inf with finite values
+      - forces mask to float
+    Expects dict with keys: seq [B,T,D], pool [B,D], mask [B,T] (but tolerates missing keys).
+    """
     out2 = dict(out)
 
     if "seq" in out2 and out2["seq"] is not None:
-        out2["seq"] = _safe_tensor(_clamp_norm(out2["seq"].float(), 20.0), f"{name}.seq").float()
+        x = out2["seq"]
+        # allow seq to be fp16/bf16, sanitize in fp32 then cast back
+        x_fp32 = x.float()
+        x_fp32 = _clamp_norm(x_fp32.view(-1, x_fp32.size(-1)), max_norm=max_norm).view_as(x_fp32)
+        x_fp32 = _safe_tensor(x_fp32, f"{name}.seq")
+        out2["seq"] = x_fp32.to(dtype=x.dtype)
 
     if "pool" in out2 and out2["pool"] is not None:
-        out2["pool"] = _safe_tensor(_clamp_norm(out2["pool"].float(), 20.0), f"{name}.pool").float()
+        x = out2["pool"]
+        x_fp32 = x.float()
+        x_fp32 = _clamp_norm(x_fp32, max_norm=max_norm)
+        x_fp32 = _safe_tensor(x_fp32, f"{name}.pool")
+        out2["pool"] = x_fp32.to(dtype=x.dtype)
 
     if "mask" in out2 and out2["mask"] is not None:
         out2["mask"] = out2["mask"].float()
 
     return out2
-
 
 def _has_nonfinite(*tensors: torch.Tensor) -> bool:
     for t in tensors:
@@ -1602,12 +1971,14 @@ def _has_nonfinite(*tensors: torch.Tensor) -> bool:
             return True
     return False
 
+
+
 @torch.no_grad()
 def evaluate_epoch(
     behrt, bbert, imgenc, fusion, projector, cap_head,
     loader,
-    amp_ctx_enc,
-    amp_ctx_caps,
+    amp_ctx_enc,          # autocast context (cuda fp16/bf16) OR nullcontext()
+    amp_ctx_caps,         # IGNORE this arg; keep for signature compatibility
     loss_fn,
     route_debug: bool = False,
     label_names: Optional[List[str]] = None,
@@ -1620,110 +1991,113 @@ def evaluate_epoch(
     if getattr(bbert, "bert", None) is not None:
         bbert.bert.eval()
 
-    total_loss, total_correct, total = 0.0, 0, 0
-    act_sum = torch.zeros(N_ROUTES, dtype=torch.float32)  # N_ROUTES=10
-    route_names = ROUTE_NAMES
-
+    total_loss = 0.0
+    act_sum = torch.zeros(N_ROUTES, dtype=torch.float32)  # CPU accumulator
     num_samples = 0
+
     printed_unimodal = False
     printed_caps_once = False
     rpt_every = int(_cfg("routing_print_every", 0) or 0)
 
     # per-route, per-phenotype routing importance
-    rc_sum_mat = None      # [N_ROUTES, K]
+    rc_sum_mat = None      # [N_ROUTES, K] on CPU
     has_routing = False
+
+    # F1 counters @ threshold 0.5
+    tp = fp = fn = None
+
+    # IMPORTANT: we force capsule/loss in fp32 for stability
+    force_capsule_fp32 = True
 
     for bidx, (xL, mL, notes, imgs, y, dbg) in enumerate(loader):
         xL = xL.to(DEVICE, non_blocking=True)
         mL = mL.to(DEVICE, non_blocking=True)
         imgs = imgs.to(DEVICE, non_blocking=True)
-        y   = y.to(DEVICE,   non_blocking=True)
+        y   = y.to(DEVICE, non_blocking=True)
 
-        # (A) Encoders under autocast
+        # ------------------------------------------------------------
+        # (A) Encoders under ONE autocast context (dtype-consistent)
+        # ------------------------------------------------------------
         with amp_ctx_enc:
-            outL = _enc_forward(behrt, xL, mask=mL, return_seq=True)
-            outN = _enc_forward(bbert, prepare_notes_batch(notes), return_seq=True)
-            outI = _enc_forward(imgenc, imgs, return_seq=True)
+            outL_raw = _enc_forward(behrt, xL, mask=mL, return_seq=True)
+            outN_raw = _enc_forward(bbert, prepare_notes_batch(notes), return_seq=True)
+            outI_raw = _enc_forward(imgenc, imgs, return_seq=True)
 
-        outL = _ensure_encoder_dict(outL, "eval.L", mask_fallback=mL)
-        outN = _ensure_encoder_dict(outN, "eval.N")
-        outI = _ensure_encoder_dict(outI, "eval.I")
+            outL = _ensure_encoder_dict(outL_raw, "eval.L", mask_fallback=mL)
+            outL = _fix_seq_pool_shapes(outL, "eval.L", mask_fallback=mL, pool_mode="cls")
+            outN = _ensure_encoder_dict(outN_raw, "eval.N")
+            outI = _ensure_encoder_dict(outI_raw, "eval.I")
 
-        outL = _sanitize_encoder_out(outL, "eval.L")
-        outN = _sanitize_encoder_out(outN, "eval.N")
-        outI = _sanitize_encoder_out(outI, "eval.I")
+            outL = _sanitize_encoder_out(outL, "eval.L")
+            outN = _sanitize_encoder_out(outN, "eval.N")
+            outI = _sanitize_encoder_out(outI, "eval.I")
 
-        # (B) Capsule forward + loss in FP32
-        with amp_ctx_caps:
+        # ------------------------------------------------------------
+        # (B) Capsules + loss in FP32 (recommended for routing stability)
+        # ------------------------------------------------------------
+        if force_capsule_fp32:
+            caps_ctx = torch_amp.autocast(device_type="cuda", enabled=False) if str(DEVICE).startswith("cuda") else nullcontext()
+        else:
+            caps_ctx = amp_ctx_enc  # if you ever want "everything in amp"
+
+        with caps_ctx:
             z = {"L": outL, "N": outN, "I": outI}
-            hasN = torch.tensor(dbg.get("hasN", [1.0] * xL.size(0)), device=DEVICE, dtype=torch.float32)
-            hasI = torch.tensor(dbg.get("hasI", [1.0] * xL.size(0)), device=DEVICE, dtype=torch.float32)
-            route_mask = build_route_mask_from_modalities(hasN, hasI)
+            B = xL.size(0)
+
+            hasL = torch.tensor(dbg.get("hasL", [1.0] * B), device=DEVICE, dtype=torch.float32)
+            hasN = torch.tensor(dbg.get("hasN", [1.0] * B), device=DEVICE, dtype=torch.float32)
+            hasI = torch.tensor(dbg.get("hasI", [1.0] * B), device=DEVICE, dtype=torch.float32)
+            route_mask = build_route_mask_from_modalities(hasL, hasN, hasI)
 
             out = _capsule_forward_safe(
                 z, fusion, projector, cap_head,
-                route_mask=route_mask, act_temperature=1.0,
-                detach_priors=False, return_routing=True
+                route_mask=route_mask,
+                act_temperature=1.0,
+                detach_priors=False,
+                return_routing=True
             )
 
             logits, prim_acts, route_embs = out[0], out[1], out[2]
             routing_coef = out[3] if len(out) > 3 else None
+
+            # Force fp32 for metrics/loss
+            logits    = _safe_tensor(logits.float(),    "eval.logits(fp32)")
+            prim_acts = _safe_tensor(prim_acts.float(), "eval.prim_acts(fp32)")
 
             if routing_coef is not None:
                 routing_coef, info = normalize_routing_coef_auto(routing_coef, expect_routes=N_ROUTES)
 
                 assert routing_coef is not None and routing_coef.ndim == 3, \
                     f"routing_coef must be 3D [B,R,K], got {None if routing_coef is None else tuple(routing_coef.shape)}"
-
                 assert int(routing_coef.shape[1]) == int(N_ROUTES), \
                     f"routing_coef must be [B,{N_ROUTES},K], got {tuple(routing_coef.shape)}"
 
                 if bidx == 0:
                     print(f"[routing_norm][{split_name}]", info)
 
-
-            if routing_coef is not None and bidx == 0:
-                debug_routing_tensor(
-                    routing_coef,
-                    name=f"{split_name}.routing_coef",
-                    expect_routes=N_ROUTES,
-                    expect_k=int(y.size(1))
-                )
-                quantization_check(routing_coef, name=f"{split_name}.routing_coef")
-            if bidx == 0:
-                mask_stats(mL, name=f"{split_name}.mL_batch")
-
-            logits    = _safe_tensor(logits.float(),    "eval.logits(fp32)")
-            prim_acts = _safe_tensor(prim_acts.float(), "eval.prim_acts(fp32)")
-
-            if routing_coef is not None:
+                # accumulate routing statistics (CPU)
                 has_routing = True
-                rc = routing_coef.detach().float().cpu()   # [B, N_ROUTES, K]
-                rc_mean_batch = rc.mean(dim=0)             # [N_ROUTES, K]
+                rc = routing_coef.detach().float().cpu()     # [B,R,K]
+                rc_mean_batch = rc.mean(dim=0)               # [R,K]
                 if rc_sum_mat is None:
                     rc_sum_mat = torch.zeros_like(rc_mean_batch)
                 rc_sum_mat += rc_mean_batch * y.size(0)
 
-            # debug prints/heatmaps on first batch
+                if bidx == 0:
+                    debug_routing_tensor(routing_coef, name=f"{split_name}.routing_coef", expect_routes=N_ROUTES, expect_k=int(y.size(1)))
+                    quantization_check(routing_coef, name=f"{split_name}.routing_coef")
+
+            if bidx == 0:
+                mask_stats(mL, name=f"{split_name}.mL_batch")
+
+            # optional verbose routing prints/heatmaps
             if route_debug and routing_coef is not None and bidx == 0:
-                names = label_names if label_names is not None else \
-                    [get_pheno_name(i) for i in range(routing_coef.size(2))]
-                print_route_matrix_detailed(
-                    routing_coef, prim_acts, names,
-                    where=f"{split_name} Batch {bidx}"
-                )
-                print_phenotype_routing_heatmap(
-                    routing_coef, prim_acts, names,
-                    where=f"{split_name} Epoch {epoch_idx if epoch_idx is not None else '?'}",
-                    top_k=None
-                )
+                names = label_names if label_names is not None else [get_pheno_name(i) for i in range(routing_coef.size(2))]
+                print_route_matrix_detailed(routing_coef, prim_acts, names, where=f"{split_name} Batch {bidx}")
+                print_phenotype_routing_heatmap(routing_coef, prim_acts, names, where=f"{split_name} Epoch {epoch_idx if epoch_idx is not None else '?'}", top_k=None)
                 if routing_out_dir is not None and epoch_idx is not None:
                     where_tag = f"{split_name.lower()}_epoch{epoch_idx:03d}"
-                    save_routing_heatmap(
-                        routing_coef, prim_acts, names,
-                        where=where_tag,
-                        out_dir=routing_out_dir
-                    )
+                    save_routing_heatmap(routing_coef, prim_acts, names, where=where_tag, out_dir=routing_out_dir)
 
             if not printed_unimodal:
                 printed_unimodal = True
@@ -1738,38 +2112,61 @@ def evaluate_epoch(
             if (not printed_caps_once) or (rpt_every > 0 and ((bidx + 1) % rpt_every == 0)):
                 printed_caps_once = True
                 keys = ", ".join(f"{k}:{tuple(v.shape)}" for k, v in route_embs.items())
-                print(
-                    f"[eval:caps] logits:{tuple(logits.shape)} "
-                    f"prim_acts:{tuple(prim_acts.shape)} routes -> {keys}"
-                )
-
+                print(f"[eval:caps] logits:{tuple(logits.shape)} prim_acts:{tuple(prim_acts.shape)} routes -> {keys}")
                 if bidx == 0:
                     route_cosine_report(route_embs)
 
             loss = loss_fn(logits, y.float())
 
-        total_loss += float(loss.item()) * y.size(0)
-        probs = torch.sigmoid(logits)
-        pred  = (probs >= 0.5).float()
-        total_correct += (pred == y.float()).sum().item()
-        total += y.numel()
-        num_samples += y.size(0)
+        # ---- accumulate loss / activations ----
+        bs = int(y.size(0))
+        total_loss += float(loss.item()) * bs
+        num_samples += bs
         act_sum += prim_acts.detach().float().cpu().sum(dim=0)
 
-    avg_loss = total_loss / max(1, num_samples)
-    avg_acc  = total_correct / max(1, total)
+        # ---- accumulate F1 counts @ 0.5 ----
+        probs = torch.sigmoid(logits)
+        pred = (probs >= 0.5)
+        yb   = (y >= 0.5)
 
-    avg_pa = (act_sum / max(1, num_samples)).numpy()  # [10]
-    avg_act_dict = {r: float(avg_pa[i]) for i, r in enumerate(route_names)}
+        pred_cpu = pred.detach().cpu()
+        y_cpu    = yb.detach().cpu()
+
+        if tp is None:
+            K = int(y_cpu.size(1))
+            tp = torch.zeros(K, dtype=torch.float64)
+            fp = torch.zeros(K, dtype=torch.float64)
+            fn = torch.zeros(K, dtype=torch.float64)
+
+        tp += (pred_cpu & y_cpu).sum(dim=0).to(torch.float64)
+        fp += (pred_cpu & (~y_cpu)).sum(dim=0).to(torch.float64)
+        fn += ((~pred_cpu) & y_cpu).sum(dim=0).to(torch.float64)
+
+    avg_loss = total_loss / max(1, num_samples)
+
+    # ---- F1_micro@0.5 and F1_macro@0.5 ----
+    if tp is None:
+        f1_micro05 = float("nan")
+        f1_macro05 = float("nan")
+    else:
+        den_micro = (2.0 * tp.sum() + fp.sum() + fn.sum())
+        f1_micro05 = float((2.0 * tp.sum() / den_micro).item()) if den_micro.item() > 0 else 0.0
+
+        den = (2.0 * tp + fp + fn)
+        f1_per_label = torch.where(den > 0, (2.0 * tp) / den, torch.zeros_like(den))
+        f1_macro05 = float(f1_per_label.mean().item())
+
+    avg_pa = (act_sum / max(1, num_samples)).numpy()  # [R]
+    avg_act_dict = {r: float(avg_pa[i]) for i, r in enumerate(ROUTE_NAMES)}
 
     if num_samples > 0 and has_routing and rc_sum_mat is not None:
-        avg_rc_mat = (rc_sum_mat / num_samples).numpy()   # [N_ROUTES, K]
-        avg_effective_mat = avg_rc_mat * avg_pa[:, None]  # [N_ROUTES, K]
+        avg_rc_mat = (rc_sum_mat / num_samples).numpy()   # [R,K]
+        avg_effective_mat = avg_rc_mat * avg_pa[:, None]  # [R,K]
     else:
         avg_rc_mat = None
         avg_effective_mat = None
 
-    return avg_loss, avg_acc, avg_act_dict, avg_rc_mat, avg_effective_mat, avg_pa
+    return avg_loss, f1_micro05, f1_macro05, avg_act_dict, avg_rc_mat, avg_effective_mat, avg_pa
 
 
 def save_checkpoint(path: str, state: Dict):
@@ -1786,7 +2183,13 @@ def load_checkpoint(path: str, behrt, bbert, imgenc, fusion, projector, cap_head
     projector.load_state_dict(ckpt["projector"])
     cap_head.load_state_dict(ckpt["cap_head"])
     optimizer.load_state_dict(ckpt["optimizer"])
-    print(f"[ckpt] loaded epoch={ckpt.get('epoch', 0)} val_acc={ckpt.get('val_acc', -1):.4f}")
+    print(
+        f"[ckpt] loaded epoch={ckpt.get('epoch', 0)} "
+        f"val_auroc={ckpt.get('val_auroc', float('nan')):.4f} "
+        f"val_f1_micro05={ckpt.get('val_f1_micro05', float('nan')):.4f} "
+        f"val_f1_macro05={ckpt.get('val_f1_macro05', float('nan')):.4f}"
+    )
+
     return int(ckpt.get("epoch", 0))
 
 
@@ -1823,6 +2226,8 @@ def collect_epoch_logits(
             outI = _enc_forward(imgenc, imgs, return_seq=True)
 
         outL = _ensure_encoder_dict(outL, "collect.L", mask_fallback=mL)
+        outL = _fix_seq_pool_shapes(outL, "collect.L", mask_fallback=mL, pool_mode="cls")
+
         outN = _ensure_encoder_dict(outN, "collect.N")
         outI = _ensure_encoder_dict(outI, "collect.I")
 
@@ -1834,6 +2239,11 @@ def collect_epoch_logits(
         with amp_ctx_caps:
             B = xL.size(0)
 
+            hasL = torch.tensor(
+                dbg.get("hasL", [1.0] * B),
+                device=DEVICE,
+                dtype=torch.float32,
+            )
             hasN = torch.tensor(
                 dbg.get("hasN", [1.0] * B),
                 device=DEVICE,
@@ -1844,8 +2254,8 @@ def collect_epoch_logits(
                 device=DEVICE,
                 dtype=torch.float32,
             )
+            route_mask = build_route_mask_from_modalities(hasL, hasN, hasI)
 
-            route_mask = build_route_mask_from_modalities(hasN, hasI)
 
             out = _capsule_forward_safe(
                 {"L": outL, "N": outN, "I": outI},
@@ -1939,6 +2349,8 @@ def collect_epoch_outputs(
             outI = _enc_forward(imgenc, imgs, return_seq=True)
         
         outL = _ensure_encoder_dict(outL, "collect.L", mask_fallback=mL)
+        outL = _fix_seq_pool_shapes(outL, "collect.L", mask_fallback=mL, pool_mode="cls")
+
         outN = _ensure_encoder_dict(outN, "collect.N")
         outI = _ensure_encoder_dict(outI, "collect.I")
 
@@ -1951,18 +2363,12 @@ def collect_epoch_outputs(
         with amp_ctx_caps:
             B = xL.size(0)
 
-            hasN = torch.tensor(
-                dbg.get("hasN", [1.0] * B),
-                device=DEVICE,
-                dtype=torch.float32,
-            )
-            hasI = torch.tensor(
-                dbg.get("hasI", [1.0] * B),
-                device=DEVICE,
-                dtype=torch.float32,
-            )
+            hasL = torch.tensor(dbg.get("hasL", [1.0] * B), device=DEVICE, dtype=torch.float32)
+            hasN = torch.tensor(dbg.get("hasN", [1.0] * B), device=DEVICE, dtype=torch.float32)
+            hasI = torch.tensor(dbg.get("hasI", [1.0] * B), device=DEVICE, dtype=torch.float32)
 
-            route_mask = build_route_mask_from_modalities(hasN, hasI)
+            route_mask = build_route_mask_from_modalities(hasL, hasN, hasI)
+
 
             out = _capsule_forward_safe(
                 {"L": outL, "N": outN, "I": outI},
@@ -2283,7 +2689,7 @@ def generate_split_heatmaps_and_tables(
     os.makedirs(out_dir, exist_ok=True)
 
     dummy_bce = nn.BCEWithLogitsLoss(reduction="mean")
-    loss, acc, act_dict, rc_mat, eff_mat, pa_vec = evaluate_epoch(
+    loss, f1_micro05, f1_macro05, act_dict, rc_mat, eff_mat, pa_vec = evaluate_epoch(
         behrt, bbert, imgenc, fusion, projector, cap_head,
         loader, amp_ctx_enc, amp_ctx_caps, dummy_bce,
         route_debug=False,
@@ -2414,10 +2820,13 @@ def generate_split_heatmaps_and_tables(
     )
 
     print(f"\n[{split_name}] Summary:")
-    print(f"  loss={loss:.4f} acc@0.5={acc:.4f} AUROC_macro={m['AUROC']:.4f} AUPRC_macro={m['AUPRC']:.4f}")
+    print(f"  loss={loss:.4f} F1_micro@0.5={f1_micro05:.4f} F1_macro@0.5={f1_macro05:.4f} "
+          f"AUROC_macro={m['AUROC']:.4f} AUPRC_macro={m['AUPRC']:.4f}")
+
     return {
         "loss": float(loss),
-        "acc": float(acc),
+        "f1_micro05": float(f1_micro05),
+        "f1_macro05": float(f1_macro05),
         "AUROC_macro": float(m["AUROC"]),
         "AUPRC_macro": float(m["AUPRC"]),
         "primary_activations": pa_vec.astype(np.float32),
@@ -2467,19 +2876,31 @@ def main():
     # Encoder autocast only 
     if use_amp:
         if precision == "fp16":
-            amp_ctx_enc = torch_amp.autocast(device_type="cuda", dtype=torch.float16)
+            precision_dtype = torch.float16
         elif precision == "bf16":
-            amp_ctx_enc = torch_amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+            precision_dtype = torch.bfloat16
         else:
-            # "auto" -> let PyTorch decide (often bf16 on A100/H100, fp16 otherwise)
-            amp_ctx_enc = torch_amp.autocast(device_type="cuda")
-    else:
-        amp_ctx_enc = nullcontext()
+            # "auto" -> PyTorch defaults to float16 on older GPUs 
+            # and bfloat16 on Ampere+ (A100, H100, RTX 30/40 series)
+            precision_dtype = None 
 
-    amp_ctx_caps = nullcontext()
+        # 2. Configure the contexts
+        if use_amp:
+            # We wrap the entire forward pass (Encoders + Capsules) in autocast
+            # to ensure all matrix multiplications use consistent dtypes.
+            amp_ctx_enc = torch_amp.autocast(device_type="cuda", dtype=precision_dtype)
+            amp_ctx_caps = amp_ctx_enc  # FIX: Align caps with encoder context
+        else:
+            amp_ctx_enc = nullcontext()
+            amp_ctx_caps = nullcontext()
 
-    from torch.cuda.amp import GradScaler
-    scaler = GradScaler(enabled=(use_amp and precision in {"auto", "fp16"}))
+    from torch.amp import GradScaler
+
+    scaler = GradScaler(
+        device="cuda" if use_cuda else "cpu",
+        enabled=(use_amp and precision in {"auto", "fp16"})
+    )
+
     print(f"[amp] use_amp={use_amp} precision={precision} scaler_enabled={scaler.is_enabled()}")
 
     # Datasets
@@ -2546,38 +2967,136 @@ def main():
         persistent_workers=(args.num_workers > 0),
     )
 
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=pin,
-        collate_fn=collate_eval,
-        worker_init_fn=seed_worker,
-        generator=g_eval,
-        persistent_workers=(args.num_workers > 0),
+    collate_eval_full = collate_fn_factory(
+        tidx=TASK_MAP[args.task],
+        img_tfms=build_image_transform("val"),
+        eval_drop_mode="none",
+        eval_drop_p=0.0,
     )
 
-    test_loader = DataLoader(
-        test_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=pin,
-        collate_fn=collate_eval,
-        worker_init_fn=seed_worker,
-        generator=g_eval,
-        persistent_workers=(args.num_workers > 0),
+    collate_eval_dropL = collate_fn_factory(
+        tidx=TASK_MAP[args.task],
+        img_tfms=build_image_transform("val"),
+        eval_drop_mode="drop_L",
+        eval_drop_p=1.0,
     )
+
+    collate_eval_dropN = collate_fn_factory(
+        tidx=TASK_MAP[args.task],
+        img_tfms=build_image_transform("val"),
+        eval_drop_mode="drop_N",
+        eval_drop_p=1.0,
+    )
+
+    collate_eval_dropI = collate_fn_factory(
+        tidx=TASK_MAP[args.task],
+        img_tfms=build_image_transform("val"),
+        eval_drop_mode="drop_I",
+        eval_drop_p=1.0,
+    )
+
+    collate_eval_random1 = collate_fn_factory(
+        tidx=TASK_MAP[args.task],
+        img_tfms=build_image_transform("val"),
+        eval_drop_mode="drop_one_random",
+        eval_drop_p=1.0,   # apply to every sample
+    )
+
+
+    val_loaders = {
+        "full": DataLoader(
+            val_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=pin,
+            collate_fn=collate_eval_full,
+            worker_init_fn=seed_worker, generator=g_eval,
+            persistent_workers=(args.num_workers > 0),
+        ),
+        "dropL": DataLoader(
+            val_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=pin,
+            collate_fn=collate_eval_dropL,
+            worker_init_fn=seed_worker, generator=g_eval,
+            persistent_workers=(args.num_workers > 0),
+        ),
+        "dropN": DataLoader(
+            val_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=pin,
+            collate_fn=collate_eval_dropN,
+            worker_init_fn=seed_worker, generator=g_eval,
+            persistent_workers=(args.num_workers > 0),
+        ),
+        "dropI": DataLoader(
+            val_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=pin,
+            collate_fn=collate_eval_dropI,
+            worker_init_fn=seed_worker, generator=g_eval,
+            persistent_workers=(args.num_workers > 0),
+        ),
+        "rand1": DataLoader(
+            val_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=pin,
+            collate_fn=collate_eval_random1,
+            worker_init_fn=seed_worker, generator=g_eval,
+            persistent_workers=(args.num_workers > 0),
+        ),
+    }
+
+    test_loaders = {
+        "full": DataLoader(
+            test_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=pin,
+            collate_fn=collate_eval_full,
+            worker_init_fn=seed_worker, generator=g_eval,
+            persistent_workers=(args.num_workers > 0),
+        ),
+        "dropL": DataLoader(
+            test_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=pin,
+            collate_fn=collate_eval_dropL,
+            worker_init_fn=seed_worker, generator=g_eval,
+            persistent_workers=(args.num_workers > 0),
+        ),
+        "dropN": DataLoader(
+            test_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=pin,
+            collate_fn=collate_eval_dropN,
+            worker_init_fn=seed_worker, generator=g_eval,
+            persistent_workers=(args.num_workers > 0),
+        ),
+        "dropI": DataLoader(
+            test_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=pin,
+            collate_fn=collate_eval_dropI,
+            worker_init_fn=seed_worker, generator=g_eval,
+            persistent_workers=(args.num_workers > 0),
+        ),
+        "rand1": DataLoader(
+            test_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=pin,
+            collate_fn=collate_eval_random1,
+            worker_init_fn=seed_worker, generator=g_eval,
+            persistent_workers=(args.num_workers > 0),
+        ),
+    }
+
+    val_loader  = val_loaders["full"]
+    test_loader = test_loaders["full"]
+
+
 
     train_eval_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=pin,
-        collate_fn=collate_eval,
+        collate_fn=collate_eval_full,   # <-- FIX HERE
         worker_init_fn=seed_worker,
         generator=g_eval,
         persistent_workers=(args.num_workers > 0),
     )
 
-
     # Encoders
     enc_cfg = EncoderConfig(
         d=_cfg("d", 256), dropout=_cfg("dropout", 0.0),
-        structured_seq_len=_cfg("structured_seq_len", -1),
+        structured_seq_len=_cfg("structured_seq_len", 256),
         structured_n_feats=_cfg("structured_n_feats", 17),
         structured_layers=_cfg("structured_layers", 2),
         structured_heads=_cfg("structured_heads", 8),
@@ -2729,10 +3248,11 @@ def main():
                 bbert.bert.eval()
 
 
-        total_loss, total_correct, total = 0.0, 0, 0
+        total_loss = 0.0
         act_sum = torch.zeros(N_ROUTES, dtype=torch.float32)
-
         num_samples = 0
+        tp = fp = fn = None  # per-label counts for F1@0.5
+
 
         for step, (xL, mL, notes, imgs, y, dbg) in enumerate(train_loader):
             if max_train_patients > 0 and seen_patients >= max_train_patients:
@@ -2760,6 +3280,8 @@ def main():
                 outI = _enc_forward(imgenc, imgs, return_seq=True)
 
             outL = _ensure_encoder_dict(outL, "train.L", mask_fallback=mL)
+            outL = _fix_seq_pool_shapes(outL, "train.L", mask_fallback=mL, pool_mode="cls")
+
             outN = _ensure_encoder_dict(outN, "train.N")
             outI = _ensure_encoder_dict(outI, "train.I")
 
@@ -2878,39 +3400,74 @@ def main():
             safe_zero_grad(optimizer)
             total_loss += float(loss.item()) * y.size(0)
 
+            # ---- TRAIN F1 counts @ 0.5 ----
             probs = torch.sigmoid(logits)
-            pred = (probs >= 0.5).float()
-            total_correct += (pred == y.float()).sum().item()
-            total += y.numel()
+            pred = (probs >= 0.5)
+            yb   = (y >= 0.5)
+
+            pred_cpu = pred.detach().cpu()
+            y_cpu    = yb.detach().cpu()
+
+            if tp is None:
+                K = int(y_cpu.size(1))
+                tp = torch.zeros(K, dtype=torch.float64)
+                fp = torch.zeros(K, dtype=torch.float64)
+                fn = torch.zeros(K, dtype=torch.float64)
+
+            tp += (pred_cpu & y_cpu).sum(dim=0).to(torch.float64)
+            fp += (pred_cpu & (~y_cpu)).sum(dim=0).to(torch.float64)
+            fn += ((~pred_cpu) & y_cpu).sum(dim=0).to(torch.float64)
+
 
             act_sum += prim_acts.detach().cpu().sum(dim=0)
             num_samples += y.size(0)
 
             if args.log_every > 0 and ((step + 1) % args.log_every == 0):
                 avg_loss_step = total_loss / max(1, num_samples)
-                avg_acc_step  = total_correct / max(1, total)
-                avg_act = (act_sum / max(1, num_samples)).tolist()
 
-                routes = ROUTE_NAMES[:N_ROUTES]
+                if tp is None:
+                    f1_micro_step = float("nan")
+                else:
+                    den_micro = (2.0 * tp.sum() + fp.sum() + fn.sum())
+                    f1_micro_step = float((2.0 * tp.sum() / den_micro).item()) if den_micro.item() > 0 else 0.0
+
+                # avg_act: list of length R
+                avg_act = (act_sum / max(1, num_samples)).detach().float().cpu().tolist()
+                R = len(avg_act)
+
+                # ---- FIX: ensure `routes` is always defined before using it ----
+                _route_names = None
+                try:
+                    # use whatever object is in-scope here (fusion/module)
+                    _route_names = getattr(fusion, "route_names", None)
+                except Exception:
+                    _route_names = None
+
+                if _route_names is None:
+                    routes = [f"R{i}" for i in range(R)]
+                else:
+                    routes = list(_route_names)
+                    if len(routes) != R:
+                        routes = [f"R{i}" for i in range(R)]
 
                 msg = (
                     f"[epoch {epoch + 1} step {step + 1}] "
-                    f"loss={avg_loss_step:.4f} acc={avg_acc_step:.4f} "
-                    f"avg_prim_act=" + " | ".join(
-                        f"{r}:{avg_act[i]:.3f}" for i, r in enumerate(routes)
-                    )
+                    f"loss={avg_loss_step:.4f} f1_micro@0.5={f1_micro_step:.4f} "
+                    f"avg_prim_act=" + " | ".join(f"{routes[i]}:{avg_act[i]:.3f}" for i in range(R))
                 )
+
                 if routing_coef is not None:
-                    # routing_coef is guaranteed [B,R,K] from the asserts above
+                    # routing_coef guaranteed [B,R,K]
                     rc_route_mean = routing_coef.detach().float().mean(dim=(0, 2))  # [R]
                     rc_route_mean = rc_route_mean.cpu().tolist()
 
-                    rc_str = " | ".join(
-                        f"{r}:{rc_route_mean[i]:.3f}" for i, r in enumerate(routes)
-                    )
+                    # keep consistent with computed R
+                    rcR = min(len(rc_route_mean), R)
+                    rc_str = " | ".join(f"{routes[i]}:{rc_route_mean[i]:.3f}" for i in range(rcR))
                     msg += f" | [routing mean coeff] {rc_str}"
 
                 print(msg)
+
 
                 if max(avg_act) > 0.95:
                     dom_route = int(np.argmax(avg_act))
@@ -2921,16 +3478,27 @@ def main():
 
         # Epoch summary (TRAIN)
         train_loss = total_loss / max(1, num_samples)
-        train_acc  = total_correct / max(1, total)
+
+        if tp is None:
+            train_f1_micro05 = float("nan")
+            train_f1_macro05 = float("nan")
+        else:
+            den_micro = (2.0 * tp.sum() + fp.sum() + fn.sum())
+            train_f1_micro05 = float((2.0 * tp.sum() / den_micro).item()) if den_micro.item() > 0 else 0.0
+
+            den = (2.0 * tp + fp + fn)
+            f1_per_label = torch.where(den > 0, (2.0 * tp) / den, torch.zeros_like(den))
+            train_f1_macro05 = float(f1_per_label.mean().item())
 
         train_avg_act = (act_sum / max(1, num_samples)).tolist()
         print(
-            f"[epoch {epoch + 1}] TRAIN loss={train_loss:.4f} acc={train_acc:.4f} "
+            f"[epoch {epoch + 1}] TRAIN loss={train_loss:.4f} "
+            f"F1_micro@0.5={train_f1_micro05:.4f} F1_macro@0.5={train_f1_macro05:.4f} "
             f"avg_prim_act={', '.join(f'{a:.3f}' for a in train_avg_act)}"
         )
 
         # VAL metrics (BCE + 0.5 threshold / F1-based thresholds)
-        val_loss, val_acc, val_act, val_rc_mat, val_eff_mat, val_pa = evaluate_epoch(
+        val_loss, val_f1_micro05, val_f1_macro05, val_act, val_rc_mat, val_eff_mat, val_pa = evaluate_epoch(
             behrt, bbert, imgenc, fusion, projector, cap_head,
             val_loader, amp_ctx_enc, amp_ctx_caps, bce,
             route_debug=bool(getattr(args, "route_debug", False)),
@@ -3081,7 +3649,8 @@ def main():
             "projector": projector.state_dict(),
             "cap_head": cap_head.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "val_acc": float(val_acc),  
+            "val_f1_micro05": float(val_f1_micro05),
+            "val_f1_macro05": float(val_f1_macro05),
             "val_auroc": float(val_score),    
             "best_thr": torch.from_numpy(best_thr.astype(np.float32)),
         }
@@ -3089,7 +3658,10 @@ def main():
         
         if is_best:
             save_checkpoint(os.path.join(ckpt_dir, "best.pt"), ckpt)
-            print(f"[epoch {epoch + 1}] Saved BEST checkpoint (VAL AUROC={val_score:.4f} | val_acc@0.5={float(val_acc):.4f})")
+            print(
+                f"[epoch {epoch + 1}] Saved BEST checkpoint (VAL AUROC={val_score:.4f} | "
+                f"F1_micro@0.5={val_f1_micro05:.4f} | F1_macro@0.5={val_f1_macro05:.4f})"
+            )
 
     # TEST evaluation using BEST checkpoint
     print("[main] Evaluating BEST checkpoint on TEST...")
@@ -3104,7 +3676,7 @@ def main():
         projector.load_state_dict(ckpt["projector"])
         cap_head.load_state_dict(ckpt["cap_head"])
 
-    test_loss, test_acc, test_act, test_rc_mat, test_eff_mat, test_pa = evaluate_epoch(
+    test_loss, test_f1_micro05, test_f1_macro05, test_act, test_rc_mat, test_eff_mat, test_pa = evaluate_epoch(
         behrt, bbert, imgenc, fusion, projector, cap_head,
         test_loader, amp_ctx_enc, amp_ctx_caps, bce,
         route_debug=False,
@@ -3113,9 +3685,10 @@ def main():
     )
 
     print(
-        f"[TEST] loss={test_loss:.4f} acc={test_acc:.4f} "
+        f"[TEST] loss={test_loss:.4f} F1_micro@0.5={test_f1_micro05:.4f} F1_macro@0.5={test_f1_macro05:.4f} "
         f"avg_prim_act={', '.join(f'{k}:{v:.3f}' for k, v in test_act.items())}"
     )
+
 
     # Routing importance: global and per-phenotype (TEST) 
     routes = ["L","N","I","LN","NL","LI","IL","NI","IN","LNI"]
