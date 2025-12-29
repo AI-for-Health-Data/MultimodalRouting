@@ -46,12 +46,42 @@ def _ensure_2d_mask(
     B: int,
     T: int,
     device,
+    x: Optional[torch.Tensor] = None,
+    eps: float = 0.0,
 ) -> torch.Tensor:
+    """
+    Return [B,T] float mask where 1=valid timestep.
+
+    If mask is None and x is provided, auto-build mask from x:
+      valid(t) = any(|x[b,t,f]| > eps) AND all finite (no nan/inf)
+
+    If mask is None and x is NOT provided, default to all-ones (backward compat).
+    """
     if mask is None:
-        return torch.ones(B, T, device=device, dtype=torch.float32)
+        if x is None:
+            return torch.ones(B, T, device=device, dtype=torch.float32)
+
+        # x expected [B,T,F] or [B,T,1]
+        xx = x
+        if xx.dim() == 2:
+            xx = xx.unsqueeze(-1)
+        if xx.size(0) != B or xx.size(1) != T:
+            # fallback: keep safe behavior
+            return torch.ones(B, T, device=device, dtype=torch.float32)
+
+        # valid if any feature nonzero
+        nonzero = (xx.abs().sum(dim=-1) > eps)
+
+        # valid only if finite too
+        finite = torch.isfinite(xx).all(dim=-1)
+
+        m = (nonzero & finite).float().to(device)
+        return m
+
     if mask.dim() == 1:
-        return mask.unsqueeze(0).expand(B, -1).contiguous().float()
-    return mask.float()
+        return mask.unsqueeze(0).expand(B, -1).contiguous().float().to(device)
+    return mask.float().to(device)
+
 
 # Structured encoder (BEHRT-style)
 class BEHRTLabEncoder(nn.Module):
@@ -119,11 +149,10 @@ class BEHRTLabEncoder(nn.Module):
         self._warned_dead = False
 
     def _pos(self, T: int) -> torch.Tensor:
-
         if T > self.pos.size(1):
             raise ValueError(
                 f"Input length T={T} exceeds max_seq_len={self.pos.size(1)}. "
-                "Increase structured_seq_len (max_seq_len) in config/build_encoders."
+                f"Increase EncoderConfig.structured_seq_len (e.g., 256)."
             )
         return self.pos[:, :T, :]
 
@@ -191,7 +220,7 @@ class BEHRTLabEncoder(nn.Module):
 
         B, T, _ = x.shape
         dev = next(self.parameters()).device
-        m = _ensure_2d_mask(mask, B, T, dev)
+        m = _ensure_2d_mask(mask, B, T, dev, x=x)
 
         h, m_out, _ = self._encode_with_optional_cls(x.to(dev), m.to(dev))
 
@@ -216,18 +245,25 @@ class BEHRTLabEncoder(nn.Module):
 
         B, T, _ = x.shape
         dev = next(self.parameters()).device
-        m = _ensure_2d_mask(mask, B, T, dev)
+
+        # auto-mask from x if mask is None
+        m = _ensure_2d_mask(mask, B, T, dev, x=x)
 
         seq_h, m_out, cls_vec = self._encode_with_optional_cls(x.to(dev), m.to(dev))
 
         if self.pool == "cls":
             z = cls_vec
+
         elif self.pool == "last":
-            if (m_out.sum(dim=1) != m_out.size(1)).any():
-                idx = (m_out.sum(dim=1) - 1).clamp_min(0).long()
-                z = seq_h[torch.arange(seq_h.size(0), device=seq_h.device), idx]
-            else:
-                z = seq_h[:, -1]
+            # SAFE last: handle samples with 0 valid timesteps
+            lengths = m_out.sum(dim=1)  # [B] float
+            idx = (lengths - 1).clamp_min(0).long()  # [B]
+            z = seq_h[torch.arange(seq_h.size(0), device=seq_h.device), idx]  # [B,D]
+
+            # if no valid timesteps, zero out embedding
+            no_valid = (lengths < 0.5).float().unsqueeze(-1)  # [B,1]
+            z = z * (1.0 - no_valid)
+
         else:
             z = _masked_mean(seq_h, m_out)
 
@@ -238,17 +274,6 @@ class BEHRTLabEncoder(nn.Module):
                     self._warned_dead = True
 
         return seq_h, m_out, z
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Return pooled embedding [B,D] using configured pooling.
-        """
-        _, _, z = self.encode_seq_and_pool(x, mask=mask)
-        return z
 
 
 # Bio-ClinicalBERT encoder (text)
@@ -262,7 +287,7 @@ class BioClinBERTEncoder(nn.Module):
 
     Returns:
         encode_seq(...) -> ([B, S_max, D], [B, S_max]) per-chunk CLS + mask
-        forward(...)    -> [B, D] pooled over chunks (masked mean)
+        forward(...)    -> [B, D] pooled over chunks (mean or attention)
     """
 
     def __init__(
@@ -277,8 +302,10 @@ class BioClinBERTEncoder(nn.Module):
         self.model_name = model_name
         self.hf_available = False
         self.bert: Optional[nn.Module] = None
-        self.chunk_bs = int(getattr(CFG, "bert_chunk_bs", 8))
-        self.chunk_bs = max(1, self.chunk_bs)
+
+        # how many note chunks to run through HF model at once (to avoid OOM)
+        self.chunk_bs = max(1, int(getattr(CFG, "bert_chunk_bs", 8)))
+
         try:
             from transformers import AutoModel
             self.bert = AutoModel.from_pretrained(model_name)
@@ -295,6 +322,7 @@ class BioClinBERTEncoder(nn.Module):
 
         self.hidden = hidden
 
+        # projection to cfg.d if needed
         if d is not None and d != hidden:
             self.proj = nn.Sequential(
                 nn.LayerNorm(hidden),
@@ -305,13 +333,42 @@ class BioClinBERTEncoder(nn.Module):
             self.proj = nn.Identity()
             self.out_dim = int(hidden)
 
-        self.drop = nn.Identity()
+        # dropout AFTER projection (applies even if BERT is frozen)
+        self.drop = nn.Dropout(dropout) if (dropout and dropout > 0) else nn.Identity()
+
+        # pooling across chunks: mean or attention
+        self.note_agg = str(getattr(CFG, "note_agg", "mean")).lower()
+        if self.note_agg not in ("mean", "attention"):
+            self.note_agg = "mean"
+
+        if self.note_agg == "attention":
+            self.attn_pool = nn.Sequential(
+                nn.LayerNorm(self.out_dim),
+                nn.Linear(self.out_dim, 1, bias=False),
+            )
+        else:
+            self.attn_pool = None
 
         if self.hf_available and self.bert is not None:
             self.bert.eval()
 
     def _device(self) -> torch.device:
         return next(self.parameters()).device
+
+    def _bert_forward(self, ids: torch.Tensor, attn: torch.Tensor):
+        """
+        Freeze/unfreeze ONLY the HF BERT using CFG.finetune_text.
+        Projection + attention pooling can still train even if BERT is frozen.
+        """
+        if self.bert is None:
+            raise RuntimeError("BERT backbone is None.")
+
+        finetune = bool(getattr(CFG, "finetune_text", False))
+        if finetune:
+            return self.bert(input_ids=ids, attention_mask=attn)
+
+        with torch.no_grad():
+            return self.bert(input_ids=ids, attention_mask=attn)
 
     @staticmethod
     def _is_pretok_item(item) -> bool:
@@ -342,6 +399,11 @@ class BioClinBERTEncoder(nn.Module):
         )
 
     def _encode_chunks_to_cls(self, ids: torch.Tensor, attn: torch.Tensor) -> torch.Tensor:
+        """
+        ids:  [S,L] or [L]
+        attn: [S,L] or [L]
+        returns: [S, out_dim]
+        """
         if ids.dim() == 1:
             ids = ids.unsqueeze(0)
         if attn.dim() == 1:
@@ -349,10 +411,9 @@ class BioClinBERTEncoder(nn.Module):
 
         S = ids.size(0)
         if S == 0:
-            # IMPORTANT: allow “missing notes” safely
             return torch.zeros(0, self.out_dim, device=self._device())
 
-        if not self.hf_available or self.bert is None:
+        if (not self.hf_available) or (self.bert is None):
             return torch.zeros(S, self.out_dim, device=self._device())
 
         dev = self._device()
@@ -362,33 +423,24 @@ class BioClinBERTEncoder(nn.Module):
         ids = ids.to(device=dev, dtype=torch.long)
         attn = attn.to(device=dev, dtype=torch.long)
 
-        S = ids.size(0)
-
-        chunk_bs = int(getattr(self, "chunk_bs", 8))   
-        chunk_bs = max(1, chunk_bs)
-
         outs = []
-        for s0 in range(0, S, chunk_bs):
-            s1 = min(S, s0 + chunk_bs)
+        for s0 in range(0, S, self.chunk_bs):
+            s1 = min(S, s0 + self.chunk_bs)
+            out = self._bert_forward(ids[s0:s1], attn[s0:s1])
 
-            out = self.bert(
-                input_ids=ids[s0:s1],
-                attention_mask=attn[s0:s1],
-            )
             cls = out.last_hidden_state[:, 0]  # [bs, hidden]
             cls = self.proj(cls)               # [bs, out_dim]
-            cls = self.drop(cls)
+            cls = self.drop(cls)               # dropout after proj
             outs.append(cls)
+
         return torch.cat(outs, dim=0)  # [S, out_dim]
 
-    def encode_seq(
-        self,
-        notes_or_chunks,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def encode_seq(self, notes_or_chunks) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
-            Hpad: [B, S_max, D]
-            M:    [B, S_max] float mask
+            Hpad: [B, Smax>=1, D]
+            M:    [B, Smax>=1] float mask
+        Missing notes => M row all zeros and H row all zeros.
         """
         dev = self._device()
         batch = self._normalize_batch(notes_or_chunks)
@@ -402,17 +454,18 @@ class BioClinBERTEncoder(nn.Module):
             if isinstance(patient, dict):
                 ids = patient["input_ids"].to(dev)
                 attn = patient["attention_mask"].to(dev)
-                cls = self._encode_chunks_to_cls(ids, attn)  # [S, D]
+                cls = self._encode_chunks_to_cls(ids, attn)  # [S,D]
                 collected.append(cls)
             else:
+                # list of (ids, attn)
                 for (ids, attn) in patient:
-                    cls = self._encode_chunks_to_cls(ids.to(dev), attn.to(dev))  # [1,D] or [S,D]
+                    cls = self._encode_chunks_to_cls(ids.to(dev), attn.to(dev))
                     collected.append(cls)
 
             if len(collected) == 0:
-                H = torch.zeros(1, self.out_dim, device=dev)
+                H = torch.zeros(0, self.out_dim, device=dev)
             else:
-                H = torch.cat(collected, dim=0)  # [S, D]
+                H = torch.cat(collected, dim=0)  # [S,D]
 
             seqs.append(H)
             lengths.append(H.size(0))
@@ -423,33 +476,49 @@ class BioClinBERTEncoder(nn.Module):
                 torch.zeros(0, 1, device=dev),
             )
 
-        Smax = max(lengths)
+        Smax = max(lengths) if lengths else 0
+        Smax = max(Smax, 1)  # keep >=1 dimension
+
         B = len(seqs)
         Hpad = torch.zeros(B, Smax, self.out_dim, device=dev)
         M = torch.zeros(B, Smax, device=dev)
 
         for i, H in enumerate(seqs):
             s = H.size(0)
-            Hpad[i, :s] = H
-            M[i, :s] = 1.0
+            if s > 0:
+                Hpad[i, :s] = H
+                M[i, :s] = 1.0
 
         return Hpad, M
 
-    @staticmethod
-    def pool_from_seq(H: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
+    def pool_from_seq(self, H: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
+        """
+        H: [B,S,D], M:[B,S] float
+        returns z: [B,D]
+        """
+        M = M.float()
+
+        if self.note_agg == "attention" and self.attn_pool is not None:
+            logits = self.attn_pool(H).squeeze(-1)  # [B,S]
+            logits = logits.masked_fill(M < 0.5, float("-inf"))
+
+            # prevent NaNs if all masked
+            all_masked = (M.sum(dim=1) < 0.5)  # [B]
+            logits = torch.where(all_masked.unsqueeze(1), torch.zeros_like(logits), logits)
+
+            w = torch.softmax(logits, dim=1)  # [B,S]
+            z = (H * w.unsqueeze(-1)).sum(dim=1)  # [B,D]
+            return z
+
         denom = M.sum(dim=1, keepdim=True).clamp_min(1.0)
         return (H * M.unsqueeze(-1)).sum(dim=1) / denom
 
     def forward(self, notes_or_chunks) -> torch.Tensor:
-        """
-        Pooled chunk-CLS vectors -> [B, D].
-        Respects CFG.finetune_text.
-        """
-        requires_grad = bool(getattr(CFG, "finetune_text", False))
-        with torch.set_grad_enabled(requires_grad):
-            H, M = self.encode_seq(notes_or_chunks)
-            z = self.pool_from_seq(H, M)
-        return z
+        H, M = self.encode_seq(notes_or_chunks)
+        return self.pool_from_seq(H, M)
+
+
+
 
 # MedFuse-style image encoder & fusion-facing wrapper
 class MedFuseImageEncoder(nn.Module):
@@ -852,15 +921,22 @@ class MultimodalFeatureExtractor(nn.Module):
         self.act_NI = RouteActivation(d, temp=temp, gate_min=gmin, gate_max=gmax)
         self.act_LNI = RouteActivation(d, temp=temp, gate_min=gmin, gate_max=gmax)
         self.unim_ln = nn.LayerNorm(d)
-
+ 
     def _pool_uni(self, X: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
         """
         Pool a unimodal sequence [B,T,D] given mask [B,T].
         """
         if self.cfg.unimodal_pool == "last":
-            last_idx = (M.sum(dim=1) - 1).clamp_min(0).long()
-            return X[torch.arange(X.size(0), device=X.device), last_idx]
+            lengths = M.sum(dim=1)  # [B]
+            idx = (lengths - 1).clamp_min(0).long()  # [B]
+            z = X[torch.arange(X.size(0), device=X.device), idx]  # [B,D]
+
+            # if a sample has no valid timesteps, zero it out
+            no_valid = (lengths < 0.5).float().unsqueeze(-1)  # [B,1]
+            return z * (1.0 - no_valid)
+
         return _masked_mean(X, M)
+
 
     def forward(
         self,
@@ -919,7 +995,7 @@ class EncoderConfig:
     dropout: float = 0.0
 
     # structured
-    structured_seq_len: int = 48
+    structured_seq_len: int = 256
     structured_n_feats: int = 17
     structured_layers: int = 2
     structured_heads: int = 8
@@ -1017,6 +1093,17 @@ def encode_modalities_for_routing(
 ) -> Dict[str, Dict[str, torch.Tensor]]:
     dev = next(behrt.parameters()).device
 
+    # --- ensure mL + hasL exist for structured modality ---
+    B, T = xL.size(0), xL.size(1)
+
+    if mL is None:
+        # Build mask from xL: valid bin = any nonzero feature and finite
+        mL = _ensure_2d_mask(None, B, T, dev, x=xL)
+
+    if hasL is None:
+        # hasL=1 if there is at least one valid timestep
+        hasL = (mL.sum(dim=1) > 0.5).float()
+
     mL_dev = (mL.to(dev) if mL is not None else None)
     L_seq, L_mask, L_pool = behrt.encode_seq_and_pool(xL.to(dev), mask=mL_dev)
 
@@ -1030,6 +1117,10 @@ def encode_modalities_for_routing(
     N_seq, N_mask = bbert.encode_seq(notes_list)
     N_pool = bbert.pool_from_seq(N_seq, N_mask)
 
+    # safety: ensure everything is on dev
+    N_seq, N_mask, N_pool = N_seq.to(dev), N_mask.to(dev), N_pool.to(dev)
+
+
     if hasN is not None:
         hN = hasN.to(dev).float().view(-1, 1, 1)
         hN2 = hasN.to(dev).float().view(-1, 1)
@@ -1039,6 +1130,8 @@ def encode_modalities_for_routing(
 
     imgs_dev = imgs.to(dev) if isinstance(imgs, torch.Tensor) else imgs
     I_seq, I_mask, I_pool = imgenc.encode_seq_and_pool(imgs_dev)
+    I_seq, I_mask, I_pool = I_seq.to(dev), I_mask.to(dev), I_pool.to(dev)
+
 
     if hasI is not None:
         hI = hasI.to(dev).float().view(-1, 1, 1)
