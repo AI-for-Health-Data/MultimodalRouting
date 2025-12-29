@@ -143,6 +143,14 @@ class CrossAttentionFusion(nn.Module):
         validB = (mB > 0.5).any(dim=1)  # [B]
 
         key_pad = (mB < 0.5)  # True=PAD for MultiheadAttention
+
+        # --- FIX: align Q/K/V dtype with MHA weights to avoid bf16 != fp32 ---
+        attn_dtype = self.attn.in_proj_weight.dtype
+        if A.dtype != attn_dtype:
+            A = A.to(dtype=attn_dtype)
+        if B.dtype != attn_dtype:
+            B = B.to(dtype=attn_dtype)
+
         A2B, _ = self.attn(query=A, key=B, value=B, key_padding_mask=key_pad, need_weights=False)
 
         X = self.ln1(A + A2B)
@@ -184,6 +192,13 @@ class TriTokenAttentionFusion(nn.Module):
         validKV = (m > 0.5).any(dim=1)  # [B]
 
         kv_pad = (m < 0.5)
+        # --- FIX: align Q/K/V dtype with MHA weights ---
+        attn_dtype = self.attn.in_proj_weight.dtype
+        if q.dtype != attn_dtype:
+            q = q.to(dtype=attn_dtype)
+        if kv.dtype != attn_dtype:
+            kv = kv.to(dtype=attn_dtype)
+
         out, _ = self.attn(query=q, key=kv, value=kv, key_padding_mask=kv_pad, need_weights=False)
         z = out[:, 0, :]  # [B,D]
         if not validKV.all():
