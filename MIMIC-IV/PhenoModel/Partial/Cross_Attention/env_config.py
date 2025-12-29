@@ -98,10 +98,12 @@ class Config:
     notes_chunk_len: int = 512               # keep consistent with pretokenization
     notes_max_chunks: int = -1               # -1 => keep all chunks (whole stay)
     bert_chunk_bs: int = 8
+    note_agg: str = "attention"
+
 
     # Structured
     feature_mode: str = "seq"   # "seq" or "pool" 
-    structured_seq_len: int = -1             # -1 => keep all time bins (whole stay)
+    structured_seq_len: int = 256             # -1 => keep all time bins (whole stay)
     structured_pos_max_len: int = 2048
     structured_n_feats: int = 17
     structured_layers: int = 2
