@@ -1,4 +1,3 @@
-# transformer.py
 import math
 import torch
 from torch import nn
@@ -9,9 +8,6 @@ from multihead_attention import MultiheadAttention
 
 
 class TransformerEncoder(nn.Module):
-    """
-    Expects inputs in fairseq style: [T, B, C]
-    """
     def __init__(
         self,
         embed_dim,
@@ -54,7 +50,6 @@ class TransformerEncoder(nn.Module):
         self.layer_norm = nn.LayerNorm(self.embed_dim) if self.normalize else None
 
     def forward(self, x_in, x_in_k=None, x_in_v=None):
-
         """
         x_in:   [T, B, C]
         x_in_k: [T2, B, C] optional
@@ -63,7 +58,6 @@ class TransformerEncoder(nn.Module):
         x = self.embed_scale * x_in
 
         if self.embed_positions is not None:
-            # build fake "token ids" from first channel, shape [B, T]
             pos = self.embed_positions(x_in.transpose(0, 1)[:, :, 0]).transpose(0, 1)  # [T,B,C]
             x = x + pos
 
@@ -108,25 +102,20 @@ class TransformerEncoderLayer(nn.Module):
         self.embed_dim = int(embed_dim)
         self.num_heads = int(num_heads)
         self.attn_mask = bool(attn_mask)
-
         self.self_attn = MultiheadAttention(
             embed_dim=self.embed_dim,
             num_heads=self.num_heads,
             attn_dropout=float(attn_dropout),
         )
-
         self.relu_dropout = float(relu_dropout)
         self.res_dropout = float(res_dropout)
         self.normalize_before = True
-
         self.fc1 = Linear(self.embed_dim, 4 * self.embed_dim)
         self.fc2 = Linear(4 * self.embed_dim, self.embed_dim)
 
-        # exactly 2 layer norms (i=0 attn block, i=1 ffn block)
         self.layer_norms = nn.ModuleList([nn.LayerNorm(self.embed_dim) for _ in range(2)])
 
     def forward(self, x, x_k=None, x_v=None):
-        # --- self-attn / cross-attn block ---
         residual = x
         x = self.maybe_layer_norm(0, x, before=True)
 
@@ -143,7 +132,6 @@ class TransformerEncoderLayer(nn.Module):
         x = residual + x
         x = self.maybe_layer_norm(0, x, after=True)
 
-        # --- FFN block ---
         residual = x
         x = self.maybe_layer_norm(1, x, before=True)
         x = F.relu(self.fc1(x))
@@ -158,7 +146,6 @@ class TransformerEncoderLayer(nn.Module):
         assert before ^ after
         if after ^ self.normalize_before:
             ln = self.layer_norms[i]
-            # ---- device guard (fix cpu/cuda mismatch) ----
             if ln.weight.device != x.device:
                 self.layer_norms[i] = ln.to(x.device)
                 ln = self.layer_norms[i]
