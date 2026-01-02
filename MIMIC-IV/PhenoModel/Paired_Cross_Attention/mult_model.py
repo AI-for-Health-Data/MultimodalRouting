@@ -27,18 +27,13 @@ class MULTModel(nn.Module):
         self.out_dropout = out_dropout
         self.embed_dropout = embed_dropout
         self.attn_mask = attn_mask
-
-        # 1. Temporal conv projections (MulT expects [B, T, D] inputs)
         self.proj_l = nn.Conv1d(self.orig_d_l, self.d_l, kernel_size=1, padding=0, bias=False)
         self.proj_n = nn.Conv1d(self.orig_d_n, self.d_n, kernel_size=1, padding=0, bias=False)
         self.proj_i = nn.Conv1d(self.orig_d_i, self.d_i, kernel_size=1, padding=0, bias=False)
-
-        # Self-attn per modality
         self.trans_l = self.get_network(self_type='l_only', layers=self.self_layers)
         self.trans_n = self.get_network(self_type='n_only', layers=self.self_layers)
         self.trans_i = self.get_network(self_type='i_only', layers=self.self_layers)
 
-        # Crossmodal attention blocks
         if self.lonly:
             self.trans_l_with_n = self.get_network(self_type='ln')
             self.trans_l_with_i = self.get_network(self_type='li')
@@ -91,7 +86,6 @@ class MULTModel(nn.Module):
         proj_x_n = x_n if self.orig_d_n == self.d_n else self.proj_n(x_n)
         proj_x_i = x_i if self.orig_d_i == self.d_i else self.proj_i(x_i)
 
-        # -> [T,B,D]
         proj_x_l = proj_x_l.permute(2, 0, 1)
         proj_x_n = proj_x_n.permute(2, 0, 1)
         proj_x_i = proj_x_i.permute(2, 0, 1)
@@ -111,7 +105,7 @@ class MULTModel(nn.Module):
         h_i_with_ls = self.trans_i_with_l(proj_x_i, proj_x_l, proj_x_l)
         h_i_with_ns = self.trans_i_with_n(proj_x_i, proj_x_n, proj_x_n)
 
-        # last timestep pooled (MulT style)
+        # last timestep pooled 
         h_l_last = h_l_only[-1]      # [B, d]
         h_n_last = h_n_only[-1]
         h_i_last = h_i_only[-1]
