@@ -46,7 +46,6 @@ class MultiheadAttention(nn.Module):
             nn.init.xavier_normal_(self.bias_v)
 
     def forward(self, query, key, value, attn_mask=None):
-        # --- DEBUG: print device placement once ---
         if not hasattr(self, "_printed_dev"):
             self._printed_dev = True
             print("[MHA dev] query:", query.device,
@@ -78,7 +77,6 @@ class MultiheadAttention(nn.Module):
             k = self.in_proj_k(key)
             v = self.in_proj_v(value)
 
-        # ✅ IMPORTANT: out-of-place scaling (no q *= ...)
         q = q * self.scaling
 
         if self.bias_k is not None:
@@ -86,10 +84,8 @@ class MultiheadAttention(nn.Module):
             k = torch.cat([k, self.bias_k.repeat(1, bsz, 1)], dim=0)
             v = torch.cat([v, self.bias_v.repeat(1, bsz, 1)], dim=0)
             if attn_mask is not None:
-                # note: new_zeros is fine; not an in-place op
                 attn_mask = torch.cat([attn_mask, attn_mask.new_zeros(attn_mask.size(0), 1)], dim=1)
 
-        # reshape to (bsz*num_heads, seq, head_dim)
         q = q.contiguous().view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
         if k is not None:
             k = k.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
@@ -99,7 +95,7 @@ class MultiheadAttention(nn.Module):
         src_len = k.size(1)
 
         if self.add_zero_attn:
-            src_len = src_len + 1  # ✅ out-of-place
+            src_len = src_len + 1  
             k = torch.cat([k, k.new_zeros((k.size(0), 1) + k.size()[2:])], dim=1)
             v = torch.cat([v, v.new_zeros((v.size(0), 1) + v.size()[2:])], dim=1)
             if attn_mask is not None:
@@ -108,20 +104,14 @@ class MultiheadAttention(nn.Module):
         attn_weights = torch.bmm(q, k.transpose(1, 2))
         assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]
 
-        # ✅ Safe masking:
-        # - If attn_mask is float/additive: add it (out-of-place)
-        # - If attn_mask is bool: masked_fill (out-of-place)
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
-                # expected shapes often [tgt_len, src_len] or [bsz, tgt_len, src_len]
-                # we broadcast with unsqueeze(0) for the [tgt_len, src_len] case
                 mask = attn_mask.unsqueeze(0) if attn_mask.dim() == 2 else attn_mask
                 neg_inf = torch.finfo(attn_weights.dtype).min
                 attn_weights = attn_weights.masked_fill(mask, neg_inf)
             else:
                 attn_weights = attn_weights + attn_mask.unsqueeze(0)
 
-        # softmax in fp32 for stability, then cast back (out-of-place)
         attn_weights = F.softmax(attn_weights.float(), dim=-1).to(dtype=attn_weights.dtype)
         attn_weights = F.dropout(attn_weights, p=self.attn_dropout, training=self.training)
 
@@ -131,7 +121,6 @@ class MultiheadAttention(nn.Module):
         attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
         attn = self.out_proj(attn)
 
-        # return average attention weights across heads (out-of-place)
         attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
         attn_weights = attn_weights.sum(dim=1) / float(self.num_heads)
         return attn, attn_weights
