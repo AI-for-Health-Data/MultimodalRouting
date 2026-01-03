@@ -104,21 +104,9 @@ def _ensure_bt_mask(
 # L encoder (Structured) -> returns seq [B,T,D], mask [B,T], pool [B,D]
 # ============================================================
 class BEHRTLabEncoder(nn.Module):
-    """
-    Option-A compliant structured encoder.
-
-    Accepts either:
-      - raw continuous x with NaNs: [B,T,17]
-      - already-prepared Z: [B,T,34] = [values_filled, observed_mask]
-      - optionally Z with delta: [B,T,51] = [values, mask, delta]
-
-    mask MUST be timestep mask [B,T] where 1=valid timestep, 0=pad.
-    hour_idx optional [B,T] (e.g., real hour or bin index).
-    """
-
     def __init__(
         self,
-        n_feats_in: int,          # set to 34 (or 51) if you prepare in collate; can be 17 if passing raw and letting encoder augment
+        n_feats_in: int,
         d: int,
         seq_len: int = 256,
         n_layers: int = 2,
@@ -127,13 +115,18 @@ class BEHRTLabEncoder(nn.Module):
         activation: Literal["relu", "gelu"] = "gelu",
     ) -> None:
         super().__init__()
+
         self.pool = pool
         self.out_dim = int(d)
 
-        # We allow input expansion from 17->34 inside forward, so proj is created for max expected.
-        self.n_feats_in = int(n_feats_in)
+        self.n_feats_raw = int(n_feats_in)
 
-        self.input_proj = nn.Linear(self.n_feats_in, d)
+        # If you *intend* n_feats_in to be raw features, we build 2F model input (values + obs_mask).
+        # If someone passes already-prepared Z, we also allow that at runtime.
+        self.add_obs = True
+        self.n_feats_model = self.n_feats_raw * 2 if self.add_obs else self.n_feats_raw
+
+        self.input_proj = nn.Linear(self.n_feats_model, d)
 
         pos_max = max(16, int(getattr(CFG, "structured_pos_max_len", seq_len)))
         self.time = nn.Embedding(pos_max, d)
@@ -157,51 +150,81 @@ class BEHRTLabEncoder(nn.Module):
             nn.Linear(d, d),
             nn.GELU() if activation == "gelu" else nn.ReLU(),
         )
-
     def _add_time(self, H: torch.Tensor, hour_idx: Optional[torch.Tensor]) -> torch.Tensor:
+        """
+        Add timestep embedding.
+        If hour_idx is None -> use positions 0..T-1.
+        hour_idx can be [B,T] or [T].
+        """
         B, T, D = H.shape
-        pos_max = self.time.num_embeddings
+        dev = H.device
 
         if hour_idx is None:
-            idx = torch.arange(T, device=H.device)
-            idx = idx.clamp_max(pos_max - 1)[None, :].expand(B, -1)
+            t = torch.arange(T, device=dev).unsqueeze(0).expand(B, -1)
         else:
-            idx = hour_idx.to(H.device).long().clamp_min(0).clamp_max(pos_max - 1)
+            t = hour_idx.to(dev)
+            if t.dim() == 1 and t.numel() == T:
+                t = t.unsqueeze(0).expand(B, -1)
+            if t.dim() != 2 or t.shape[0] != B or t.shape[1] != T:
+                raise ValueError(f"hour_idx must be [B,T] or [T]; got {tuple(t.shape)}")
 
-        return H + self.time(idx)
+            t = t.long()
+
+        t = t.clamp(min=0, max=self.time.num_embeddings - 1)
+        return H + self.time(t)
 
     def _pool(self, seq_h: torch.Tensor, mask_bt: torch.Tensor, cls_vec: Optional[torch.Tensor]) -> torch.Tensor:
+        """
+        seq_h: [B,T,D]
+        mask_bt: [B,T] with 1=valid, 0=pad
+        """
         if self.pool == "cls":
+            if cls_vec is None:
+                raise ValueError("pool='cls' requires cls_vec")
             return cls_vec
 
-        if self.pool == "last":
-            idx = (mask_bt.sum(dim=1) - 1).clamp_min(0).long()
-            return seq_h[torch.arange(seq_h.size(0), device=seq_h.device), idx]
+        mask_bt = _ensure_bt_mask(mask_bt, seq_h)  # float [B,T]
+        B, T, D = seq_h.shape
 
-        # mean
-        m = mask_bt.float()
-        denom = m.sum(dim=1, keepdim=True).clamp_min(1.0)
-        return (seq_h * m.unsqueeze(-1)).sum(dim=1) / denom
+        if self.pool == "mean":
+            denom = mask_bt.sum(dim=1, keepdim=True).clamp_min(1.0)
+            return (seq_h * mask_bt.unsqueeze(-1)).sum(dim=1) / denom
+
+        if self.pool == "last":
+            lengths = mask_bt.sum(dim=1).clamp_min(1.0).long()  # [B]
+            idx = (lengths - 1).clamp_min(0)                    # [B]
+            return seq_h[torch.arange(B, device=seq_h.device), idx]
+
+        raise ValueError(f"Unknown pool='{self.pool}'")
 
     def _prepare_Z(self, x: torch.Tensor) -> torch.Tensor:
         """
-        If x is raw [B,T,17] with NaNs -> build Z=[values_filled, observed_mask] => [B,T,34].
-        If x is already [B,T,34] or [B,T,51], return as-is.
+        Accept:
+          - raw continuous with NaNs: [B,T,Fraw]  -> returns [B,T,2*Fraw]
+          - already-prepared:        [B,T,Fin] where Fin == input_proj.in_features
         """
         if x.dim() == 2:
             x = x.unsqueeze(-1)
 
-        B, T, F = x.shape
+        B, T, Fin = x.shape
+        expected = int(self.input_proj.in_features)
 
-        # Case 1: raw 17 features -> Option A augmentation inside encoder
-        if F == 17:
-            M = (~torch.isnan(x)).float()             # [B,T,17]
-            x_filled = torch.nan_to_num(x, nan=0.0)   # assume already normalized upstream; 0.0 corresponds to mean
-            Z = torch.cat([x_filled, M], dim=-1)      # [B,T,34]
-            return Z
+        # Case A: already matches model input
+        if Fin == expected:
+            return x
 
-        # Case 2: already prepared
-        return x
+        # Case B: raw -> expand if model expects doubled input
+        if self.add_obs and expected == 2 * Fin:
+            M = (~torch.isnan(x)).float()           # [B,T,Fin]
+            x_filled = torch.nan_to_num(x, nan=0.0) # [B,T,Fin]
+            return torch.cat([x_filled, M], dim=-1) # [B,T,2*Fin]
+
+        raise ValueError(
+            f"Structured input feature mismatch: got Fin={Fin}, "
+            f"but model expects {expected}. "
+            f"Pass raw [B,T,F] (with NaNs if available) OR prepared [B,T,{expected}]."
+        )
+
 
     def forward(
         self,
@@ -214,19 +237,18 @@ class BEHRTLabEncoder(nn.Module):
         # --- prepare inputs ---
         dev = next(self.parameters()).device
         x = x.to(dev)
-        mask_bt = mask_bt.to(dev)
+        mask_bt = _ensure_bt_mask(mask_bt, x).to(dev)  # <- force [B,T] float
+
+        if (mask_bt.sum(dim=1) == 0).any():
+            mask_bt = mask_bt.clone()
+            mask_bt[:, -1] = 1.0
 
         Z = self._prepare_Z(x)  # [B,T,34] or [B,T,51]
         B, T, Fin = Z.shape
 
-        # IMPORTANT: if you pass raw 17 and encoder expands to 34,
-        # then you must instantiate n_feats_in=34 (or set input_proj accordingly).
-        if Fin != self.input_proj.in_features:
-            raise ValueError(
-                f"Input features mismatch: got {Fin}, expected {self.input_proj.in_features}. "
-                f"If passing raw 17, set n_feats_in=34 (or prepare Z in collate)."
-            )
+        # Z is guaranteed to match input_proj.in_features by _prepare_Z
 
+ 
         # --- embed ---
         H = self.input_proj(Z)            # [B,T,D]
         H = self._add_time(H, hour_idx)   # add hour/bin embedding
@@ -325,7 +347,12 @@ class BioClinBERTEncoder(nn.Module):
         self.drop = nn.Identity()
 
         if self.hf_available and self.bert is not None:
-            self.bert.eval()
+            # Freeze or finetune controlled by CFG.finetune_text
+            finetune = bool(getattr(CFG, "finetune_text", False))
+            for p in self.bert.parameters():
+                p.requires_grad = finetune
+            self.bert.train(finetune)
+
 
     def _device(self) -> torch.device:
         return next(self.parameters()).device
@@ -374,18 +401,28 @@ class BioClinBERTEncoder(nn.Module):
         ids = ids.to(device=dev, dtype=torch.long)
         attn = attn.to(device=dev, dtype=torch.long)
 
+        # Decide once (not inside loop): is BERT trainable?
+        bert_trainable = any(p.requires_grad for p in self.bert.parameters())
+        ctx = torch.enable_grad if bert_trainable else torch.no_grad
+
         S = ids.size(0)
         chunk_bs = max(1, int(getattr(self, "chunk_bs", 8)))
 
         outs = []
         for s0 in range(0, S, chunk_bs):
             s1 = min(S, s0 + chunk_bs)
-            out = self.bert(input_ids=ids[s0:s1], attention_mask=attn[s0:s1])
+
+            # Only the BERT forward is gated
+            with ctx():
+                out = self.bert(input_ids=ids[s0:s1], attention_mask=attn[s0:s1])
+
             cls = out.last_hidden_state[:, 0]  # [bs, hidden]
-            cls = self.proj(cls)               # [bs, out_dim]
+            cls = self.proj(cls)               # proj can still train
             cls = self.drop(cls)
             outs.append(cls)
+
         return torch.cat(outs, dim=0)  # [S, out_dim]
+
 
     def _coerce_ids_attn(self, ids, attn, dev: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -481,7 +518,8 @@ class BioClinBERTEncoder(nn.Module):
                 collected.append(cls)
             else:
                 for (ids, attn) in patient:
-                    cls = self._encode_chunks_to_cls(ids.to(dev), attn.to(dev))
+                    cls = self._encode_chunks_to_cls(ids, attn)
+
                     collected.append(cls)
 
             if len(collected) == 0:
@@ -518,11 +556,8 @@ class BioClinBERTEncoder(nn.Module):
         return (H * M.unsqueeze(-1)).sum(dim=1) / denom
 
     def forward(self, notes_or_chunks) -> torch.Tensor:
-        requires_grad = bool(getattr(CFG, "finetune_text", False))
-        with torch.set_grad_enabled(requires_grad):
-            H, M = self.encode_seq(notes_or_chunks)
-            z = self.pool_from_seq(H, M)
-        return z
+        H, M = self.encode_seq(notes_or_chunks)
+        return self.pool_from_seq(H, M)
 
 
 # ============================================================
@@ -792,12 +827,11 @@ def build_encoders(
         seq_len = int(getattr(CFG, "structured_pos_max_len", 2048))
 
     behrt = BEHRTLabEncoder(
-        n_feats=int(cfg.structured_n_feats),
+        n_feats_in=int(cfg.structured_n_feats),
         d=int(cfg.d),
         seq_len=seq_len,
         n_layers=int(cfg.structured_layers),
         n_heads=int(cfg.structured_heads),
-        dropout=0.0,
         pool=cfg.structured_pool,
     ).to(dev)
 
@@ -853,9 +887,16 @@ def encode_modalities_for_routing(
     dev = next(behrt.parameters()).device
 
     # L (structured)
-    mL_dev = (mL.to(dev) if mL is not None else None)
-    L_seq, L_mask, L_pool = behrt.encode_seq_and_pool(xL.to(dev), mask=mL_dev)
+    if mL is None:
+        raise ValueError("mL (structured timestep mask [B,T]) is required for BEHRTLabEncoder.")
+    L_seq, L_mask, L_pool = behrt(
+        xL.to(dev),
+        mask_bt=mL.to(dev),
+        hour_idx=None,          # or pass your hour/bin indices if you have them
+        return_seq=True,
+    )
     L_mask = L_mask.float()
+
 
     # N (notes)
     N_seq, N_mask = bbert.encode_seq(notes_list)  # [B,S,D], [B,S]
@@ -890,18 +931,22 @@ def encode_unimodal_pooled(
     imgs: Union[torch.Tensor, List[torch.Tensor], List[List[torch.Tensor]]],
     mL: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
+
     """
     Convenience if you ever need pooled-only:
       {"L": [B,D], "N": [B,D], "I": [B,D]}
     """
     dev = next(behrt.parameters()).device
-
-    mL_dev = (mL.to(dev) if mL is not None else None)
-    _, _, zL = behrt.encode_seq_and_pool(xL.to(dev), mask=mL_dev)
-
-    zN = bbert(notes_list)  # pooled [B,D]
+    if mL is None:
+        raise ValueError("mL is required.")
+    _, _, zL = behrt(
+        xL.to(dev),
+        mask_bt=mL.to(dev),
+        hour_idx=None,
+        return_seq=True,
+    )
+    zN = bbert(notes_list)
     zI = imgenc(imgs.to(dev) if isinstance(imgs, torch.Tensor) else imgs)
-
     return {"L": zL, "N": zN, "I": zI}
 
 
