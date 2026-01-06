@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import os as _os
@@ -35,67 +34,22 @@ from env_config import get_pheno_name, apply_cli_overrides
 
 from encoders import (
     BEHRTLabEncoder, BioClinBERTEncoder, ImageEncoder,
-    EncoderConfig, build_encoders, encode_modalities_for_routing,
+    EncoderConfig, build_encoders,
 )
+from mult_model import MULTModel
 from routing_and_heads import (
-    build_fusions,
     RoutePrimaryProjector,
+    RouteDimAdapter,
     CapsuleMortalityHead,
-    forward_capsule_from_routes,
+    forward_capsule_from_multmodel,
+    make_route_inputs_mult,
+    forward_capsule_from_route_dict,
 )
+
+
 
 ROUTE_NAMES = ["L", "N", "I", "LN", "NL", "LI", "IL", "NI", "IN", "LNI"]
 N_ROUTES = len(ROUTE_NAMES) 
-def _to_route_weights(
-    rc: torch.Tensor,
-    expect_routes: int,
-    eps: float = 1e-12,
-    route_mask: Optional[torch.Tensor] = None,
-    mode: Optional[str] = None,
-) -> torch.Tensor:
-    """
-    Convert routing tensor to a usable [B,R,K] weight tensor depending on routing mode.
-
-    - prob:    assumes rc already sums over routes; renorm only for numerical safety
-    - gate:    assumes rc are independent gates in [0,1]; do NOT renorm
-    - gate_norm: sigmoid gates that should be scale-normalized over routes (sum≈1)
-    """
-    if rc is None or rc.ndim != 3:
-        return rc
-
-    mode = (mode or _routing_mode()).lower()
-    rc = rc.float()
-    rc = _orient_brk(rc, expect_routes)
-    if rc is None or rc.ndim != 3 or rc.shape[1] != expect_routes:
-        raise RuntimeError(f"routing_coef has wrong shape after orient: {None if rc is None else tuple(rc.shape)}")
-
-    # apply route mask if provided
-    if route_mask is not None:
-        m = route_mask.float()
-        if m.ndim == 2:
-            m = m.unsqueeze(-1)  # [B,R,1]
-        rc = rc * m
-
-    if mode in {"prob", "softmax"}:
-        # treat as probabilities; renormalize for safety
-        rc = rc.clamp_min(0.0)
-        denom = rc.sum(dim=1, keepdim=True).clamp_min(eps)
-        rc = rc / denom
-        return rc
-
-    if mode in {"gate"}:
-        # independent gates, do NOT renorm
-        rc = rc.clamp(eps, 1.0 - eps)
-        return rc
-
-    if mode in {"gate_norm", "gatenorm"}:
-        # independent gates but scale-normalize (NOT softmax)
-        rc = rc.clamp(eps, 1.0 - eps)
-        denom = rc.sum(dim=1, keepdim=True).clamp_min(eps)
-        rc = rc / denom
-        return rc
-
-    raise ValueError(f"Unknown routing mode: {mode}. Use prob|gate|gate_norm.")
 
 def grads_are_finite(param_list):
     for p in param_list:
@@ -131,26 +85,27 @@ def print_route_matrix_detailed(
     where: str = "",
 ):
     with torch.no_grad():
-        rc = routing_coef.detach().float().cpu()     # [B,R,K]
-        pa = prim_acts.detach().float().cpu()        # [B,R]
+        rc = routing_coef.detach().float().cpu()  # [B,N_ROUTES,K]
+        pa = prim_acts.detach().float().cpu()     # [B,N_ROUTES]
 
-        B, R, K = rc.shape  # ✅ ADD THIS
+        B, R, K = rc.shape
 
-        rc_mean = rc.mean(dim=0).numpy()             # [R,K]
-        pa_mean = pa.mean(dim=0).numpy()             # [R]
+        # Average over batch
+        rc_mean = rc.mean(dim=0).numpy()          # [N_ROUTES,K]
+        pa_mean = pa.mean(dim=0).numpy()          # [N_ROUTES]
 
-        effective = (rc * pa.unsqueeze(-1)).mean(dim=0).numpy()   # [R,K]
+        # Effective weights (per route × phenotype)
+        effective = (rc * pa.unsqueeze(-1)).mean(dim=0).numpy()  # [N_ROUTES,K]
+
         routes = ROUTE_NAMES
 
         print(f"\n{'=' * 120}")
         print(f"[ROUTING ANALYSIS] {where}")
         print(f"{'=' * 120}")
 
-        # Primary activations
         print(f"\n1. PRIMARY ACTIVATIONS (sigmoid, same across all phenotypes):")
         print("   " + " | ".join(f"{r:4s}={pa_mean[i]:.3f}" for i, r in enumerate(routes)))
 
-        # Per-phenotype routing + effective weights
         print(f"\n2. PER-PHENOTYPE ROUTING WEIGHTS:")
         print("   Format: phenotype_name | " + " | ".join(routes))
         print("   Each cell shows: routing_coef(effective_weight)")
@@ -165,7 +120,6 @@ def print_route_matrix_detailed(
             row = f"   {name:15s} | " + " | ".join(f"{cell:>10s}" for cell in cells)
             print(row)
 
-        # Route importance aggregated across phenotypes
         print(f"\n3. ROUTE IMPORTANCE (averaged across all phenotypes):")
         rc_avg = rc_mean.mean(axis=1)      # [N_ROUTES]
         eff_avg = effective.mean(axis=1)   # [N_ROUTES]
@@ -190,14 +144,31 @@ def print_route_matrix_detailed(
 
         print(f"{'=' * 120}\n")
 
+def encode_all_modalities(behrt, bbert, imgenc, xL, mL, notes, imgs, amp_ctx_enc):
+    with amp_ctx_enc:
+        L_seq, L_mask, L_pool = behrt.encode_seq_and_pool(xL, mask=mL)
+
+        notes_batch = prepare_notes_batch(notes)
+        N_seq, N_mask = bbert.encode_seq(notes_batch)
+        N_pool = bbert.pool_from_seq(N_seq, N_mask)
+
+        I_seq, I_mask, I_pool = imgenc.encode_seq_and_pool(imgs)
+
+    outL = {"seq": L_seq, "mask": L_mask.float(), "pool": L_pool}
+    outN = {"seq": N_seq, "mask": N_mask.float(), "pool": N_pool}
+    outI = {"seq": I_seq, "mask": I_mask.float(), "pool": I_pool}
+
+    outL = _sanitize_encoder_out(outL, "L")
+    outN = _sanitize_encoder_out(outN, "N")
+    outI = _sanitize_encoder_out(outI, "I")
+    return outL, outN, outI
+
 def debug_routing_tensor(
     rc: torch.Tensor,
     name: str = "routing_coef",
     expect_routes: int = 10,
     expect_k: Optional[int] = None,
-    mode: Optional[str] = None,
 ):
-
     with torch.no_grad():
         print(f"\n[debug] {name}.shape={tuple(rc.shape)} dtype={rc.dtype} device={rc.device}")
         if rc.ndim != 3:
@@ -224,18 +195,6 @@ def debug_routing_tensor(
         s_routes = rc.sum(dim=routes_dim)
         print(f"[debug] sum_over_routes(dim={routes_dim}): mean={s_routes.float().mean().item():.6f} "
               f"min={s_routes.float().min().item():.6f} max={s_routes.float().max().item():.6f}")
-        mode = (mode or _routing_mode()).lower()
-        print(f"[debug] routing_mode={mode}")
-
-        s_routes = rc.sum(dim=routes_dim)
-        print(f"[debug] sum_over_routes(dim={routes_dim}): mean={s_routes.float().mean().item():.6f} "
-              f"min={s_routes.float().min().item():.6f} max={s_routes.float().max().item():.6f}")
-
-        if mode in {"prob", "softmax", "gate_norm", "gatenorm"}:
-            if not torch.allclose(s_routes, torch.ones_like(s_routes), atol=1e-3, rtol=0.0):
-                print(f"[debug] WARNING: sums are not ~1 though mode={mode}.")
-        else:
-            print("[debug] NOTE: sums need NOT be 1 in gate mode (sigmoid routing).")
 
         if routes_dim == 1:
             print("[debug] rc[0, :, 0] (routes for phenotype0):", rc[0, :, 0].detach().float().cpu().tolist())
@@ -248,40 +207,59 @@ def normalize_routing_coef_auto(
     rc: torch.Tensor,
     expect_routes: int = N_ROUTES,
     eps: float = 1e-12,
-    mode: str = "gate_norm",   # <-- NEW: prob|gate|gate_norm
+    mode: str = "gate_norm",  # {"gate_norm", "softmax", "none"}
+    atol_already: float = 1e-3,
 ):
     if rc is None or rc.ndim != 3:
         return rc, {"ok": False, "reason": "rc None or not 3D"}
 
     rc = rc.float()
     B, D1, D2 = rc.shape
-    info = {"orig_shape": (B, D1, D2), "expect_routes": int(expect_routes), "mode": mode}
+    info = {"orig_shape": (B, D1, D2), "expect_routes": int(expect_routes), "mode": str(mode)}
 
     transposed = False
     if D1 == expect_routes:
-        pass  # [B,R,K]
+        pass
     elif D2 == expect_routes:
         rc = rc.transpose(1, 2)  # [B,K,R] -> [B,R,K]
         transposed = True
     else:
-        info["ok"] = False
-        info["reason"] = "could not locate routes axis"
-        return rc, info
+        s1 = rc.sum(dim=1)  # [B, D2]
+        s2 = rc.sum(dim=2)  # [B, D1]
+        info["err_sum_dim1"] = float((s1 - 1.0).abs().mean().item())
+        info["err_sum_dim2"] = float((s2 - 1.0).abs().mean().item())
+        info["warn"] = "could_not_identify_routes_dim_by_size"
 
     info["transposed_to_BRK"] = transposed
     info["shape_after_orient"] = tuple(rc.shape)
 
-    if mode in {"prob", "softmax", "gate_norm", "gatenorm"}:
+    mode_l = str(mode).lower()
+
+    if mode_l == "none":
+        info["ok"] = True
+        return rc, info
+
+    if mode_l == "softmax":
+        rc = torch.softmax(rc, dim=1)
+        s = rc.sum(dim=1)
+        info["post_min_sum_routes"] = float(s.min().item())
+        info["post_max_sum_routes"] = float(s.max().item())
+        info["ok"] = True
+        return rc, info
+
+    if mode_l == "gate_norm":
         rc = rc.clamp_min(0.0)
         denom = rc.sum(dim=1, keepdim=True).clamp_min(eps)
         rc = rc / denom
-    elif mode in {"gate"}:
-        rc = rc.clamp(eps, 1.0 - eps)
-    else:
-        raise ValueError(f"Unknown mode={mode}")
 
-    info["ok"] = True
-    return rc, info
+        s = rc.sum(dim=1)
+        info["post_min_sum_routes"] = float(s.min().item())
+        info["post_max_sum_routes"] = float(s.max().item())
+        info["ok"] = True
+        return rc, info
+
+    return rc, {"ok": False, "reason": f"unknown mode={mode}"}
+
 
 
 def renorm_over_routes(rc: torch.Tensor, routes_dim: int = 1, eps: float = 1e-12) -> torch.Tensor:
@@ -415,12 +393,11 @@ def save_routing_heatmap(
     with torch.no_grad():
         rc = routing_coef.detach().float().cpu()
         pa = prim_acts.detach().float().cpu()
-        effective = (rc * pa.unsqueeze(-1)).mean(dim=0).numpy()  # [R,K]
-        rc_mean = rc.mean(dim=0).numpy()
-        pa_mean = pa.mean(dim=0).numpy()
 
         B, R, K = rc.shape          # [B, N_ROUTES, K]
- 
+        rc_mean = rc.mean(dim=0).numpy()     # [N_ROUTES, K]
+        pa_mean = pa.mean(dim=0).numpy()     # [N_ROUTES]
+        effective = rc_mean * pa_mean[:, np.newaxis]  # [N_ROUTES, K]
 
         routes = ROUTE_NAMES
         mat = effective.T  # [K, 10]
@@ -469,10 +446,11 @@ def normalize_minmax(arr: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     return np.nan_to_num(out, nan=0.0, posinf=1.0, neginf=0.0)
 
 
-def normalize_routes_per_phenotype(mat):
+def normalize_routes_per_phenotype(mat: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    mat = np.asarray(mat, dtype=np.float32)
     row_sum = mat.sum(axis=1, keepdims=True)
+    row_sum = np.maximum(row_sum, eps)
     return mat / row_sum
-
 
 def save_array_with_versions(
     arr_raw: np.ndarray,
@@ -642,12 +620,6 @@ def prepare_notes_batch(notes_batch: List[Dict[str, Any]]):
         return seq + [pad_value] * (max_len - len(seq))
 
     def _flatten_if_nested(seq):
-        """
-        Accepts:
-          - [int, int, ...]
-          - [[int,...], [int,...], ...]   (extra nesting)
-        Returns a flat [int, int, ...]
-        """
         if not isinstance(seq, (list, tuple)):
             return []
         if len(seq) == 0:
@@ -728,7 +700,6 @@ def prepare_notes_batch(notes_batch: List[Dict[str, Any]]):
         attn_mat = (attn_mat > 0).long()
         out.append({"input_ids": ids_mat, "attention_mask": attn_mat})
     return out
-
 
 def pretok_batch_notes(batch_notes: List[List[str]]):
     global TOKENIZER, MAXLEN
@@ -969,13 +940,6 @@ def _cell_to_list(x):
     return []
 
 class ICUStayDataset(Dataset):
-    """
-      - splits.json
-      - structured.parquet       (stay_id, hour, <17 feature columns>)
-      - notes.parquet            (stay_id, chunk_000..chunk_XXX) OR pretokenized columns
-      - images.parquet           (stay_id, image_path/cxr_path/...)
-      - labels_pheno.parquet     (stay_id, pheno_00..pheno_24)
-    """
     def __init__(self, root: str, split: str = "train"):
         super().__init__()
         root = os.path.abspath(os.path.expanduser(root))
@@ -1222,14 +1186,16 @@ class ICUStayDataset(Dataset):
 
         # structured EHR
         df_s = self.struct[self.struct.stay_id == stay_id].sort_values("hour")
-        xs_np = df_s[self.feat_cols].astype("float32").to_numpy()  # keep NaNs
-
+        xs_np = (
+            df_s[self.feat_cols]
+            .astype("float32")
+            .fillna(0.0)
+            .to_numpy()
+        )
         if xs_np.shape[1] != CFG.structured_n_feats:
             raise ValueError(f"Structured feat dim mismatch: got {xs_np.shape[1]} but CFG.structured_n_feats={CFG.structured_n_feats}")
 
         xs = torch.from_numpy(xs_np)  # [<=T,F]
-        xs_len = int(xs.shape[0])
-
 
         # notes: use the first row for this stay_id (you can change policy later if needed)
         df_n = self.notes[self.notes.stay_id == stay_id]
@@ -1335,7 +1301,6 @@ class ICUStayDataset(Dataset):
         return {
             "stay_id": stay_id,
             "x_struct": xs,
-            "x_struct_len": xs_len,   # <<< ADD THIS
             "notes": notes_payload,
             "image_paths": img_paths,
             "y": y,
@@ -1404,33 +1369,28 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
         F_dim = int(CFG.structured_n_feats)
 
         # choose T safely
-        T_len_cfg = int(getattr(CFG, "structured_seq_len", -1))
+        T_len_cfg = int(getattr(CFG, "structured_seq_len", 256))
         if T_len_cfg is not None and T_len_cfg > 0:
             T_len = T_len_cfg
         else:
+            # dynamic pad-to-batch-max when seq_len is -1 / unset
             T_len = max(int(b["x_struct"].shape[0]) for b in batch)
-            T_len = max(T_len, 1)
+            T_len = max(T_len, 1)  # safety
 
-        # ---- THIS is the missing variable in your error ----
         xL_batch = torch.stack(
             [pad_or_trim_struct(b["x_struct"], T_len, F_dim) for b in batch], dim=0
         )
 
-        B, T, _ = xL_batch.shape
+        # mask: valid timesteps = any non-zero feature at that t
+        mL_batch = (xL_batch.abs().sum(dim=2) > 0).float()
 
-        lens = torch.tensor([int(b["x_struct_len"]) for b in batch], dtype=torch.long)  # [B]
-        lens = torch.clamp(lens, min=1, max=T_len)  # avoid 0-len weirdness
-
-        t = torch.arange(T_len).unsqueeze(0)  # [1,T]
-        mL_batch = (t >= (T_len - lens).unsqueeze(1)).float()  # [B,T]
-
+        # safety: ensure mask not all-zero
         mask_sum = mL_batch.sum(dim=1)
         bad = (mask_sum == 0)
         if bad.any():
             mL_batch[bad, -1] = 1.0
             xL_batch[bad, -1, 0] = 1e-6
             print(f"[collate] fixed {int(bad.sum())} samples with empty structured mask")
-
 
 
         # notes payloads are already in the exact format prepare_notes_batch expects
@@ -1475,8 +1435,6 @@ def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
 
         # show a couple non-zero EHR rows (first 5 feats)
         nz_rows = (mL[i] > 0.5).nonzero(as_tuple=False).flatten().tolist()
-        valid_len = int((mL[i] > 0.5).sum().item())
-
         show_rows = nz_rows[:2] if nz_rows else []
         ehr_rows = []
         for r in show_rows:
@@ -1516,121 +1474,89 @@ def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
         except Exception as e:
             note_preview = f"<notes preview failed: {type(e).__name__}: {e}>"
         print(
-            f"  • stay_id={sid} | valid_T={valid_len} | ehr_rows(first2->first5feats)={ehr_rows} | "
+            f"  • stay_id={sid} | ehr_rows(first2->first5feats)={ehr_rows} | "
             f'notes_preview="{note_preview}" | cxr="{imgp}"'
         )
     print("[sample-inspect] ---------------------------\n")
 
-def _capsule_forward_safe(z, fusion, projector, cap_head,
-                          route_mask=None, act_temperature=1.0,
-                          detach_priors=False, return_routing=True):
-    # Try the most likely signatures
+def _enc_forward(enc, *args, **kwargs):
     try:
-        return forward_capsule_from_routes(
-            z_unimodal=z, fusion=fusion, projector=projector, capsule_head=cap_head,
-            route_mask=route_mask, act_temperature=act_temperature,
-            detach_priors=detach_priors, return_routing=return_routing
-        )
-    except TypeError:
-        pass
+        return enc(*args, **kwargs)
+    except TypeError as e:
+        for k in ["return_seq", "return_attn", "return_mask"]:
+            if k in kwargs:
+                kwargs.pop(k, None)
+        return enc(*args, **kwargs)
 
-    # Try route_mask unsqueezed (some implementations want [B,R,1])
-    if route_mask is not None and route_mask.ndim == 2:
-        try:
-            return forward_capsule_from_routes(
-                z_unimodal=z, fusion=fusion, projector=projector, capsule_head=cap_head,
-                route_mask=route_mask.unsqueeze(-1), act_temperature=act_temperature,
-                detach_priors=detach_priors, return_routing=return_routing
-            )
-        except TypeError:
-            pass
 
-    # Fallback: legacy signature
-    return forward_capsule_from_routes(
-        z_unimodal=z, fusion=fusion, projector=projector, capsule_head=cap_head,
-        return_routing=return_routing
+def _capsule_forward_mult(
+    *,
+    mult,
+    route_adapter,
+    x_l: torch.Tensor,
+    x_n: torch.Tensor,
+    x_i: torch.Tensor,
+    projector,
+    cap_head,
+    route_mask=None,
+    act_temperature: float = 1.0,
+    detach_priors: bool = False,
+    return_routing: bool = True,
+):
+    """
+    MulT -> route dict -> (adapter) -> projector -> capsule head
+    returns (logits, prim_acts, route_embs, routing_coef)
+    """
+    return forward_capsule_from_multmodel(
+        multmodel=mult,
+        x_l=x_l, x_n=x_n, x_i=x_i,
+        projector=projector,
+        capsule_head=cap_head,
+        route_adapter=route_adapter,
+        route_mask=route_mask,
+        act_temperature=act_temperature,
+        detach_priors=detach_priors,
+        return_routing=return_routing,
     )
 
-
-def _orient_brk(rc: torch.Tensor, expect_routes: int) -> torch.Tensor:
-    """Ensure routing tensor is [B, R, K]. Accepts [B,R,K] or [B,K,R]."""
-    if rc is None or rc.ndim != 3:
-        return rc
-    B, D1, D2 = rc.shape
-    if D1 == expect_routes:
-        return rc
-    if D2 == expect_routes:
-        return rc.transpose(1, 2)
-    return rc
-
-
-def _to_route_probs(rc: torch.Tensor, expect_routes: int, eps: float = 1e-12, route_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-    if rc is None or rc.ndim != 3:
-        return rc
-
-    rc = rc.float()
-    rc = _orient_brk(rc, expect_routes)
-    if rc is None or rc.ndim != 3 or rc.shape[1] != expect_routes:
-        raise RuntimeError(f"routing_coef has wrong shape after orient: {None if rc is None else tuple(rc.shape)}")
-
-    if route_mask is not None:
-        m = route_mask.float()
-        if m.ndim == 2:
-            m = m.unsqueeze(-1)  # [B,R,1]
-        rc = rc * m
-
-    # STRICT: treat rc as probs and renorm; if it’s wildly off, fail loudly
-    denom = rc.sum(dim=1, keepdim=True).clamp_min(eps)
-    rc = rc / denom
-
-    # assert normalized
-    s = rc.sum(dim=1)
-    if not torch.allclose(s, torch.ones_like(s), atol=1e-3, rtol=0.0):
-        raise RuntimeError(f"routing_coef not normalized over routes. sum stats: min={s.min().item()} max={s.max().item()}")
-
-    return rc
-
-def unpack_capsule_out(out, expect_routes: int, y: Optional[torch.Tensor] = None, name: str = "", route_mask: Optional[torch.Tensor] = None):
+def capsule_forward_from_encoded(
+    *,
+    mult,
+    route_adapter,
+    outL: Dict[str, torch.Tensor],
+    outN: Dict[str, torch.Tensor],
+    outI: Dict[str, torch.Tensor],
+    projector,
+    cap_head,
+    route_mask=None,
+    act_temperature: float = 1.0,
+    detach_priors: bool = False,
+    return_routing: bool = True,
+):
     """
-    Supports:
-      - tuple/list: (logits, prim_acts, route_embs, routing_coef?, beta?)
-      - dict: {"logits","prim_acts","route_embs","routing_coef","beta"}
-
-    Returns:
-      logits:   [B,K]
-      prim_acts:[B,R]
-      route_embs: dict[str, Tensor]
-      rc_w: [B,R,K] or None   (normalized over routes)
-      beta:     [B,R,K] or None   (effective = prim_acts * rc_w)
+    Build ALL 10 routes using your MulT cross-attention stack:
+      L,N,I,LN,NL,LI,IL,NI,IN,LNI
+    Then adapt dims -> projector -> capsule head.
+    Returns (logits, prim_acts, route_embs, routing_coef)
     """
-    if isinstance(out, dict):
-        logits = out.get("logits", None)
-        prim_acts = out.get("prim_acts", out.get("acts", None))
-        route_embs = out.get("route_embs", out.get("routes", {}))
-        rc = out.get("routing_coef", out.get("routing", None))
-        beta = out.get("beta", None)
-    else:
-        logits = out[0] if len(out) > 0 else None
-        prim_acts = out[1] if len(out) > 1 else None
-        route_embs = out[2] if len(out) > 2 else {}
-        rc = out[3] if len(out) > 3 else None
-        beta = out[4] if len(out) > 4 else None
+    z = {"L": outL, "N": outN, "I": outI}
 
-    if logits is None or prim_acts is None:
-        raise RuntimeError(f"[{name}] capsule output missing logits/prim_acts. type={type(out)}")
+    # 10 routes from encoders (MulT does cross-attn internally with masks/pools)
+    route_embs_in = make_route_inputs_mult(z, mult)
 
-    rc_w = _to_route_weights(rc, expect_routes, route_mask=route_mask) if rc is not None else None
+    # ensure common d_in for projector/capsule
+    if route_adapter is not None:
+        route_embs_in = route_adapter(route_embs_in)
 
-    if beta is None and (rc_w is not None):
-        beta = prim_acts.unsqueeze(-1) * rc_w  # [B,R,K]
-    # mild shape sanity
-    if rc_w is not None and rc_w.ndim == 3:
-        if rc_w.shape[1] != expect_routes:
-            raise RuntimeError(f"[{name}] rc_w wrong shape {tuple(rc_w.shape)} expect_routes={expect_routes}")
-        if y is not None and rc_w.shape[2] != y.shape[1]:
-            print(f"[warn][{name}] rc_w K={rc_w.shape[2]} != y K={y.shape[1]}")
-
-    return logits, prim_acts, route_embs, rc_w, beta
+    return forward_capsule_from_route_dict(
+        route_embs_in=route_embs_in,
+        projector=projector,
+        capsule_head=cap_head,
+        route_mask=route_mask,
+        act_temperature=act_temperature,
+        detach_priors=detach_priors,
+        return_routing=return_routing,
+    )
 
 def _clamp_norm(x: torch.Tensor, max_norm: float = 20.0) -> torch.Tensor:
     if x.ndim < 2:
@@ -1648,56 +1574,37 @@ def _safe_tensor(x: torch.Tensor, name: str = "") -> torch.Tensor:
     return x
 
 
+def _ensure_encoder_dict(out, name: str, mask_fallback: Optional[torch.Tensor] = None):
+    if isinstance(out, dict):
+        return out
+
+    if torch.is_tensor(out):
+        pool = out
+        seq = pool[:, None, :]  # [B,1,D]
+        if mask_fallback is None:
+            mask = torch.ones(pool.size(0), 1, device=pool.device, dtype=torch.float32)
+        else:
+            # use first token mask if provided
+            if mask_fallback.ndim == 2:
+                mask = mask_fallback[:, :1].float()
+            else:
+                mask = torch.ones(pool.size(0), 1, device=pool.device, dtype=torch.float32)
+        return {"seq": seq, "pool": pool, "mask": mask}
+
+    raise TypeError(f"[{name}] unsupported encoder output type: {type(out)}")
+
 def _sanitize_encoder_out(out: Dict[str, torch.Tensor], name: str) -> Dict[str, torch.Tensor]:
     out2 = dict(out)
-    seq  = out2.get("seq", None)
-    pool = out2.get("pool", None)
-    mask = out2.get("mask", None)
 
-    if seq is None and torch.is_tensor(pool):
-        seq = pool[:, None, :]
-        out2["seq"] = seq
-
-    if torch.is_tensor(out2.get("seq", None)):
+    if "seq" in out2 and out2["seq"] is not None:
         out2["seq"] = _safe_tensor(_clamp_norm(out2["seq"].float(), 20.0), f"{name}.seq").float()
-    if torch.is_tensor(out2.get("pool", None)):
+
+    if "pool" in out2 and out2["pool"] is not None:
         out2["pool"] = _safe_tensor(_clamp_norm(out2["pool"].float(), 20.0), f"{name}.pool").float()
 
-    seq = out2.get("seq", None)
-    mask = out2.get("mask", None)
+    if "mask" in out2 and out2["mask"] is not None:
+        out2["mask"] = out2["mask"].float()
 
-    if torch.is_tensor(mask):
-        if mask.ndim == 3 and mask.shape[-1] == 1:
-            mask = mask[..., 0]
-        mask = (mask > 0).float()
-    else:
-        mask = None
-
-    # --- infer B,T robustly ---
-    if torch.is_tensor(seq):
-        if torch.is_tensor(pool):
-            B = int(pool.shape[0])
-            # assume seq is [B,T,D] unless clearly [T,B,D]
-            if seq.ndim == 3 and seq.shape[0] != B and seq.shape[1] == B:
-                seq = seq.transpose(0, 1)  # [B,T,D]
-        else:
-            # fallback: assume [B,T,D]
-            B = int(seq.shape[0])
-        out2["seq"] = seq
-
-    # create mask if missing
-    if torch.is_tensor(out2.get("seq")) and mask is None:
-        B = int(out2["seq"].shape[0])
-        T = int(out2["seq"].shape[1])
-        mask = torch.ones(B, T, device=out2["seq"].device, dtype=torch.float32)
-
-    # if mask exists but mismatched T, fix
-    if torch.is_tensor(out2.get("seq")) and torch.is_tensor(mask):
-        if mask.ndim == 2 and (mask.shape[0] != out2["seq"].shape[0] or mask.shape[1] != out2["seq"].shape[1]):
-            mask = torch.ones(out2["seq"].shape[0], out2["seq"].shape[1],
-                              device=out2["seq"].device, dtype=torch.float32)
-
-    out2["mask"] = mask
     return out2
 
 
@@ -1711,29 +1618,23 @@ def _has_nonfinite(*tensors: torch.Tensor) -> bool:
 
 @torch.no_grad()
 def evaluate_epoch(
-    behrt, bbert, imgenc, fusion, projector, cap_head,
+    behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
     loader,
     amp_ctx_enc,
     amp_ctx_caps,
     loss_fn,
+    act_temperature: float = 1.0,
+    detach_priors: bool = False,
     route_debug: bool = False,
     label_names: Optional[List[str]] = None,
     epoch_idx: Optional[int] = None,
     split_name: str = "VAL",
     routing_out_dir: Optional[str] = None,
 ):
-    # --- eval mode for everything that can have dropout/BN/LayerNorm ---
     behrt.eval()
     imgenc.eval()
-    bbert.eval()
     if getattr(bbert, "bert", None) is not None:
         bbert.bert.eval()
-
-    # fusion is a dict of modules
-    for k in fusion.keys():
-        fusion[k].eval()
-    projector.eval()
-    cap_head.eval()
 
     total_loss, total_correct, total = 0.0, 0, 0
     act_sum = torch.zeros(N_ROUTES, dtype=torch.float32)  # N_ROUTES=10
@@ -1747,9 +1648,6 @@ def evaluate_epoch(
     # per-route, per-phenotype routing importance
     rc_sum_mat = None      # [N_ROUTES, K]
     has_routing = False
-    beta_sum_mat = None     # [N_ROUTES, K]
-    has_beta = False
-
 
     for bidx, (xL, mL, notes, imgs, y, dbg) in enumerate(loader):
         xL = xL.to(DEVICE, non_blocking=True)
@@ -1757,97 +1655,88 @@ def evaluate_epoch(
         imgs = imgs.to(DEVICE, non_blocking=True)
         y   = y.to(DEVICE,   non_blocking=True)
 
-        # (A) Encoders under autocast
-        with amp_ctx_enc:
-            prepared_notes = prepare_notes_batch(notes)
-
-            z = encode_modalities_for_routing(
-                behrt=behrt,
-                bbert=bbert,
-                imgenc=imgenc,
-                xL=xL,
-                notes_list=prepared_notes,
-                imgs=imgs,
-                mL=mL,
-            )
-
-        outL = _sanitize_encoder_out(z["L"], "eval.L")
-        outN = _sanitize_encoder_out(z["N"], "eval.N")
-        outI = _sanitize_encoder_out(z["I"], "eval.I")
+        # (A) Encoders under autocast (REAL seq + mask + pool)
+        outL, outN, outI = encode_all_modalities(
+            behrt, bbert, imgenc,
+            xL=xL, mL=mL, notes=notes, imgs=imgs,
+            amp_ctx_enc=amp_ctx_enc,
+        )
 
         # (B) Capsule forward + loss in FP32
         with amp_ctx_caps:
             z = {"L": outL, "N": outN, "I": outI}
             route_mask = torch.ones(xL.size(0), N_ROUTES, device=DEVICE, dtype=torch.float32)
 
-            out = _capsule_forward_safe(
-                z, fusion, projector, cap_head,
-                route_mask=route_mask, act_temperature=1.0,
-                detach_priors=False, return_routing=True
+            out = capsule_forward_from_encoded(
+                mult=mult,
+                route_adapter=route_adapter,
+                outL=outL, outN=outN, outI=outI,
+                projector=projector,
+                cap_head=cap_head,
+                route_mask=route_mask,
+                act_temperature=float(act_temperature),
+                detach_priors=bool(detach_priors),
+                return_routing=True,
             )
 
-            logits, prim_acts, route_embs, rc_w, beta = unpack_capsule_out(
-                out, expect_routes=N_ROUTES, y=y, name=f"{split_name}.capsule", route_mask=route_mask
-            )
 
-            if rc_w is not None and bidx == 0:
-                debug_routing_tensor(
-                    rc_w,
-                    name=f"{split_name}.routing_probs",
-                    expect_routes=N_ROUTES,
-                    expect_k=int(y.size(1))
-                )
-                quantization_check(rc_w, name=f"{split_name}.routing_probs")
+            logits, prim_acts, route_embs = out[0], out[1], out[2]
+            routing_coef = out[3] if len(out) > 3 else None
 
-            if rc_w is not None and bidx == 0:
-                m = rc_w.detach().float().mean(dim=0)   # [R,K]
-                std_over_k = m.std(dim=1)                   # [R]
-                print(f"[debug] routing std over phenotypes: mean={std_over_k.mean().item():.6f} "
-                      f"min={std_over_k.min().item():.6f} max={std_over_k.max().item():.6f}")
+            if routing_coef is not None:
+                # DO NOT renormalize here — the capsule head should be the single source of truth.
+                assert routing_coef.ndim == 3, \
+                    f"routing_coef must be 3D [B,R,K], got {tuple(routing_coef.shape)}"
 
+                assert int(routing_coef.shape[1]) == int(N_ROUTES), \
+                    f"routing_coef must be [B,{N_ROUTES},K], got {tuple(routing_coef.shape)}"
 
+                # Optional: just verify it sums to ~1 over routes WITHOUT changing it
+                if bidx == 0:
+                    debug_routing_tensor(
+                        routing_coef,
+                        name=f"{split_name}.routing_coef",
+                        expect_routes=N_ROUTES,
+                        expect_k=int(y.size(1))
+                    )
+
+            if routing_coef is not None and bidx == 0:
+                quantization_check(routing_coef, name=f"{split_name}.routing_coef")
             if bidx == 0:
                 mask_stats(mL, name=f"{split_name}.mL_batch")
+
 
             logits    = _safe_tensor(logits.float(),    "eval.logits(fp32)")
             prim_acts = _safe_tensor(prim_acts.float(), "eval.prim_acts(fp32)")
 
-            if rc_w is not None:
+            if routing_coef is not None:
                 has_routing = True
-                rc = rc_w.detach().float().cpu()  # [B,R,K]
+                rc = routing_coef.detach().float().cpu()   # [B, N_ROUTES, K]
+                rc_mean_batch = rc.mean(dim=0)             # [N_ROUTES, K]
                 if rc_sum_mat is None:
-                    rc_sum_mat = torch.zeros(rc.size(1), rc.size(2), dtype=torch.float32)
-                rc_sum_mat += rc.sum(dim=0)           # SUM over batch (not mean)
-
-
+                    rc_sum_mat = torch.zeros_like(rc_mean_batch)
+                rc_sum_mat += rc_mean_batch * y.size(0)
 
             # debug prints/heatmaps on first batch
-            if route_debug and rc_w is not None and bidx == 0:
+            if route_debug and routing_coef is not None and bidx == 0:
                 names = label_names if label_names is not None else \
-                    [get_pheno_name(i) for i in range(rc_w.size(2))]
+                    [get_pheno_name(i) for i in range(routing_coef.size(2))]
                 print_route_matrix_detailed(
-                    rc_w, prim_acts, names,
+                    routing_coef, prim_acts, names,
                     where=f"{split_name} Batch {bidx}"
                 )
                 print_phenotype_routing_heatmap(
-                    rc_w, prim_acts, names,
+                    routing_coef, prim_acts, names,
                     where=f"{split_name} Epoch {epoch_idx if epoch_idx is not None else '?'}",
                     top_k=None
                 )
                 if routing_out_dir is not None and epoch_idx is not None:
                     where_tag = f"{split_name.lower()}_epoch{epoch_idx:03d}"
                     save_routing_heatmap(
-                        rc_w, prim_acts, names,
+                        routing_coef, prim_acts, names,
                         where=where_tag,
                         out_dir=routing_out_dir
                     )
-            
-            if beta is not None:
-                has_beta = True
-                b = beta.detach().float().cpu()       # [B,R,K]
-                if beta_sum_mat is None:
-                    beta_sum_mat = torch.zeros(b.size(1), b.size(2), dtype=torch.float32)
-                beta_sum_mat += b.sum(dim=0)          # SUM over batch (not mean)
 
             if not printed_unimodal:
                 printed_unimodal = True
@@ -1887,11 +1776,8 @@ def evaluate_epoch(
     avg_act_dict = {r: float(avg_pa[i]) for i, r in enumerate(route_names)}
 
     if num_samples > 0 and has_routing and rc_sum_mat is not None:
-        avg_rc_mat = (rc_sum_mat / num_samples).numpy()   # [R,K]
-        if has_beta and beta_sum_mat is not None:
-            avg_effective_mat = (beta_sum_mat / num_samples).numpy()
-        else:
-            avg_effective_mat = avg_rc_mat * avg_pa[:, None]
+        avg_rc_mat = (rc_sum_mat / num_samples).numpy()   # [N_ROUTES, K]
+        avg_effective_mat = avg_rc_mat * avg_pa[:, None]  # [N_ROUTES, K]
     else:
         avg_rc_mat = None
         avg_effective_mat = None
@@ -1903,13 +1789,15 @@ def save_checkpoint(path: str, state: Dict):
     ensure_dir(os.path.dirname(path))
     torch.save(state, path)
 
-def load_checkpoint(path: str, behrt, bbert, imgenc, fusion, projector, cap_head, optimizer) -> int:
+def load_checkpoint(path: str, behrt, bbert, imgenc, mult, route_adapter, projector, cap_head, optimizer) -> int:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     behrt.load_state_dict(ckpt["behrt"])
     bbert.load_state_dict(ckpt["bbert"])
     imgenc.load_state_dict(ckpt["imgenc"])
-    for k in fusion.keys():
-        fusion[k].load_state_dict(ckpt["fusion"][k])
+    mult.load_state_dict(ckpt["mult"])
+    route_adapter.load_state_dict(ckpt["route_adapter"])
+
+
     projector.load_state_dict(ckpt["projector"])
     cap_head.load_state_dict(ckpt["cap_head"])
     optimizer.load_state_dict(ckpt["optimizer"])
@@ -1920,9 +1808,11 @@ def load_checkpoint(path: str, behrt, bbert, imgenc, fusion, projector, cap_head
 @torch.no_grad()
 def collect_epoch_logits(
     loader,
-    behrt, bbert, imgenc, fusion, projector, cap_head,
+    behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
     amp_ctx_enc,   
     amp_ctx_caps,  
+    act_temperature: float = 1.0,
+    detach_priors: bool = False,
 ):
     """
     Collect raw logits (NOT sigmoid) and y_true for temperature scaling & calibration.
@@ -1933,15 +1823,8 @@ def collect_epoch_logits(
     """
     behrt.eval()
     imgenc.eval()
-    bbert.eval()
     if getattr(bbert, "bert", None) is not None:
         bbert.bert.eval()
-
-    for k in fusion.keys():
-        fusion[k].eval()
-    projector.eval()
-    cap_head.eval()
-
 
     ys, ls, ids = [], [], []
     for xL, mL, notes, imgs, y, dbg in loader:
@@ -1951,35 +1834,30 @@ def collect_epoch_logits(
         y   = y.to(DEVICE,   non_blocking=True)
 
         # (A) Encoders under autocast
-        with amp_ctx_enc:
-            prepared_notes = prepare_notes_batch(notes)
-            z = encode_modalities_for_routing(
-                behrt=behrt,
-                bbert=bbert,
-                imgenc=imgenc,
-                xL=xL,
-                notes_list=prepared_notes,
-                imgs=imgs,
-                mL=mL,
-            )
-
-        outL = _sanitize_encoder_out(z["L"], "collect_logits.L")
-        outN = _sanitize_encoder_out(z["N"], "collect_logits.N")
-        outI = _sanitize_encoder_out(z["I"], "collect_logits.I")
+        outL, outN, outI = encode_all_modalities(
+            behrt, bbert, imgenc,
+            xL=xL, mL=mL, notes=notes, imgs=imgs,
+            amp_ctx_enc=amp_ctx_enc,
+        )
 
 
         # (B) Capsule in fp32
         with amp_ctx_caps:
-            out = _capsule_forward_safe(
-                {"L": outL, "N": outN, "I": outI},
-                fusion, projector, cap_head,
-                route_mask=torch.ones(xL.size(0), N_ROUTES, device=DEVICE, dtype=torch.float32),
-                act_temperature=1.0, detach_priors=False, return_routing=False
+            z = {"L": outL, "N": outN, "I": outI}
+            route_mask = torch.ones(xL.size(0), N_ROUTES, device=DEVICE, dtype=torch.float32)
+
+            out = capsule_forward_from_encoded(
+                mult=mult,
+                route_adapter=route_adapter,
+                outL=outL, outN=outN, outI=outI,
+                projector=projector,
+                cap_head=cap_head,
+                route_mask=route_mask,
+                act_temperature=float(act_temperature),
+                detach_priors=bool(detach_priors),
+                return_routing=True,
             )
-            logits, prim_acts, route_embs, rc_w, beta = unpack_capsule_out(
-                out, expect_routes=N_ROUTES, y=y, name="collect_logits.capsule"
-            )
-            logits = _safe_tensor(logits.float(), "collect_logits.logits(fp32)")
+            logits = _safe_tensor(out[0].float(), "collect_logits.logits(fp32)")
 
 
         ys.append(y.detach().cpu())
@@ -2042,21 +1920,16 @@ def sigmoid_np(x: np.ndarray) -> np.ndarray:
 @torch.no_grad()
 def collect_epoch_outputs(
     loader,
-    behrt, bbert, imgenc, fusion, projector, cap_head,
+    behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
     amp_ctx_enc,  
-    amp_ctx_caps,  
+    amp_ctx_caps, 
+    act_temperature: float = 1.0, 
+    detach_priors: bool = False,
 ):
     behrt.eval()
     imgenc.eval()
-    bbert.eval()
     if getattr(bbert, "bert", None) is not None:
         bbert.bert.eval()
-
-    for k in fusion.keys():
-        fusion[k].eval()
-    projector.eval()
-    cap_head.eval()
-
 
     y_true, p1, ids = [], [], []
     for xL, mL, notes, imgs, y, dbg in loader:
@@ -2065,35 +1938,34 @@ def collect_epoch_outputs(
         imgs = imgs.to(DEVICE, non_blocking=True)
         y   = y.to(DEVICE,   non_blocking=True)
 
-        with amp_ctx_enc:
-            prepared_notes = prepare_notes_batch(notes)
-            z = encode_modalities_for_routing(
-                behrt=behrt,
-                bbert=bbert,
-                imgenc=imgenc,
-                xL=xL,
-                notes_list=prepared_notes,
-                imgs=imgs,
-                mL=mL,
-            )
+        outL, outN, outI = encode_all_modalities(
+            behrt, bbert, imgenc,
+            xL=xL, mL=mL, notes=notes, imgs=imgs,
+            amp_ctx_enc=amp_ctx_enc,
+        )   
 
-        outL = _sanitize_encoder_out(z["L"], "collect_logits.L")
-        outN = _sanitize_encoder_out(z["N"], "collect_logits.N")
-        outI = _sanitize_encoder_out(z["I"], "collect_logits.I")
+
 
         with amp_ctx_caps:
-            out = _capsule_forward_safe(
-                {"L": outL, "N": outN, "I": outI},
-                fusion, projector, cap_head,
-                route_mask=torch.ones(xL.size(0), N_ROUTES, device=DEVICE, dtype=torch.float32),
-                act_temperature=1.0, detach_priors=False, return_routing=True
-            )
-            logits, prim_acts, route_embs, rc_w, beta = unpack_capsule_out(
-                out, expect_routes=N_ROUTES, y=y, name="collect_outputs.capsule"
-            )
-            logits = _safe_tensor(logits.float(), "collect.logits(fp32)")
-            probs  = torch.sigmoid(logits)
+            z = {"L": outL, "N": outN, "I": outI}
+            route_mask = torch.ones(xL.size(0), N_ROUTES, device=DEVICE, dtype=torch.float32)
 
+            out = capsule_forward_from_encoded(
+                mult=mult,
+                route_adapter=route_adapter,
+                outL=outL, outN=outN, outI=outI,
+                projector=projector,
+                cap_head=cap_head,
+                route_mask=route_mask,
+                act_temperature=float(act_temperature),
+                detach_priors=bool(detach_priors),
+                return_routing=True,
+            )
+            logits = _safe_tensor(out[0].float(), "collect.logits(fp32)")
+
+
+
+        probs = torch.sigmoid(logits)
 
         y_true.append(y.detach().cpu())
         p1.append(probs.detach().cpu())
@@ -2326,12 +2198,6 @@ def grid_search_thresholds(
     p: np.ndarray,
     n_steps: int = 101,
 ):
-    """
-    Per-label threshold search that maximizes per-label F1.
-    Returns:
-      thresholds: [K]
-      best_f1:    [K]
-    """
     y_true = np.asarray(y_true)
     p      = np.asarray(p)
     N, K = p.shape
@@ -2379,7 +2245,7 @@ def save_split_thresholds(
 def generate_split_heatmaps_and_tables(
     split_name: str,
     loader,
-    behrt, bbert, imgenc, fusion, projector, cap_head,
+    behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
     amp_ctx_enc,
     amp_ctx_caps,
     label_names: List[str],
@@ -2403,7 +2269,7 @@ def generate_split_heatmaps_and_tables(
 
     dummy_bce = nn.BCEWithLogitsLoss(reduction="mean")
     loss, acc, act_dict, rc_mat, eff_mat, pa_vec = evaluate_epoch(
-        behrt, bbert, imgenc, fusion, projector, cap_head,
+        behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
         loader, amp_ctx_enc, amp_ctx_caps, dummy_bce,
         route_debug=False,
         label_names=label_names,
@@ -2421,7 +2287,7 @@ def generate_split_heatmaps_and_tables(
     eff_k10 = eff_mat.T      # [K,N_ROUTES]
 
     y_true_log, logits, _ = collect_epoch_logits(
-        loader, behrt, bbert, imgenc, fusion, projector, cap_head,
+        loader, behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
         amp_ctx_enc, amp_ctx_caps
     )
 
@@ -2549,17 +2415,11 @@ def generate_split_heatmaps_and_tables(
 def main():
     import env_config as E
 
-    E.load_cfg()
-
-    # IMPORTANT: sync main.py globals BEFORE parse_args(), because parse_args() uses _cfg(...)
-    global CFG, DEVICE
-    CFG = E.CFG
-    DEVICE = E.DEVICE
-
-    args = parse_args()
+    E.load_cfg()                    
+    args = parse_args()             
     apply_cli_overrides(args)
 
-    # resync in case CLI overrides changed env_config.CFG
+    global CFG, DEVICE
     CFG = E.CFG
     DEVICE = E.DEVICE
 
@@ -2611,13 +2471,6 @@ def main():
     train_ds = ICUStayDataset(args.data_root, split="train")
     tri_ids = set(train_ds.ids)
 
-    # ---- SYNC structured feature dimension to what's actually in the parquet ----
-    actual_F = len(train_ds.feat_cols)
-    if int(CFG.structured_n_feats) != int(actual_F):
-        print(f"[fix] structured_n_feats mismatch: CFG={CFG.structured_n_feats} vs data={actual_F} -> syncing CFG")
-        CFG.structured_n_feats = int(actual_F)
-
-
     # Class-balancing pos_weight from TRAIN (tri-modal TRAIN only)
     train_label_df = (
         train_ds.labels[train_ds.labels["stay_id"].isin(tri_ids)]
@@ -2644,11 +2497,6 @@ def main():
 
     val_ds   = ICUStayDataset(args.data_root, split="val")
     test_ds  = ICUStayDataset(args.data_root, split="test")
-
-    # ---- Force val/test to use the SAME structured feature columns as train ----
-    val_ds.feat_cols  = list(train_ds.feat_cols)
-    test_ds.feat_cols = list(train_ds.feat_cols)
-
     num_phenos = train_ds.num_labels
 
     raw_label_cols = train_ds.label_cols
@@ -2708,22 +2556,20 @@ def main():
 
     # Encoders
     enc_cfg = EncoderConfig(
-        d=_cfg("d", 256),
-        dropout=_cfg("dropout", 0.0),
-
+        d=_cfg("d", 256), dropout=_cfg("dropout", 0.0),
         structured_seq_len=_cfg("structured_seq_len", 256),
         structured_n_feats=_cfg("structured_n_feats", 17),
         structured_layers=_cfg("structured_layers", 2),
         structured_heads=_cfg("structured_heads", 8),
         structured_pool="cls",
-
         text_model_name=_cfg("text_model_name", "emilyalsentzer/Bio_ClinicalBERT"),
-
-        vision_backbone=_cfg("image_model_name", "resnet34"),   # maps to field name expected by EncoderConfig
+        text_max_len=_cfg("max_text_len", 512),
+        note_agg="attention",
+        img_agg="last",
+        vision_backbone=_cfg("image_model_name", "resnet34"),
         vision_num_classes=14,
         vision_pretrained=True,
     )
-
     behrt, bbert, imgenc = build_encoders(enc_cfg, device=DEVICE)
     print(
         f"[encoders] d={CFG.d} | BEHRT out_dim={behrt.out_dim} | "
@@ -2736,13 +2582,46 @@ def main():
         bbert.bert.eval()
         print("[encoders] Bio_ClinicalBERT frozen (feature extractor mode)")
 
-    # Fusions + capsule head
-    fusion = build_fusions(d=CFG.d, p_drop=CFG.dropout)
 
 
-    for k in fusion.keys():
-        fusion[k].to(DEVICE)
-    projector = RoutePrimaryProjector(d_in=CFG.d, pc_dim=CFG.capsule_pc_dim).to(DEVICE)
+    # =========================
+    # MULTModel + capsule head
+    # =========================
+
+    # Choose MulT output dims (these are MulT internal dims, NOT encoder dims)
+    d_l = int(getattr(CFG, "mult_d_l", CFG.d))
+    d_n = int(getattr(CFG, "mult_d_n", CFG.d))
+    d_i = int(getattr(CFG, "mult_d_i", CFG.d))
+
+    # Original encoder feature dims are CFG.d for all three in your current setup
+    orig_d_l = int(CFG.d)
+    orig_d_n = int(CFG.d)
+    orig_d_i = int(CFG.d)
+
+    mult = MULTModel(
+        orig_d_l=orig_d_l, orig_d_n=orig_d_n, orig_d_i=orig_d_i,
+        d_l=d_l, d_n=d_n, d_i=d_i,
+        ionly=True, nonly=True, lonly=True,
+        num_heads=int(getattr(CFG, "mult_num_heads", 8)),
+        layers=int(getattr(CFG, "mult_layers", 4)),
+        self_layers=int(getattr(CFG, "mult_self_layers", 0)),
+        attn_dropout=float(getattr(CFG, "mult_attn_dropout", CFG.dropout)),
+        attn_dropout_n=float(getattr(CFG, "mult_attn_dropout_n", CFG.dropout)),
+        attn_dropout_i=float(getattr(CFG, "mult_attn_dropout_i", CFG.dropout)),
+        relu_dropout=float(getattr(CFG, "mult_relu_dropout", CFG.dropout)),
+        res_dropout=float(getattr(CFG, "mult_res_dropout", CFG.dropout)),
+        out_dropout=float(getattr(CFG, "mult_out_dropout", CFG.dropout)),
+        embed_dropout=float(getattr(CFG, "mult_embed_dropout", 0.0)),
+        attn_mask=bool(getattr(CFG, "mult_attn_mask", False)),
+    ).to(DEVICE)
+
+    # Projector input dim (shared across routes)
+    d_in = int(getattr(CFG, "mult_d_in", d_l))  # common choice: d_in=d_l if you set d_l=d_n=d_i
+
+    route_adapter = RouteDimAdapter(d_in=d_in, d_l=d_l, d_n=d_n, d_i=d_i).to(DEVICE)
+
+    projector = RoutePrimaryProjector(d_in=d_in, pc_dim=CFG.capsule_pc_dim).to(DEVICE)
+
     cap_head = CapsuleMortalityHead(
         pc_dim=CFG.capsule_pc_dim,
         mc_caps_dim=CFG.capsule_mc_caps_dim,
@@ -2751,13 +2630,18 @@ def main():
         act_type=CFG.capsule_act_type,
         layer_norm=CFG.capsule_layer_norm,
         dim_pose_to_vote=CFG.capsule_dim_pose_to_vote,
-        num_classes=num_phenos,  # <<< K=25 phenotypes
+        num_classes=num_phenos,
     ).to(DEVICE)
+
+    print(
+        f"[mult] d_l={d_l} d_n={d_n} d_i={d_i} d_in={d_in} "
+        f"| heads={getattr(CFG,'mult_num_heads',8)} layers={getattr(CFG,'mult_layers',4)}"
+    )
     print(
         f"[capsule] pc_dim={CFG.capsule_pc_dim} mc_caps_dim={CFG.capsule_mc_caps_dim} "
-        f"iters={CFG.capsule_num_routing} act_type={CFG.capsule_act_type} "
-        f"out_caps={num_phenos}"
+        f"iters={CFG.capsule_num_routing} act_type={CFG.capsule_act_type} out_caps={num_phenos}"
     )
+
 
     encoder_warmup_epochs = int(getattr(args, "encoder_warmup_epochs", _cfg("encoder_warmup_epochs", 2)))
 
@@ -2773,10 +2657,12 @@ def main():
     else:
         head_params += [p for p in bbert.parameters() if p.requires_grad]
 
-    for k in fusion.keys():
-        head_params += [p for p in fusion[k].parameters() if p.requires_grad]
+
+    head_params += [p for p in mult.parameters() if p.requires_grad]
+    head_params += [p for p in route_adapter.parameters() if p.requires_grad]
     head_params += [p for p in projector.parameters() if p.requires_grad]
     head_params += [p for p in cap_head.parameters() if p.requires_grad]
+
 
     params = enc_params + head_params
 
@@ -2798,7 +2684,7 @@ def main():
     ensure_dir(ckpt_dir)
     if args.resume and os.path.isfile(args.resume):
         print(f"[main] Resuming from {args.resume}")
-        start_epoch = load_checkpoint(args.resume, behrt, bbert, imgenc, fusion, projector, cap_head, optimizer)
+        start_epoch = load_checkpoint(args.resume, behrt, bbert, imgenc, mult, route_adapter, projector, cap_head, optimizer)
 
     printed_once = False
 
@@ -2815,7 +2701,6 @@ def main():
     routing_warmup_epochs        = max(0, int(routing_warmup_epochs))
     route_entropy_warmup_epochs  = max(0.0, float(route_entropy_warmup_epochs))
     route_uniform_warmup_epochs = max(0, route_uniform_warmup_epochs)
-    route_uniform_lambda = 0.0 
 
 
     max_train_patients = int(os.environ.get("MIMICIV_MAX_TRAIN_PATIENTS", "-1"))
@@ -2854,40 +2739,14 @@ def main():
         if epoch in {start_epoch, start_epoch + encoder_warmup_epochs}:
             print(f"[warmup] epoch={epoch+1} enc_lr={enc_lr} head_lr={args.lr} enc_train={enc_train}")
 
-        # --- TRAIN/EVAL modes (warmup-aware) ---
-
-        # Encoders: only put in train mode when enc_train is True (avoids dropout noise during warmup)
-        if enc_train:
-            behrt.train()
-            imgenc.train()
-        else:
-            behrt.eval()
-            imgenc.eval()
-
-        # Text encoder wrapper vs bert:
-        # - If finetune_text=False: projection head is trainable, but BERT backbone stays eval/frozen
-        # - If finetune_text=True: during warmup (enc_train=False) keep entire bbert eval; otherwise train
-        if CFG.finetune_text:
-            if enc_train:
-                bbert.train()
-                if getattr(bbert, "bert", None) is not None:
-                    bbert.bert.train()
+        behrt.train()
+        imgenc.train()
+        bbert.train()
+        if getattr(bbert, "bert", None) is not None:
+            if CFG.finetune_text:
+                bbert.bert.train()
             else:
-                bbert.eval()
-                if getattr(bbert, "bert", None) is not None:
-                    bbert.bert.eval()
-        else:
-            # projection head trainable, backbone frozen/eval
-            bbert.train()
-            if getattr(bbert, "bert", None) is not None:
                 bbert.bert.eval()
-
-        # Heads/fusions must be train mode during training
-        for k in fusion.keys():
-            fusion[k].train()
-        projector.train()
-        cap_head.train()
-
 
 
         total_loss, total_correct, total = 0.0, 0, 0
@@ -2915,22 +2774,11 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
-            with amp_ctx_enc:
-                prepared_notes = prepare_notes_batch(notes)
-
-                z = encode_modalities_for_routing(
-                    behrt=behrt,
-                    bbert=bbert,
-                    imgenc=imgenc,
-                    xL=xL,
-                    notes_list=prepared_notes,
-                    imgs=imgs,
-                    mL=mL,
-                )
-
-            outL = _sanitize_encoder_out(z["L"], "train.L")
-            outN = _sanitize_encoder_out(z["N"], "train.N")
-            outI = _sanitize_encoder_out(z["I"], "train.I")
+            outL, outN, outI = encode_all_modalities(
+                behrt, bbert, imgenc,
+                xL=xL, mL=mL, notes=notes, imgs=imgs,
+                amp_ctx_enc=amp_ctx_enc,
+            )
 
 
             if _has_nonfinite(outL.get("pool"), outN.get("pool"), outI.get("pool"),
@@ -2941,7 +2789,7 @@ def main():
 
             with amp_ctx_caps:
                 B = xL.size(0)
-                route_mask = torch.ones(B, N_ROUTES, device=DEVICE, dtype=torch.float32)  # keep as float unless your capsule expects bool
+                route_mask = torch.ones(B, N_ROUTES, device=DEVICE, dtype=torch.float32)
 
                 if route_dropout_p > 0.0:
                     if torch.rand((), device=DEVICE) < route_dropout_p:
@@ -2951,28 +2799,41 @@ def main():
                         drop_idx2 = int(torch.randint(low=0, high=N_ROUTES, size=(1,), device=DEVICE))
                         route_mask[:, drop_idx2] = 0.0
 
+                
                 detach_priors_flag = (epoch - start_epoch) < routing_warmup_epochs
-                temp = 2.0 if epoch < 2 else 1.0
+                temp = 2.0 if (epoch - start_epoch) < 2 else 1.0   # or whatever schedule you want
 
-                out = _capsule_forward_safe(
-                    {"L": outL, "N": outN, "I": outI},
-                    fusion, projector, cap_head,
-                    route_mask=route_mask, act_temperature=temp,
-                    detach_priors=detach_priors_flag, return_routing=True
+                out = capsule_forward_from_encoded(
+                    mult=mult,
+                    route_adapter=route_adapter,
+                    outL=outL, outN=outN, outI=outI,
+                    projector=projector,
+                    cap_head=cap_head,
+                    route_mask=route_mask,
+                    act_temperature=temp,
+                    detach_priors=detach_priors_flag,
+                    return_routing=True,
                 )
 
-                logits, prim_acts, route_embs, rc_w, beta = unpack_capsule_out(
-                    out, expect_routes=N_ROUTES, y=y, name="TRAIN.capsule"
-                )
 
-                if (epoch == start_epoch) and (step == 0) and rc_w is not None and bool(getattr(args, "route_debug", False)):
-                    debug_routing_tensor(
-                        rc_w,
-                        name="TRAIN.routing_probs",
-                        expect_routes=N_ROUTES,
-                        expect_k=int(y.size(1))
-                    )
-                    quantization_check(rc_w, name="TRAIN.routing_probs")
+                logits, prim_acts, route_embs = out[0], out[1], out[2]
+                routing_coef = out[3] if len(out) > 3 else None
+
+                if routing_coef is not None:
+                    # no renorm here (CapsuleMortalityHead is the source of truth)
+                    assert routing_coef.ndim == 3, \
+                        f"routing_coef must be 3D [B,R,K], got {tuple(routing_coef.shape)}"
+
+                    assert int(routing_coef.shape[1]) == int(N_ROUTES), \
+                        f"routing_coef must be [B,{N_ROUTES},K], got {tuple(routing_coef.shape)}"
+
+                    if bool(getattr(args, "route_debug", False)) and (epoch == start_epoch) and (step == 0):
+                        debug_routing_tensor(
+                            routing_coef,
+                            name="TRAIN.routing_coef_precheck",
+                            expect_routes=N_ROUTES,
+                            expect_k=int(y.size(1)),
+                        )
 
                 logits    = _safe_tensor(logits.float(),     "logits(fp32)")
                 prim_acts = _safe_tensor(prim_acts.float(), "prim_acts(fp32)")
@@ -2987,22 +2848,21 @@ def main():
 
                 cur_epoch = float(epoch + 1) 
 
-                # Entropy REGULARIZER (encourage specialization / non-uniform)
-                # If lambda > 0: this MINIMIZES entropy -> peaky routing
-                if route_entropy_lambda > 0.0 and (cur_epoch <= route_entropy_warmup_epochs):
+                # Entropy bonus (if warmup_epochs <= 0 => apply ALWAYS)
+                if route_entropy_lambda > 0.0 and (route_entropy_warmup_epochs <= 0 or cur_epoch <= route_entropy_warmup_epochs):
                     pa = prim_acts / (prim_acts.sum(dim=1, keepdim=True) + 1e-6)
                     pa = torch.clamp(pa, 1e-6, 1.0)
                     H = -(pa * pa.log()).sum(dim=1).mean()
-                    loss = loss + route_entropy_lambda * H   # <-- FLIPPED SIGN
+                    loss = loss - route_entropy_lambda * H
 
-
-                # Uniform bonus (only during warmup window)
-                if route_uniform_lambda > 0.0 and (cur_epoch <= route_uniform_warmup_epochs):
+                # Uniform bonus (if warmup_epochs <= 0 => apply ALWAYS)
+                if route_uniform_lambda > 0.0 and (route_uniform_warmup_epochs <= 0 or cur_epoch <= route_uniform_warmup_epochs):
                     pa_dist = prim_acts / (prim_acts.sum(dim=1, keepdim=True) + 1e-6)
                     p_mean = pa_dist.mean(dim=0)
                     target = torch.full_like(p_mean, 1.0 / p_mean.numel())
                     uniform_loss = ((p_mean - target) ** 2).sum()
                     loss = loss + route_uniform_lambda * uniform_loss
+
 
 
             grad_clip = float(_cfg("grad_clip", 0.3))
@@ -3057,11 +2917,15 @@ def main():
                         f"{r}:{avg_act[i]:.3f}" for i, r in enumerate(routes)
                     )
                 )
-                if rc_w is not None:
-                    rc_route_mean = rc_w.detach().float().mean(dim=(0, 2)).cpu().tolist()  # [R]
-                    rc_str = " | ".join(f"{r}:{rc_route_mean[i]:.3f}" for i, r in enumerate(routes))
-                    msg += f" | [routing mean coeff] {rc_str}"
+                if routing_coef is not None:
+                    # routing_coef is guaranteed [B,R,K] from the asserts above
+                    rc_route_mean = routing_coef.detach().float().mean(dim=(0, 2))  # [R]
+                    rc_route_mean = rc_route_mean.cpu().tolist()
 
+                    rc_str = " | ".join(
+                        f"{r}:{rc_route_mean[i]:.3f}" for i, r in enumerate(routes)
+                    )
+                    msg += f" | [routing mean coeff] {rc_str}"
 
                 print(msg)
 
@@ -3084,8 +2948,10 @@ def main():
 
         # VAL metrics (BCE + 0.5 threshold / F1-based thresholds)
         val_loss, val_acc, val_act, val_rc_mat, val_eff_mat, val_pa = evaluate_epoch(
-            behrt, bbert, imgenc, fusion, projector, cap_head,
+            behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
             val_loader, amp_ctx_enc, amp_ctx_caps, bce,
+            act_temperature=1.0,
+            detach_priors=False,
             route_debug=bool(getattr(args, "route_debug", False)),
             label_names=label_names,
             epoch_idx=epoch + 1,
@@ -3144,8 +3010,11 @@ def main():
 
         # Collect outputs for full VAL metrics
         y_true, p1, _ = collect_epoch_outputs(
-            val_loader, behrt, bbert, imgenc, fusion, projector, cap_head,
-            amp_ctx_enc, amp_ctx_caps
+            val_loader, behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
+            amp_ctx_enc, amp_ctx_caps,
+            act_temperature=1.0,
+            detach_priors=False,
+
         )
 
         best_thr = find_best_thresholds(y_true, p1, n_steps=50)
@@ -3230,7 +3099,8 @@ def main():
             "behrt": behrt.state_dict(),
             "bbert": bbert.state_dict(),
             "imgenc": imgenc.state_dict(),
-            "fusion": {k: v.state_dict() for k, v in fusion.items()},
+            "mult": mult.state_dict(),
+            "route_adapter": route_adapter.state_dict(),
             "projector": projector.state_dict(),
             "cap_head": cap_head.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -3252,14 +3122,18 @@ def main():
         behrt.load_state_dict(ckpt["behrt"])
         bbert.load_state_dict(ckpt["bbert"])
         imgenc.load_state_dict(ckpt["imgenc"])
-        for k in fusion.keys():
-            fusion[k].load_state_dict(ckpt["fusion"][k])
+        mult.load_state_dict(ckpt["mult"])
+        route_adapter.load_state_dict(ckpt["route_adapter"])
+
+
         projector.load_state_dict(ckpt["projector"])
         cap_head.load_state_dict(ckpt["cap_head"])
 
     test_loss, test_acc, test_act, test_rc_mat, test_eff_mat, test_pa = evaluate_epoch(
-        behrt, bbert, imgenc, fusion, projector, cap_head,
+        behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
         test_loader, amp_ctx_enc, amp_ctx_caps, bce,
+        act_temperature=1.0,
+        detach_priors=False,
         route_debug=False,
         label_names=label_names,
         split_name="TEST",
@@ -3312,7 +3186,7 @@ def main():
 
     # Compute prevalence & thresholds on VAL
     y_true_v_log, logits_v, _ = collect_epoch_logits(
-        val_loader, behrt, bbert, imgenc, fusion, projector, cap_head,
+        val_loader, behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
         amp_ctx_enc, amp_ctx_caps
     )
 
@@ -3325,7 +3199,7 @@ def main():
     thr_val, f1_val_thr = grid_search_thresholds(y_true_v_log, p_v, n_steps=101)
     save_split_thresholds(thr_val, ckpt_dir, split_name="VAL")  
     y_true_t_log, logits_t, _ = collect_epoch_logits(
-        test_loader, behrt, bbert, imgenc, fusion, projector, cap_head, amp_ctx_enc, amp_ctx_caps
+        test_loader, behrt, bbert, imgenc, mult, route_adapter, projector, cap_head, amp_ctx_enc, amp_ctx_caps
     )
 
     # Uncalibrated + calibrated probabilities on TEST
@@ -3359,7 +3233,7 @@ def main():
         split_name="TRAIN",
         loader=train_eval_loader,
         behrt=behrt, bbert=bbert, imgenc=imgenc,
-        fusion=fusion, projector=projector, cap_head=cap_head,
+        mult=mult, route_adapter=route_adapter, projector=projector, cap_head=cap_head,
         amp_ctx_enc=amp_ctx_enc,
         amp_ctx_caps=amp_ctx_caps,
         label_names=label_names,
@@ -3372,7 +3246,7 @@ def main():
         split_name="TEST",
         loader=test_loader,
         behrt=behrt, bbert=bbert, imgenc=imgenc,
-        fusion=fusion, projector=projector, cap_head=cap_head,
+        mult=mult, route_adapter=route_adapter, projector=projector, cap_head=cap_head,
         amp_ctx_enc=amp_ctx_enc,
         amp_ctx_caps=amp_ctx_caps,
         label_names=label_names,
