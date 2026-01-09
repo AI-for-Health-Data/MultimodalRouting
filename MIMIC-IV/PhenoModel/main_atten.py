@@ -22,6 +22,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 from torch import amp as torch_amp
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 import matplotlib
 matplotlib.use("Agg")
@@ -29,7 +30,7 @@ import matplotlib.pyplot as plt
 
 from transformers import AutoTokenizer
 
-from env_config import CFG, DEVICE, load_cfg, ensure_dir
+from env_config import CFG, DEVICE, load_cfg, ensure_dir, ROUTES
 from env_config import get_pheno_name, apply_cli_overrides
 
 from encoders import (
@@ -44,12 +45,13 @@ from routing_and_heads import (
     forward_capsule_from_multmodel,
     make_route_inputs_mult,
     forward_capsule_from_route_dict,
+    route_given_pheno,
 )
 
 
+ROUTE_NAMES = list(ROUTES)          # single source of truth
+N_ROUTES = len(ROUTE_NAMES)
 
-ROUTE_NAMES = ["L", "N", "I", "LN", "NL", "LI", "IL", "NI", "IN", "LNI"]
-N_ROUTES = len(ROUTE_NAMES) 
 
 def grads_are_finite(param_list):
     for p in param_list:
@@ -68,6 +70,14 @@ def seed_worker(worker_id: int):
     random.seed(ws)
     torch.manual_seed(ws)
 
+    # ADD THIS:
+    global TOKENIZER, MAXLEN
+    if TOKENIZER is None:
+        from transformers import AutoTokenizer
+        TOKENIZER = AutoTokenizer.from_pretrained(CFG.text_model_name)
+        MAXLEN = int(getattr(CFG, "max_text_len", 512))
+
+
 def _standardize_id_column(df: pd.DataFrame, name="stay_id") -> pd.DataFrame:
     candidates = [name, "icustay_id", "stay", "sample_id"]
     found = next((c for c in candidates if c in df.columns), None)
@@ -83,20 +93,22 @@ def print_route_matrix_detailed(
     prim_acts: torch.Tensor,
     label_names: List[str],
     where: str = "",
+    rc_is_report: bool = True,   # ✅ NEW
 ):
     with torch.no_grad():
-        rc = routing_coef.detach().float().cpu()  # [B,N_ROUTES,K]
-        pa = prim_acts.detach().float().cpu()     # [B,N_ROUTES]
+        rc = routing_coef.detach().float().cpu()  # [B,R,K]
+        pa = prim_acts.detach().float().cpu()     # [B,R]
 
         B, R, K = rc.shape
+        rc_mean = rc.mean(dim=0).numpy()          # [R,K]
+        pa_mean = pa.mean(dim=0).numpy()          # [R]
 
-        # Average over batch
-        rc_mean = rc.mean(dim=0).numpy()          # [N_ROUTES,K]
-        pa_mean = pa.mean(dim=0).numpy()          # [N_ROUTES]
-
-        # Effective weights (per route × phenotype)
-        effective = (rc * pa.unsqueeze(-1)).mean(dim=0).numpy()  # [N_ROUTES,K]
-
+        if rc_is_report:
+            # rc already accounts for primary activations (your route_given_pheno uses prim_act)
+            effective = rc_mean                    # ✅ same as routing
+        else:
+            # raw capsule coupling p(k|r): if you ever pass it, this is the old “effective”
+            effective = (rc * pa.unsqueeze(-1)).mean(dim=0).numpy()
         routes = ROUTE_NAMES
 
         print(f"\n{'=' * 120}")
@@ -108,7 +120,11 @@ def print_route_matrix_detailed(
 
         print(f"\n2. PER-PHENOTYPE ROUTING WEIGHTS:")
         print("   Format: phenotype_name | " + " | ".join(routes))
-        print("   Each cell shows: routing_coef(effective_weight)")
+        if rc_is_report:
+            print("   Each cell shows: p(route|phenotype) (effective == routing in this mode)")
+        else:
+            print("   Each cell shows: routing_coef_raw(effective=raw×primary_act)")
+
         print(f"   {'-' * 116}")
 
         for k in range(K):
@@ -144,24 +160,65 @@ def print_route_matrix_detailed(
 
         print(f"{'=' * 120}\n")
 
-def encode_all_modalities(behrt, bbert, imgenc, xL, mL, notes, imgs, amp_ctx_enc):
+def encode_all_modalities(
+    behrt, bbert, imgenc,
+    xL, mL, notes, imgs,
+    amp_ctx_enc,
+    dbg_once: bool = False,     # ✅ NEW
+):
+    def _peek_tensor(name: str, x: torch.Tensor, k: int = 3) -> None:
+        if not dbg_once:
+            return
+        try:
+            if x is None:
+                print(f"[peek] {name}: <None>")
+                return
+            with torch.no_grad():
+                flat = x.reshape(-1)
+                vals = flat[:k].detach().cpu().tolist()
+            print(f"[peek] {name}: shape={tuple(x.shape)} sample={vals}")
+        except Exception as e:
+            print(f"[peek] {name}: <peek failed: {type(e).__name__}: {e}>")
+
     with amp_ctx_enc:
-        L_seq, L_mask, L_pool = behrt.encode_seq_and_pool(xL, mask=mL)
+        L_seq, L_mask, L_pool = behrt.encode_seq_and_pool(xL, mL)
 
-        notes_batch = prepare_notes_batch(notes)
-        N_seq, N_mask = bbert.encode_seq(notes_batch)
-        N_pool = bbert.pool_from_seq(N_seq, N_mask)
+        # ✅ Only print once
+        if dbg_once:
+            with torch.no_grad():
+                print("[dbg] xL.abs().sum per-sample (first 5):",
+                      xL.abs().sum(dim=(1, 2))[:5].detach().cpu().tolist())
+                print("[dbg] mL.sum per-sample (first 5):",
+                      mL.sum(dim=1)[:5].detach().cpu().tolist())
+            _peek_tensor("enc.L_pool", L_pool)
+            _peek_tensor("enc.L_seq",  L_seq)
 
+        # notes is dict with batched tensors
+        notes_ids  = notes["input_ids"].to(DEVICE, non_blocking=True)        # [B,S,L]
+        notes_attn = notes["attention_mask"].to(DEVICE, non_blocking=True)   # [B,S,L]
+        chunk_mask = notes.get("chunk_mask", None)
+        if chunk_mask is not None:
+            chunk_mask = chunk_mask.to(DEVICE, non_blocking=True)            # [B,S]
+
+        notes_batch = {
+            "input_ids": notes_ids,
+            "attention_mask": notes_attn,
+            "chunk_mask": chunk_mask,
+        }
+        N_seq, N_mask, N_pool = bbert.encode_seq_and_pool(notes_batch)
         I_seq, I_mask, I_pool = imgenc.encode_seq_and_pool(imgs)
+
+        # ✅ Print only once
+        _peek_tensor("enc.N_pool", N_pool)
+        _peek_tensor("enc.N_seq",  N_seq)
+        _peek_tensor("enc.I_pool", I_pool)
+        _peek_tensor("enc.I_seq",  I_seq)
 
     outL = {"seq": L_seq, "mask": L_mask.float(), "pool": L_pool}
     outN = {"seq": N_seq, "mask": N_mask.float(), "pool": N_pool}
     outI = {"seq": I_seq, "mask": I_mask.float(), "pool": I_pool}
 
-    outL = _sanitize_encoder_out(outL, "L")
-    outN = _sanitize_encoder_out(outN, "N")
-    outI = _sanitize_encoder_out(outI, "I")
-    return outL, outN, outI
+    return _sanitize_encoder_out(outL, "L"), _sanitize_encoder_out(outN, "N"), _sanitize_encoder_out(outI, "I")
 
 def debug_routing_tensor(
     rc: torch.Tensor,
@@ -202,69 +259,6 @@ def debug_routing_tensor(
         else:
             print("[debug] rc[0, 0, :] (routes for phenotype0):", rc[0, 0, :].detach().float().cpu().tolist())
             print("[debug] rc[0, 0, :].sum() =", float(rc[0, 0, :].sum().detach().cpu()))
-
-def normalize_routing_coef_auto(
-    rc: torch.Tensor,
-    expect_routes: int = N_ROUTES,
-    eps: float = 1e-12,
-    mode: str = "gate_norm",  # {"gate_norm", "softmax", "none"}
-    atol_already: float = 1e-3,
-):
-    if rc is None or rc.ndim != 3:
-        return rc, {"ok": False, "reason": "rc None or not 3D"}
-
-    rc = rc.float()
-    B, D1, D2 = rc.shape
-    info = {"orig_shape": (B, D1, D2), "expect_routes": int(expect_routes), "mode": str(mode)}
-
-    transposed = False
-    if D1 == expect_routes:
-        pass
-    elif D2 == expect_routes:
-        rc = rc.transpose(1, 2)  # [B,K,R] -> [B,R,K]
-        transposed = True
-    else:
-        s1 = rc.sum(dim=1)  # [B, D2]
-        s2 = rc.sum(dim=2)  # [B, D1]
-        info["err_sum_dim1"] = float((s1 - 1.0).abs().mean().item())
-        info["err_sum_dim2"] = float((s2 - 1.0).abs().mean().item())
-        info["warn"] = "could_not_identify_routes_dim_by_size"
-
-    info["transposed_to_BRK"] = transposed
-    info["shape_after_orient"] = tuple(rc.shape)
-
-    mode_l = str(mode).lower()
-
-    if mode_l == "none":
-        info["ok"] = True
-        return rc, info
-
-    if mode_l == "softmax":
-        rc = torch.softmax(rc, dim=1)
-        s = rc.sum(dim=1)
-        info["post_min_sum_routes"] = float(s.min().item())
-        info["post_max_sum_routes"] = float(s.max().item())
-        info["ok"] = True
-        return rc, info
-
-    if mode_l == "gate_norm":
-        rc = rc.clamp_min(0.0)
-        denom = rc.sum(dim=1, keepdim=True).clamp_min(eps)
-        rc = rc / denom
-
-        s = rc.sum(dim=1)
-        info["post_min_sum_routes"] = float(s.min().item())
-        info["post_max_sum_routes"] = float(s.max().item())
-        info["ok"] = True
-        return rc, info
-
-    return rc, {"ok": False, "reason": f"unknown mode={mode}"}
-
-
-
-def renorm_over_routes(rc: torch.Tensor, routes_dim: int = 1, eps: float = 1e-12) -> torch.Tensor:
-    denom = rc.sum(dim=routes_dim, keepdim=True).clamp_min(eps)
-    return rc / denom
 
 
 def assert_routing_over_routes(rc: torch.Tensor, routes_dim: int = 1, atol: float = 1e-3, name: str = "routing_coef"):
@@ -336,29 +330,66 @@ def print_phenotype_routing_heatmap(
     label_names: Optional[List[str]] = None,
     where: str = "",
     top_k: Optional[int] = None,
+    rc_is_report: bool = True,
 ):
+    """
+    Prints per-phenotype route usage.
+
+    If rc_is_report=True:
+        routing_coef is assumed to be rc_report = p(route | phenotype) (already includes prim_acts)
+        -> "effective" == rc_mean
+
+    If rc_is_report=False:
+        routing_coef is assumed to be raw capsule coupling (e.g., p(phenotype | route) or similar)
+        and we form an "effective" proxy via (rc_mean * pa_mean) just for reporting.
+    """
+    import numpy as np
+
     with torch.no_grad():
-        rc = routing_coef.detach().float().cpu()
-        pa = prim_acts.detach().float().cpu()
+        rc = routing_coef.detach().float().cpu()   # [B,R,K]
+        pa = prim_acts.detach().float().cpu()      # [B,R]
+
+        if rc.ndim != 3:
+            raise ValueError(f"routing_coef must be [B,R,K], got shape={tuple(rc.shape)}")
+        if pa.ndim != 2:
+            raise ValueError(f"prim_acts must be [B,R], got shape={tuple(pa.shape)}")
+        if rc.shape[0] != pa.shape[0] or rc.shape[1] != pa.shape[1]:
+            raise ValueError(
+                f"Shape mismatch: routing_coef={tuple(rc.shape)} vs prim_acts={tuple(pa.shape)} "
+                f"(expect same B and R)"
+            )
 
         B, R, K = rc.shape
-        rc_mean = rc.mean(dim=0).numpy()  # [N_ROUTES,K]
-        pa_mean = pa.mean(dim=0).numpy()  # [N_ROUTES]
-
-        effective = rc_mean * pa_mean[:, np.newaxis]  # [N_ROUTES,K]
-
-        # decide which phenotypes to show
-        if top_k is None or top_k >= K:
-            top_indices = np.arange(K)
-        else:
-            variance = effective.var(axis=0)  # [K]
-            top_indices = variance.argsort()[-top_k:][::-1]
+        rc_mean = rc.mean(dim=0).numpy()  # [R,K]
+        pa_mean = pa.mean(dim=0).numpy()  # [R]
 
         routes = ROUTE_NAMES
+        if len(routes) != R:
+            # don't hard-crash, but make it obvious
+            print(f"[warn] ROUTE_NAMES has len={len(routes)} but routing_coef has R={R}. Using first R names.")
+            routes = routes[:R] if len(routes) >= R else routes + [f"route_{i}" for i in range(len(routes), R)]
 
+        if rc_is_report:
+            effective = rc_mean
+            header = "Showing p(route | phenotype) (already includes primary activations):"
+        else:
+            effective = rc_mean * pa_mean[:, np.newaxis]
+            header = "Showing effective weights (primary_act × routing_coef_raw):"
+
+        # -------------------------
+        # ✅ define top_indices safely
+        # -------------------------
+        K_found = effective.shape[1]
+        if top_k is None or int(top_k) <= 0 or int(top_k) >= K_found:
+            top_indices = list(range(K_found))
+        else:
+            # choose phenotypes with strongest "peak" route weight
+            scores = effective.max(axis=0)  # [K]
+            top_indices = np.argsort(-scores)[:int(top_k)].tolist()
+
+        print(header)
         print(f"\n{'=' * 120}")
-        print(f"[PHENOTYPE ROUTING HEATMAP] {where}")
-        print("Showing effective weights (primary_act × routing_coef):")
+        print(f"[PHENOTYPE ROUTING HEATMAP] {where}  (showing {len(top_indices)}/{K_found})")
         print(f"{'-' * 120}")
 
         for idx in top_indices:
@@ -367,9 +398,9 @@ def print_phenotype_routing_heatmap(
             else:
                 name = get_pheno_name(idx)
 
-            weights = effective[:, idx]  # [N_ROUTES]
+            weights = effective[:, idx]  # [R]
 
-            dominant_idx = weights.argmax()
+            dominant_idx = int(weights.argmax())
             dominant_route = routes[dominant_idx]
             dominant_weight = float(weights[dominant_idx])
 
@@ -380,7 +411,9 @@ def print_phenotype_routing_heatmap(
                 f"  {name:60s} → DOMINANT: {dominant_route:4s} ({dominant_weight:.3f}) "
                 f"| ALL: {weight_str}"
             )
+
         print(f"{'=' * 120}\n")
+
 
 
 def save_routing_heatmap(
@@ -397,7 +430,10 @@ def save_routing_heatmap(
         B, R, K = rc.shape          # [B, N_ROUTES, K]
         rc_mean = rc.mean(dim=0).numpy()     # [N_ROUTES, K]
         pa_mean = pa.mean(dim=0).numpy()     # [N_ROUTES]
-        effective = rc_mean * pa_mean[:, np.newaxis]  # [N_ROUTES, K]
+
+        # IMPORTANT:
+        # - If routing_coef is rc_report = p(route|phenotype), it's already "effective".
+        effective = rc_mean
 
         routes = ROUTE_NAMES
         mat = effective.T  # [K, 10]
@@ -406,17 +442,15 @@ def save_routing_heatmap(
 
         plt.figure(figsize=(10, 8))
         im = plt.imshow(mat, aspect="auto")
-        plt.colorbar(
-            im,
-            label="Effective weight (primary_act × routing_coef)"
-        )
+        plt.colorbar(im, label="p(route | phenotype)")
 
         plt.xticks(ticks=np.arange(len(routes)), labels=routes)
         plt.yticks(ticks=np.arange(K), labels=label_names, fontsize=6)
 
         plt.xlabel("Route")
         plt.ylabel("Phenotype")
-        plt.title(f"Phenotype Routing Heatmap ({where}, effective weights)")
+        plt.title(f"Phenotype Routing Heatmap ({where}, p(route|phenotype))")
+
         plt.tight_layout()
 
         fname = os.path.join(out_dir, f"phenotype_routing_{where}_heatmap.png")
@@ -681,10 +715,11 @@ def prepare_notes_batch(notes_batch: List[Dict[str, Any]]):
         ]
         if len(paired) == 0:
             out.append({
-                "input_ids": torch.zeros(0, L, dtype=torch.long, device=DEVICE),
-                "attention_mask": torch.zeros(0, L, dtype=torch.long, device=DEVICE),
+                "input_ids": torch.zeros(0, L, dtype=torch.long),
+                "attention_mask": torch.zeros(0, L, dtype=torch.long),
             })
             continue
+
 
 
         ids_chunks, attn_chunks = zip(*paired)
@@ -719,9 +754,10 @@ def pretok_batch_notes(batch_notes: List[List[str]]):
     for texts in cleaned:
         if not texts:
             out.append({
-                "input_ids": torch.zeros(0, MAXLEN, dtype=torch.long, device=DEVICE),
-                "attention_mask": torch.zeros(0, MAXLEN, dtype=torch.long, device=DEVICE),
+                "input_ids": torch.zeros(0, MAXLEN, dtype=torch.long),
+                "attention_mask": torch.zeros(0, MAXLEN, dtype=torch.long),
             })
+
             continue
 
         all_ids, all_attn = [], []
@@ -825,14 +861,15 @@ def resolve_image_path(p: str, dataset_root: str) -> str:
         return ""
     if os.path.isabs(p):
         return p
-    image_root = str(getattr(CFG, "image_root", "") or "").strip()
-    if p.startswith("mimic-cxr-jpg/"):
-        base = image_root if image_root else dataset_root
-        return os.path.join(base, p)
 
+    # ✅ normalize
+    p = p.replace("\\", "/").lstrip("/")
+
+    image_root = str(getattr(CFG, "image_root", "") or "").strip()
     if image_root:
         return os.path.join(image_root, p)
     return os.path.join(dataset_root, p)
+
 
 
 def is_probably_image_file(p: str) -> bool:
@@ -951,7 +988,7 @@ class ICUStayDataset(Dataset):
 
         req_files = [
             "splits.json",
-            "structured_fullstay_medfuse_11230.parquet",
+            "xehr_haru17_2h_76.parquet",
             "notes_fullstay_radiology_TEXTCHUNKS_11230.parquet",
             "images.parquet",
             "labels_pheno.parquet",
@@ -972,7 +1009,7 @@ class ICUStayDataset(Dataset):
         split_ids: List[int] = [int(x) for x in splits[split]]
         ids_set = set(split_ids)
 
-        struct_fp = os.path.join(root, "structured_fullstay_medfuse_11230.parquet")
+        struct_fp = os.path.join(root, "xehr_haru17_2h_76.parquet")
         notes_fp  = os.path.join(root, "notes_fullstay_radiology_TEXTCHUNKS_11230.parquet")
 
         images_fp = os.path.join(root, "images.parquet")
@@ -1007,13 +1044,13 @@ class ICUStayDataset(Dataset):
                 df["stay_id"] = df["stay_id"].astype(int)
 
         # structured feature columns
-        base_cols = {"stay_id", "hour"}
+        base_cols = {"stay_id", "bin"}
         self.feat_cols: List[str] = [c for c in self.struct.columns if c not in base_cols]
         self.feat_cols.sort()
         if hasattr(CFG, "structured_feat_cols") and CFG.structured_feat_cols:
             self.feat_cols = list(CFG.structured_feat_cols)
         else:
-            exclude = {"stay_id", "hour", "subject_id", "hadm_id", "icustay_id"}
+            exclude = {"stay_id", "bin", "subject_id", "hadm_id", "icustay_id"}
             self.feat_cols = [
                 c for c in self.struct.columns
                 if c not in exclude and pd.api.types.is_numeric_dtype(self.struct[c])
@@ -1185,7 +1222,7 @@ class ICUStayDataset(Dataset):
         stay_id = self.ids[idx]
 
         # structured EHR
-        df_s = self.struct[self.struct.stay_id == stay_id].sort_values("hour")
+        df_s = self.struct[self.struct.stay_id == stay_id].sort_values("bin")
         xs_np = (
             df_s[self.feat_cols]
             .astype("float32")
@@ -1382,24 +1419,50 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
         )
 
         # mask: valid timesteps = any non-zero feature at that t
-        mL_batch = (xL_batch.abs().sum(dim=2) > 0).float()
+        lengths = torch.tensor([b["x_struct"].shape[0] for b in batch], dtype=torch.long)
 
-        # safety: ensure mask not all-zero
-        mask_sum = mL_batch.sum(dim=1)
-        bad = (mask_sum == 0)
-        if bad.any():
-            mL_batch[bad, -1] = 1.0
-            xL_batch[bad, -1, 0] = 1e-6
-            print(f"[collate] fixed {int(bad.sum())} samples with empty structured mask")
+        # after pad_or_trim_struct: if t < T_len, data occupies the LAST t positions
+        idx = torch.arange(T_len).unsqueeze(0)  # [1, T_len]
+        start = (T_len - torch.clamp(lengths, max=T_len)).unsqueeze(1)  # [B,1]
+        mL_batch = (idx >= start).float()  # [B, T_len]
 
 
         # notes payloads are already in the exact format prepare_notes_batch expects
-        notes_batch = [b["notes"] for b in batch]
-        for b in notes_batch:
-            if b.get("mode") == "text":
-                assert len(b.get("chunks", [])) > 0, "[collate] empty text chunks"
-            else:
-                assert len(b.get("input_ids", [])) > 0, "[collate] empty pretokenized chunks"
+        notes_list = [b["notes"] for b in batch]  # list of per-sample dicts
+        prep = prepare_notes_batch(notes_list)    # list of {"input_ids":[S_i,L], "attention_mask":[S_i,L]}
+
+        L = int(getattr(CFG, "max_text_len", 512))
+        S_cap = int(getattr(CFG, "notes_max_chunks", -1))
+        # if notes_max_chunks <= 0, cap at max in batch
+        S_max = max((p["input_ids"].shape[0] for p in prep), default=0)
+        if S_cap and S_cap > 0:
+            S = min(S_max, S_cap)
+        else:
+            S = S_max
+        S = max(S, 1)
+
+        B = len(prep)
+        notes_ids  = torch.zeros((B, S, L), dtype=torch.long)
+        notes_attn = torch.zeros((B, S, L), dtype=torch.long)
+        notes_cmask = torch.zeros((B, S), dtype=torch.float32)
+
+        for i, p in enumerate(prep):
+            ids_i  = p["input_ids"]        # [S_i, L]
+            att_i  = p["attention_mask"]   # [S_i, L]
+            s_i = min(ids_i.shape[0], S)
+            if s_i > 0:
+                notes_ids[i, :s_i]  = ids_i[:s_i].cpu()
+                notes_attn[i, :s_i] = att_i[:s_i].cpu()
+                notes_cmask[i, :s_i] = 1.0
+
+        # move to GPU later in training loop (like xL/imgs), keep CPU here for pinned transfer
+        notes_batch = {
+            "input_ids": notes_ids,
+            "attention_mask": notes_attn,
+            "chunk_mask": notes_cmask,
+            "mode": "batched"
+        }
+
 
         imgs_list, img_paths_list = [], []
         for b in batch:
@@ -1423,6 +1486,9 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
     return _collate
 
 
+import numpy as np
+import torch
+
 @torch.no_grad()
 def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
     B, T, F = xL.shape
@@ -1439,45 +1505,44 @@ def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
         ehr_rows = []
         for r in show_rows:
             vec = xL[i, r].detach().cpu().numpy()
-            ehr_rows.append(np.round(vec[:min(5, F)], 3).tolist())
+            ehr_rows.append((r, np.round(vec[:min(5, F)], 3).tolist()))
 
-        # notes summary (robust to new schema)
-        note_obj = notes[i]
-
+        # --- notes summary (batched dict) ---
         note_preview = "<no-notes>"
-        try:
-            mode = note_obj.get("mode", "text") if isinstance(note_obj, dict) else "unknown"
-
-            if mode == "text":
-                chunks = note_obj.get("chunks", [])
-                if chunks:
-                    s = str(chunks[0])
-                    note_preview = (s[:120] + "…") if len(s) > 120 else s
-                else:
-                    note_preview = "<empty-text-chunks>"
-
-            elif mode == "pretokenized":
-                ids_chunks = note_obj.get("input_ids", [])
-                n_chunks = len(ids_chunks)
-                if n_chunks > 0:
-                    first = ids_chunks[0]
-                    first_list = list(first) if hasattr(first, "__iter__") else []
-                    note_preview = (
-                        f"<pretokenized: chunks={n_chunks}, len0={len(first_list)}, "
-                        f"ids0[:10]={first_list[:10]}>"
-                    )
-                else:
-                    note_preview = "<empty-pretokenized-chunks>"
-
+        if isinstance(notes, dict) and "input_ids" in notes:
+            cmask = notes.get("chunk_mask", None)
+            if cmask is not None:
+                n_valid = int(cmask[i].sum().item())
             else:
-                note_preview = f"<unknown notes mode: {mode}>"
-        except Exception as e:
-            note_preview = f"<notes preview failed: {type(e).__name__}: {e}>"
-        print(
-            f"  • stay_id={sid} | ehr_rows(first2->first5feats)={ehr_rows} | "
-            f'notes_preview="{note_preview}" | cxr="{imgp}"'
-        )
+                n_valid = int((notes["attention_mask"][i].sum(dim=-1) > 0).sum().item())
+
+            if n_valid > 0:
+                if cmask is not None:
+                    j0 = int((cmask[i] > 0.5).nonzero(as_tuple=False)[0].item())
+                else:
+                    j0 = int((notes["attention_mask"][i].sum(dim=-1) > 0).nonzero(as_tuple=False)[0].item())
+
+                ids0 = notes["input_ids"][i, j0, :10].detach().cpu().tolist()
+                note_preview = f"<batched: valid_chunks={n_valid}, first_chunk={j0}, ids[:10]={ids0}>"
+            else:
+                note_preview = "<batched: valid_chunks=0>"
+        else:
+            # old path (list-of-dicts)
+            try:
+                note_obj = notes[i]
+                mode = note_obj.get("mode", "text")
+                note_preview = f"<{mode}>"
+            except Exception as e:
+                note_preview = f"<notes preview failed: {type(e).__name__}: {e}>"
+
+        # ✅ actually print per-sample summary
+        print(f"[sample-inspect] i={i} stay_id={sid}")
+        print(f"[sample-inspect]   img_path={imgp}")
+        print(f"[sample-inspect]   ehr_rows(first2_nonzero)={ehr_rows if ehr_rows else '<none>'}")
+        print(f"[sample-inspect]   notes={note_preview}")
+
     print("[sample-inspect] ---------------------------\n")
+
 
 def _enc_forward(enc, *args, **kwargs):
     try:
@@ -1646,7 +1711,8 @@ def evaluate_epoch(
     rpt_every = int(_cfg("routing_print_every", 0) or 0)
 
     # per-route, per-phenotype routing importance
-    rc_sum_mat = None      # [N_ROUTES, K]
+    rc_sum_mat = None      # [R, K]
+    eff_sum_mat = None     # [R, K]
     has_routing = False
 
     for bidx, (xL, mL, notes, imgs, y, dbg) in enumerate(loader):
@@ -1656,11 +1722,14 @@ def evaluate_epoch(
         y   = y.to(DEVICE,   non_blocking=True)
 
         # (A) Encoders under autocast (REAL seq + mask + pool)
+        dbg_once = (bidx == 0) and (epoch_idx is not None) and (int(epoch_idx) == 1) and (split_name == "VAL")
         outL, outN, outI = encode_all_modalities(
             behrt, bbert, imgenc,
             xL=xL, mL=mL, notes=notes, imgs=imgs,
             amp_ctx_enc=amp_ctx_enc,
+            dbg_once=dbg_once,     # ✅ prints only on first VAL batch of epoch 1
         )
+
 
         # (B) Capsule forward + loss in FP32
         with amp_ctx_caps:
@@ -1684,14 +1753,30 @@ def evaluate_epoch(
             routing_coef = out[3] if len(out) > 3 else None
 
             if routing_coef is not None:
-                # DO NOT renormalize here — the capsule head should be the single source of truth.
-                assert routing_coef.ndim == 3, \
-                    f"routing_coef must be 3D [B,R,K], got {tuple(routing_coef.shape)}"
+                # --- RAW capsule coupling from CapsuleFC ---
+                rc_raw = routing_coef  # expected [B,R,K]
+                assert rc_raw.ndim == 3, f"rc_raw must be [B,R,K], got {tuple(rc_raw.shape)}"
+                assert int(rc_raw.shape[1]) == int(N_ROUTES), f"Expected R={N_ROUTES}, got {int(rc_raw.shape[1])}"
 
-                assert int(routing_coef.shape[1]) == int(N_ROUTES), \
-                    f"routing_coef must be [B,{N_ROUTES},K], got {tuple(routing_coef.shape)}"
+                # CapsuleFC in your code softmaxes over K (phenotypes), so sum over K ~ 1
+                sK = rc_raw.sum(dim=2)  # [B,R]
+                if not torch.allclose(sK, torch.ones_like(sK), atol=1e-3):
+                    if getattr(CFG, "verbose", False):
+                        print("[warn] rc_raw not normalized over K (dim=2). max|sumK-1|=",
+                              (sK - 1).abs().max().item())
 
-                # Optional: just verify it sums to ~1 over routes WITHOUT changing it
+                # --- REPORTING MATRIX: p(route | phenotype) ---
+                # This is what your heatmaps/“route importance per phenotype” should use.
+                rc_report = route_given_pheno(
+                    rc_raw, prim_acts,
+                    route_mask=route_mask,  # this exists in this scope already
+                )  # [B,R,K] and sums over routes (dim=1) ~ 1
+
+                # This assert is now correct because rc_report is route-normalized:
+                assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name=f"{split_name}.rc_report")
+
+                routing_coef = rc_report
+
                 if bidx == 0:
                     debug_routing_tensor(
                         routing_coef,
@@ -1699,6 +1784,7 @@ def evaluate_epoch(
                         expect_routes=N_ROUTES,
                         expect_k=int(y.size(1))
                     )
+
 
             if routing_coef is not None and bidx == 0:
                 quantization_check(routing_coef, name=f"{split_name}.routing_coef")
@@ -1711,11 +1797,16 @@ def evaluate_epoch(
 
             if routing_coef is not None:
                 has_routing = True
-                rc = routing_coef.detach().float().cpu()   # [B, N_ROUTES, K]
-                rc_mean_batch = rc.mean(dim=0)             # [N_ROUTES, K]
+                rc_cpu = routing_coef.detach().float().cpu()
+                pa_cpu = prim_acts.detach().float().cpu()
+                rc_sum = rc_cpu.sum(dim=0)   # [R,K]
+                eff_sum = rc_sum             # ✅ same, because rc_cpu is rc_report already
                 if rc_sum_mat is None:
-                    rc_sum_mat = torch.zeros_like(rc_mean_batch)
-                rc_sum_mat += rc_mean_batch * y.size(0)
+                    rc_sum_mat = torch.zeros_like(rc_sum)
+                    eff_sum_mat = torch.zeros_like(eff_sum)
+                rc_sum_mat += rc_sum
+                eff_sum_mat += eff_sum
+
 
             # debug prints/heatmaps on first batch
             if route_debug and routing_coef is not None and bidx == 0:
@@ -1723,12 +1814,13 @@ def evaluate_epoch(
                     [get_pheno_name(i) for i in range(routing_coef.size(2))]
                 print_route_matrix_detailed(
                     routing_coef, prim_acts, names,
-                    where=f"{split_name} Batch {bidx}"
+                    where=f"{split_name} Batch {bidx}", rc_is_report=True
                 )
                 print_phenotype_routing_heatmap(
                     routing_coef, prim_acts, names,
                     where=f"{split_name} Epoch {epoch_idx if epoch_idx is not None else '?'}",
-                    top_k=None
+                    top_k=None,
+                    rc_is_report=True,
                 )
                 if routing_out_dir is not None and epoch_idx is not None:
                     where_tag = f"{split_name.lower()}_epoch{epoch_idx:03d}"
@@ -1776,8 +1868,8 @@ def evaluate_epoch(
     avg_act_dict = {r: float(avg_pa[i]) for i, r in enumerate(route_names)}
 
     if num_samples > 0 and has_routing and rc_sum_mat is not None:
-        avg_rc_mat = (rc_sum_mat / num_samples).numpy()   # [N_ROUTES, K]
-        avg_effective_mat = avg_rc_mat * avg_pa[:, None]  # [N_ROUTES, K]
+        avg_rc_mat = (rc_sum_mat / num_samples).numpy()        # [R,K] exact
+        avg_effective_mat = (eff_sum_mat / num_samples).numpy()# [R,K] exact
     else:
         avg_rc_mat = None
         avg_effective_mat = None
@@ -2326,7 +2418,7 @@ def generate_split_heatmaps_and_tables(
     eff_norm, _, _ = save_array_with_versions(
         eff_k10, out_dir, f"{split_name.lower()}_effective_weights_kxN_ROUTES",
         row_names=label_names, col_names=routes,
-        print_title=f"[{split_name}] EFFECTIVE WEIGHTS (primary_act × routing_coef) [KxN_ROUTES] (raw + normalized)",
+        print_title=f"[{split_name}] p(route | phenotype) [KxN_ROUTES] (raw + normalized)",
         norm_fn=normalize_routes_per_phenotype, 
     )
     save_heatmap_with_numbers(
@@ -2334,7 +2426,7 @@ def generate_split_heatmaps_and_tables(
         mat_raw=eff_k10,
         row_names=label_names,
         col_names=routes,
-        title=f"{split_name} Effective Weights (KxN_ROUTES) | normalized color, raw numbers",
+        title=f"{split_name} p(route | phenotype) (KxN_ROUTES) | normalized color, raw numbers",
         out_path=os.path.join(out_dir, f"{split_name.lower()}_effective_weights_kxN_ROUTES.png"),
         fontsize_cell=6,
         fontsize_ticks=9
@@ -2422,12 +2514,6 @@ def main():
     global CFG, DEVICE
     CFG = E.CFG
     DEVICE = E.DEVICE
-
-    from env_config import ROUTES
-
-    _expected = ["L", "N", "I", "LN", "NL", "LI", "IL", "NI", "IN", "LNI"]
-    assert list(ROUTES) == _expected, f"ROUTES mismatch. expected={_expected} got={list(ROUTES)}"
-
 
     import torch.backends.cudnn as cudnn
     cudnn.benchmark = True
@@ -2556,25 +2642,28 @@ def main():
 
     # Encoders
     enc_cfg = EncoderConfig(
-        d=_cfg("d", 256), dropout=_cfg("dropout", 0.0),
+        d=_cfg("d", 256),
         structured_seq_len=_cfg("structured_seq_len", 256),
-        structured_n_feats=_cfg("structured_n_feats", 17),
+        structured_n_feats=_cfg("structured_n_feats", 61),
         structured_layers=_cfg("structured_layers", 2),
         structured_heads=_cfg("structured_heads", 8),
-        structured_pool="cls",
+
         text_model_name=_cfg("text_model_name", "emilyalsentzer/Bio_ClinicalBERT"),
-        text_max_len=_cfg("max_text_len", 512),
-        note_agg="attention",
-        img_agg="last",
+        bert_chunk_bs=_cfg("bert_chunk_bs", 8),
+        note_agg=str(_cfg("note_agg", "mean")).lower(),   # must be mean/max
+
         vision_backbone=_cfg("image_model_name", "resnet34"),
-        vision_num_classes=14,
         vision_pretrained=True,
     )
     behrt, bbert, imgenc = build_encoders(enc_cfg, device=DEVICE)
+
     print(
         f"[encoders] d={CFG.d} | BEHRT out_dim={behrt.out_dim} | "
-        f"BERT→out_dim={bbert.out_dim} | IMG out_dim={getattr(imgenc.proj, 'out_features', 'NA')}"
+        f"BERT→out_dim={bbert.out_dim}"
     )
+    print(f"... | IMG out_dim={imgenc.proj.out_features}")
+
+
 
     if not CFG.finetune_text and getattr(bbert, "bert", None) is not None:
         for p in bbert.bert.parameters():
@@ -2774,10 +2863,12 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
+            dbg_once = (epoch == start_epoch) and (step == 0)
             outL, outN, outI = encode_all_modalities(
                 behrt, bbert, imgenc,
                 xL=xL, mL=mL, notes=notes, imgs=imgs,
                 amp_ctx_enc=amp_ctx_enc,
+                dbg_once=dbg_once,     # ✅ NEW
             )
 
 
@@ -2820,17 +2911,28 @@ def main():
                 routing_coef = out[3] if len(out) > 3 else None
 
                 if routing_coef is not None:
-                    # no renorm here (CapsuleMortalityHead is the source of truth)
-                    assert routing_coef.ndim == 3, \
-                        f"routing_coef must be 3D [B,R,K], got {tuple(routing_coef.shape)}"
+                    rc_raw = routing_coef  # [B,R,K]
+                    assert rc_raw.ndim == 3, f"routing_coef must be [B,R,K], got {tuple(rc_raw.shape)}"
+                    assert int(rc_raw.shape[1]) == int(N_ROUTES), f"Expected R={N_ROUTES}, got {tuple(rc_raw.shape)}"
 
-                    assert int(routing_coef.shape[1]) == int(N_ROUTES), \
-                        f"routing_coef must be [B,{N_ROUTES},K], got {tuple(routing_coef.shape)}"
+                    # Optional: raw CapsuleFC normalization check (your assumption)
+                    sK = rc_raw.sum(dim=2)
+                    if not torch.allclose(sK, torch.ones_like(sK), atol=1e-3):
+                        if getattr(CFG, "verbose", False):
+                            print("[warn] TRAIN rc_raw not normalized over K. max|sumK-1|=",
+                                  (sK - 1).abs().max().item())
+
+                    # Convert for logging/analysis
+                    rc_report = route_given_pheno(rc_raw, prim_acts, route_mask=route_mask)
+                    assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name="TRAIN.rc_report")
+
+                    routing_coef = rc_report
+
 
                     if bool(getattr(args, "route_debug", False)) and (epoch == start_epoch) and (step == 0):
                         debug_routing_tensor(
                             routing_coef,
-                            name="TRAIN.routing_coef_precheck",
+                            name="TRAIN.rc_report",
                             expect_routes=N_ROUTES,
                             expect_k=int(y.size(1)),
                         )
@@ -2918,14 +3020,16 @@ def main():
                     )
                 )
                 if routing_coef is not None:
-                    # routing_coef is guaranteed [B,R,K] from the asserts above
+                    # routing_coef is rc_report = p(route|phenotype), already includes prim_acts
                     rc_route_mean = routing_coef.detach().float().mean(dim=(0, 2))  # [R]
+                    eff_route_mean = rc_route_mean                                  # ✅ same meaning now
+
                     rc_route_mean = rc_route_mean.cpu().tolist()
 
-                    rc_str = " | ".join(
-                        f"{r}:{rc_route_mean[i]:.3f}" for i, r in enumerate(routes)
-                    )
-                    msg += f" | [routing mean coeff] {rc_str}"
+                    rc_str = " | ".join(f"{r}:{rc_route_mean[i]:.3f}" for i, r in enumerate(routes))
+                    eff_str = " | ".join(f"{r}:{eff_route_mean[i].item():.3f}" for i, r in enumerate(routes))
+                    msg += f" | [p(route|pheno) mean] {rc_str}"
+
 
                 print(msg)
 
@@ -2973,21 +3077,14 @@ def main():
             K = val_rc_mat.shape[1]
             pheno_names = [get_pheno_name(i) for i in range(K)]
 
-            print("\n[epoch %d] [VAL] per-route, per-phenotype routing importance (mean routing coeff):" % (epoch + 1))
+            print("\n[epoch %d] [VAL] per-route, per-phenotype routing importance (p(route|phenotype)):" % (epoch + 1))
             for i, r in enumerate(routes):
                 row = " | ".join(
                     f"{pheno_names[k]}:{val_rc_mat[i, k]:.3f}"
                     for k in range(K)
                 )
                 print(f"  {r}: {row}")
-            if val_eff_mat is not None and val_eff_mat.shape == val_rc_mat.shape:
-                print("\n[epoch %d] [VAL] per-route, per-phenotype routing importance (EFFECTIVE = rc × primary_act):" % (epoch + 1))
-                for i, r in enumerate(routes):
-                    row = " | ".join(
-                        f"{pheno_names[k]}:{val_eff_mat[i, k]:.3f}"
-                        for k in range(K)
-                    )
-                    print(f"  {r}: {row}")
+
             # Heatmap of routing importance on VAL for this epoch
             #mat_val = val_rc_mat.T  # [K, N_ROUTES]
 
