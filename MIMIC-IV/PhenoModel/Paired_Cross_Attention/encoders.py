@@ -55,24 +55,6 @@ def _ensure_2d_mask(
 
 # Structured encoder (BEHRT-style)
 class BEHRTLabEncoder(nn.Module):
-    """
-    Transformer encoder over structured sequences.
-
-    Inputs:
-        x : [B, T, F] where F = number of variables (e.g., 17).
-            If [B,T], it's auto-expanded to [B,T,1].
-        mask : [B, T] where 1=valid timestep.
-
-    Pooling:
-        - "mean": masked mean over time
-        - "last": last valid timestep (by mask)
-        - "cls" : learnable CLS token; pooled CLS
-
-    Output:
-        forward(...) -> [B, D] pooled embedding
-        encode_seq(...) -> ([B,T,D], [B,T])
-    """
-
     def __init__(
         self,
         n_feats: int,
@@ -80,23 +62,19 @@ class BEHRTLabEncoder(nn.Module):
         seq_len: int = 48,
         n_layers: int = 2,
         n_heads: int = 8,
-        dropout: float = 0.0,  # kept for API compatibility
+        dropout: float = 0.0,  
         pool: Literal["last", "mean", "cls"] = "cls",
         activation: Literal["relu", "gelu"] = "relu",
     ) -> None:
         super().__init__()
-
         self.pool = pool
         self.out_dim = d
-
         self.input_proj = nn.Linear(n_feats, d)
         self.max_seq_len = int(seq_len)
         if self.max_seq_len <= 0:
             raise ValueError(f"BEHRTLabEncoder seq_len must be > 0, got {seq_len}.")
         self.pos = nn.Parameter(torch.randn(1, self.max_seq_len, d) * 0.02)
-
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d))
-
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d,
             nhead=n_heads,
@@ -106,7 +84,6 @@ class BEHRTLabEncoder(nn.Module):
             batch_first=True,
         )
         self.enc = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
-
         self.out = nn.Sequential(
             nn.LayerNorm(d),
             nn.Linear(d, d),
@@ -114,12 +91,10 @@ class BEHRTLabEncoder(nn.Module):
         )
 
         nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
-
         self._printed_once = False
         self._warned_dead = False
 
     def _pos(self, T: int) -> torch.Tensor:
-
         if T > self.pos.size(1):
             raise ValueError(
                 f"Input length T={T} exceeds max_seq_len={self.pos.size(1)}. "
@@ -133,26 +108,12 @@ class BEHRTLabEncoder(nn.Module):
         x: torch.Tensor,
         mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Run transformer.
-        If pool='cls', prepend CLS and return:
-            - seq_out_no_cls: [B,T,D]
-            - mask_out:       [B,T]
-            - cls_vec:        [B,D]
-        Else:
-            - seq_out:        [B,T,D]
-            - mask_out:       [B,T]
-            - cls_vec:        None
-        """
         B, T, F = x.shape
         dev = x.device
-
         assert self.input_proj.in_features == F, (
             f"Expected F={self.input_proj.in_features}, got F={F}"
         )
-
         H_in = self.input_proj(x) + self._pos(T)  # [B,T,D]
-
         if self.pool == "cls":
             cls_tok = self.cls_token.expand(B, 1, -1)  # [B,1,D]
             H_in = torch.cat([cls_tok, H_in], dim=1)   # [B,T+1,D]
@@ -181,25 +142,16 @@ class BEHRTLabEncoder(nn.Module):
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns per-timestep sequence representations (WITHOUT CLS) and mask:
-            - h:    [B,T,D]
-            - mask: [B,T] float
-        """
         if x.dim() == 2:
             x = x.unsqueeze(-1)  # [B,T,1]
-
         B, T, _ = x.shape
         dev = next(self.parameters()).device
         m = _ensure_2d_mask(mask, B, T, dev)
-
         h, m_out, _ = self._encode_with_optional_cls(x.to(dev), m.to(dev))
-
         if not self._printed_once:
             self._printed_once = True
             _dbg(f"[BEHRTLabEncoder] encode_seq -> h:{tuple(h.shape)} mask:{tuple(m_out.shape)}")
             _peek_tensor("behrt.h", h)
-
         return h, m_out
 
     def encode_seq_and_pool(
@@ -207,19 +159,12 @@ class BEHRTLabEncoder(nn.Module):
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Single-pass helper to avoid double-encoding:
-            returns (seq_h [B,T,D], mask [B,T], pooled [B,D])
-        """
         if x.dim() == 2:
             x = x.unsqueeze(-1)
-
         B, T, _ = x.shape
         dev = next(self.parameters()).device
         m = _ensure_2d_mask(mask, B, T, dev)
-
         seq_h, m_out, cls_vec = self._encode_with_optional_cls(x.to(dev), m.to(dev))
-
         if self.pool == "cls":
             z = cls_vec
         elif self.pool == "last":
@@ -236,7 +181,6 @@ class BEHRTLabEncoder(nn.Module):
                 if z.abs().mean().item() < 1e-6:
                     print("[warn:BEHRTLabEncoder] near-zero pooled embedding; check mask/inputs.")
                     self._warned_dead = True
-
         return seq_h, m_out, z
 
     def forward(
@@ -244,27 +188,12 @@ class BEHRTLabEncoder(nn.Module):
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Return pooled embedding [B,D] using configured pooling.
-        """
         _, _, z = self.encode_seq_and_pool(x, mask=mask)
         return z
 
 
 # Bio-ClinicalBERT encoder (text)
 class BioClinBERTEncoder(nn.Module):
-    """
-    Bio-ClinicalBERT encoder (pre-tokenized only).
-
-    Batch = list of per-patient objects:
-      - dict: {"input_ids": [S,L], "attention_mask": [S,L]}
-      - OR list: [(ids[L], attn[L]), ...]
-
-    Returns:
-        encode_seq(...) -> ([B, S_max, D], [B, S_max]) per-chunk CLS + mask
-        forward(...)    -> [B, D] pooled over chunks (masked mean)
-    """
-
     def __init__(
         self,
         model_name: str = "emilyalsentzer/Bio_ClinicalBERT",
@@ -273,7 +202,6 @@ class BioClinBERTEncoder(nn.Module):
         force_hf: bool = True,
     ) -> None:
         super().__init__()
-
         self.model_name = model_name
         self.hf_available = False
         self.bert: Optional[nn.Module] = None
@@ -292,9 +220,7 @@ class BioClinBERTEncoder(nn.Module):
             self.bert = None
             hidden = 768
             self.hf_available = False
-
         self.hidden = hidden
-
         if d is not None and d != hidden:
             self.proj = nn.Sequential(
                 nn.LayerNorm(hidden),
@@ -304,9 +230,7 @@ class BioClinBERTEncoder(nn.Module):
         else:
             self.proj = nn.Identity()
             self.out_dim = int(hidden)
-
         self.drop = nn.Identity()
-
         if self.hf_available and self.bert is not None:
             self.bert.eval()
 
@@ -380,59 +304,41 @@ class BioClinBERTEncoder(nn.Module):
             outs.append(cls)
         return torch.cat(outs, dim=0)  # [S, out_dim]
 
-    def encode_seq(
-        self,
-        notes_or_chunks,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-            Hpad: [B, S_max, D]
-            M:    [B, S_max] float mask
-        """
-        dev = self._device()
-        batch = self._normalize_batch(notes_or_chunks)
+    def encode_seq(self, notes_or_chunks):
+        if isinstance(notes_or_chunks, dict) and "input_ids" in notes_or_chunks and "attention_mask" in notes_or_chunks:
+            ids  = notes_or_chunks["input_ids"]         # [B,S,L]
+            attn = notes_or_chunks["attention_mask"]    # [B,S,L]
+            cmask = notes_or_chunks.get("chunk_mask", None)  # [B,S] optional
 
-        seqs: List[torch.Tensor] = []
-        lengths: List[int] = []
+            ids  = ids.to(next(self.bert.parameters()).device)
+            attn = attn.to(next(self.bert.parameters()).device)
+            B, S, L = ids.shape
 
-        for patient in batch:
-            collected: List[torch.Tensor] = []
+            # flatten chunks -> [B*S, L]
+            ids2  = ids.reshape(B * S, L)
+            attn2 = attn.reshape(B * S, L)
 
-            if isinstance(patient, dict):
-                ids = patient["input_ids"].to(dev)
-                attn = patient["attention_mask"].to(dev)
-                cls = self._encode_chunks_to_cls(ids, attn)  # [S, D]
-                collected.append(cls)
+            # Encode CLS for each chunk
+            cls2 = self._encode_chunks_to_cls(ids2, attn2)     # [B*S, D]
+            D = cls2.size(-1)
+
+            # reshape back -> [B, S, D]
+            H = cls2.view(B, S, D)
+
+            # Chunk-level mask [B,S]
+            if cmask is not None:
+                M = cmask.to(H.device).float()
             else:
-                for (ids, attn) in patient:
-                    cls = self._encode_chunks_to_cls(ids.to(dev), attn.to(dev))  # [1,D] or [S,D]
-                    collected.append(cls)
+                # valid chunk if it has any attended tokens
+                M = (attn.sum(dim=-1) > 0).to(H.device).float()
 
-            if len(collected) == 0:
-                H = torch.zeros(1, self.out_dim, device=dev)
-            else:
-                H = torch.cat(collected, dim=0)  # [S, D]
+            return H, M
 
-            seqs.append(H)
-            lengths.append(H.size(0))
 
-        if len(seqs) == 0:
-            return (
-                torch.zeros(0, 1, self.out_dim, device=dev),
-                torch.zeros(0, 1, device=dev),
-            )
-
-        Smax = max(lengths)
-        B = len(seqs)
-        Hpad = torch.zeros(B, Smax, self.out_dim, device=dev)
-        M = torch.zeros(B, Smax, device=dev)
-
-        for i, H in enumerate(seqs):
-            s = H.size(0)
-            Hpad[i, :s] = H
-            M[i, :s] = 1.0
-
-        return Hpad, M
+    def encode_seq_and_pool(self, notes_or_chunks):
+        H, M = self.encode_seq(notes_or_chunks)
+        z = self.pool_from_seq(H, M)
+        return H, M, z
 
     @staticmethod
     def pool_from_seq(H: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
@@ -440,17 +346,13 @@ class BioClinBERTEncoder(nn.Module):
         return (H * M.unsqueeze(-1)).sum(dim=1) / denom
 
     def forward(self, notes_or_chunks) -> torch.Tensor:
-        """
-        Pooled chunk-CLS vectors -> [B, D].
-        Respects CFG.finetune_text.
-        """
         requires_grad = bool(getattr(CFG, "finetune_text", False))
         with torch.set_grad_enabled(requires_grad):
             H, M = self.encode_seq(notes_or_chunks)
             z = self.pool_from_seq(H, M)
         return z
 
-# MedFuse-style image encoder & fusion-facing wrapper
+# MedFuse-style image encoder 
 class MedFuseImageEncoder(nn.Module):
     def __init__(
         self,
@@ -461,17 +363,13 @@ class MedFuseImageEncoder(nn.Module):
     ):
         super().__init__()
         import torchvision
-
         self.device = torch.device(device)
-
         self.vision_backbone = getattr(torchvision.models, vision_backbone)(pretrained=pretrained)
-
         d_visual = None
         for classifier in ("classifier", "fc"):
             cls_layer = getattr(self.vision_backbone, classifier, None)
             if cls_layer is None:
                 continue
-
             d_visual = getattr(cls_layer, "in_features", None)
             if d_visual is None:
                 last_linear = None
@@ -481,12 +379,10 @@ class MedFuseImageEncoder(nn.Module):
                         break
                 if last_linear is not None:
                     d_visual = last_linear.in_features
-
             if d_visual is None:
                 raise ValueError(
                     f"Cannot infer in_features from {classifier} of {type(self.vision_backbone).__name__}"
                 )
-
             setattr(self.vision_backbone, classifier, nn.Identity())
             break
 
@@ -495,10 +391,8 @@ class MedFuseImageEncoder(nn.Module):
 
         self.bce_loss = nn.BCELoss(reduction="mean")
         self.classifier = nn.Sequential(nn.Linear(d_visual, vision_num_classes))
-
         self.feats_dim = d_visual
         self.vision_num_classes = vision_num_classes
-
         self.to(self.device)
 
     def forward(
@@ -510,11 +404,9 @@ class MedFuseImageEncoder(nn.Module):
     ):
         device = next(self.parameters()).device
         x = x.to(device)
-
         visual_feats = self.vision_backbone(x)   # [B, D_vis]
         logits = self.classifier(visual_feats)   # [B, C]
         preds = torch.sigmoid(logits)            # [B, C]
-
         if n_crops and n_crops > 0:
             if bs is None:
                 if preds.size(0) % n_crops != 0:
@@ -551,6 +443,7 @@ class ImageEncoder(nn.Module):
             device=str(dev),
         )
         self.proj = nn.Linear(self.medfuse.feats_dim, d)
+        self.out_dim = int(d)
         self.drop = nn.Identity()
         self.token_in_dim = self._infer_resnet_layer4_channels()
         self.token_proj = nn.Linear(self.token_in_dim, d, bias=False)
@@ -567,9 +460,9 @@ class ImageEncoder(nn.Module):
 
         layer4 = m.layer4
         last_block = list(layer4.children())[-1]
-        if hasattr(last_block, "conv3"):   # Bottleneck (resnet50+)
+        if hasattr(last_block, "conv3"):   
             return int(last_block.conv3.out_channels)
-        if hasattr(last_block, "conv2"):   # BasicBlock (resnet18/34)
+        if hasattr(last_block, "conv2"):   
             return int(last_block.conv2.out_channels)
 
         last_conv = None
@@ -589,24 +482,15 @@ class ImageEncoder(nn.Module):
     def _encode_pool_and_layer4_once(
         self, x: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Single forward through backbone:
-          - returns pooled image embedding I_pool: [B,d]
-          - returns layer4 fmap: [B,C,H,W]
-        """
         m = self.medfuse.vision_backbone
-
         if not hasattr(m, "layer4"):
             raise ValueError("Hook path requires torchvision ResNet with .layer4")
-
         holder: Dict[str, torch.Tensor] = {}
-
         def _hook(_module, _inp, out):
             holder["fmap"] = out
-
         h = m.layer4.register_forward_hook(_hook)
         try:
-            _, _, feats = self.medfuse(x)  # feats: [B, feats_dim]
+            _, _, feats = self.medfuse(x)  
         finally:
             h.remove()
 
@@ -632,9 +516,6 @@ class ImageEncoder(nn.Module):
         batch_images: Union[torch.Tensor, List[torch.Tensor], List[List[torch.Tensor]]],
         device: torch.device,
     ) -> torch.Tensor:
-        """
-        Normalize input to [B,3,H,W] tensor.
-        """
         if isinstance(batch_images, torch.Tensor):
             x = batch_images
             if x.dim() == 3:
@@ -647,8 +528,6 @@ class ImageEncoder(nn.Module):
             if len(batch_images) == 0:
                 return torch.zeros(0, 3, 224, 224, device=device)
             return torch.stack(batch_images, dim=0).to(device)
-
-        # list[list[tensor]] -> last per sample
         xs: List[torch.Tensor] = []
         for imgs in batch_images:
             if imgs is None or len(imgs) == 0:
@@ -671,15 +550,12 @@ class ImageEncoder(nn.Module):
             return I_seq, I_mask, I_pool
 
         I_pool, fmap = self._encode_pool_and_layer4_once(x)  # [B,d], [B,C,H,W]
-
         B, C, H, W = fmap.shape
-
         if C != self.token_in_dim:
             raise ValueError(
                 f"Layer4 channels mismatch: got C={C}, expected {self.token_in_dim}. "
                 f"Backbone={type(self.medfuse.vision_backbone).__name__}."
             )
-
         tokens = fmap.permute(0, 2, 3, 1).reshape(B, H * W, C)  # [B,P,C]
         I_seq = self.token_proj(tokens)                          # [B,P,d]
         I_mask = torch.ones(B, H * W, device=device)             # [B,P]
@@ -728,94 +604,6 @@ class ImageEncoder(nn.Module):
         for p in self.medfuse.vision_backbone.parameters():
             p.requires_grad = True
 
-class SimpleHead(nn.Module):
-    def __init__(
-        self,
-        in_dim: int,
-        out_dim: int,
-        p_drop: float = 0.0,
-    ):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, out_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class PairwiseConcatFusion(nn.Module):
-    def __init__(
-        self,
-        d: int,
-        p_drop: float = 0.0,
-    ):
-        super().__init__()
-        self.head = SimpleHead(in_dim=2 * d, out_dim=d, p_drop=0.0)
-
-    def forward(
-        self,
-        A: torch.Tensor,
-        mA: torch.Tensor,
-        B: torch.Tensor,
-        mB: torch.Tensor,
-    ) -> torch.Tensor:
-        za = _masked_mean(A, mA)  # [B, D]
-        zb = _masked_mean(B, mB)  # [B, D]
-        x = torch.cat([za, zb], dim=-1)  # [B, 2D]
-        z = self.head(x)                 # [B, D]
-        _peek_tensor("fusion.pair_z", z)
-        return z
-
-
-class TrimodalConcatFusion(nn.Module):
-    def __init__(
-        self,
-        d: int,
-        p_drop: float = 0.0,
-    ):
-        super().__init__()
-        self.head = SimpleHead(in_dim=3 * d, out_dim=d, p_drop=0.0)
-
-    def forward(
-        self,
-        L: torch.Tensor,
-        mL: torch.Tensor,
-        N: torch.Tensor,
-        mN: torch.Tensor,
-        I: torch.Tensor,
-        mI: torch.Tensor,
-    ) -> torch.Tensor:
-        zL = _masked_mean(L, mL)  # [B, D]
-        zN = _masked_mean(N, mN)  # [B, D]
-        zI = _masked_mean(I, mI)  # [B, D]
-        x = torch.cat([zL, zN, zI], dim=-1)  # [B, 3D]
-        z = self.head(x)                     # [B, D]
-        _peek_tensor("fusion.tri_z", z)
-        return z
-
-
-class RouteActivation(nn.Module):
-    def __init__(self, d: int, temp: float = 1.0, gate_min: float = 0.0, gate_max: float = 1.0):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(d),
-            nn.Linear(d, 1),
-        )
-        self.temp = float(temp)
-        self.gate_min = float(gate_min)
-        self.gate_max = float(gate_max)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        logits = self.net(x)
-        if self.temp and self.temp != 1.0:
-            logits = logits / self.temp
-        a = torch.sigmoid(logits)
-        if self.gate_min > 0.0 or self.gate_max < 1.0:
-            a = a.clamp(self.gate_min, self.gate_max)
-        return a
-
 @dataclass
 class MulTConfig:
     d: int = 256
@@ -824,25 +612,17 @@ class MulTConfig:
 
 
 class MultimodalFeatureExtractor(nn.Module):
-    """
-    Build 7 route embeddings (L, N, I, LN, LI, NI, LNI) + per-route sigmoids
-    from sequence-level encoders.
-    """
     def __init__(self, cfg: MulTConfig) -> None:
         super().__init__()
         self.cfg = cfg
         d = cfg.d
-
         self.pair_LN = PairwiseConcatFusion(d, p_drop=cfg.dropout)
         self.pair_LI = PairwiseConcatFusion(d, p_drop=cfg.dropout)
         self.pair_NI = PairwiseConcatFusion(d, p_drop=cfg.dropout)
         self.tri_LNI = TrimodalConcatFusion(d, p_drop=cfg.dropout)
-
-        # Per-route activations (sigmoid)
         temp = float(getattr(CFG, "route_gate_temp", 1.0))
         gmin = float(getattr(CFG, "route_gate_min", 0.0))
         gmax = float(getattr(CFG, "route_gate_max", 1.0))
-
         self.act_L = RouteActivation(d, temp=temp, gate_min=gmin, gate_max=gmax)
         self.act_N = RouteActivation(d, temp=temp, gate_min=gmin, gate_max=gmax)
         self.act_I = RouteActivation(d, temp=temp, gate_min=gmin, gate_max=gmax)
@@ -853,9 +633,6 @@ class MultimodalFeatureExtractor(nn.Module):
         self.unim_ln = nn.LayerNorm(d)
 
     def _pool_uni(self, X: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
-        """
-        Pool a unimodal sequence [B,T,D] given mask [B,T].
-        """
         if self.cfg.unimodal_pool == "last":
             last_idx = (M.sum(dim=1) - 1).clamp_min(0).long()
             return X[torch.arange(X.size(0), device=X.device), last_idx]
@@ -870,21 +647,11 @@ class MultimodalFeatureExtractor(nn.Module):
         I_seq: torch.Tensor,
         mI: torch.Tensor,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        """
-        Inputs:
-            L_seq, N_seq, I_seq: [B,T,D]
-            mL, mN, mI:          [B,T]
 
-        Returns:
-            route_embs: dict of 7 -> [B,d]
-            route_act:  dict of 7 -> [B,1]
-        """
-        # Unimodal pooled
         zL = self.unim_ln(self._pool_uni(L_seq, mL))
         zN = self.unim_ln(self._pool_uni(N_seq, mN))
         zI = self.unim_ln(self._pool_uni(I_seq, mI))
 
-        # Pairwise + Trimodal (simple concat + linear)
         zLN = self.pair_LN(L_seq, mL, N_seq, mN)
         zLI = self.pair_LI(L_seq, mL, I_seq, mI)
         zNI = self.pair_NI(N_seq, mN, I_seq, mI)
@@ -918,8 +685,8 @@ class EncoderConfig:
     dropout: float = 0.0
 
     # structured
-    structured_seq_len: int = 48
-    structured_n_feats: int = 17
+    structured_seq_len: int = 256
+    structured_n_feats: int = 61
     structured_layers: int = 2
     structured_heads: int = 8
     structured_pool: Literal["last", "mean", "cls"] = "cls"
@@ -928,6 +695,7 @@ class EncoderConfig:
     text_model_name: str = "emilyalsentzer/Bio_ClinicalBERT"
     text_max_len: int = 512
     note_agg: Literal["mean", "attention"] = "attention"
+    bert_chunk_bs: int = 8
 
     # images
     img_agg: Literal["last", "mean", "attention"] = "last"
@@ -954,6 +722,7 @@ def build_encoders(
         dropout=0.0,
         pool=cfg.structured_pool,
     ).to(dev)
+    CFG.bert_chunk_bs = int(getattr(cfg, "bert_chunk_bs", getattr(CFG, "bert_chunk_bs", 8)))
 
     bbert = BioClinBERTEncoder(
         model_name=cfg.text_model_name,
@@ -985,9 +754,6 @@ def build_multimodal_feature_extractor(
     dropout: float = 0.0,
     unimodal_pool: Literal["mean", "last"] = "mean",
 ) -> MultimodalFeatureExtractor:
-    """
-    Convenience for building MultimodalFeatureExtractor with config.
-    """
     cfg = MulTConfig(
         d=d,
         dropout=dropout,
@@ -1046,10 +812,7 @@ def encode_unimodal_pooled(
     ],
     mL: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
-    """
-    Return unimodal pooled embeddings:
-        {"L": zL, "N": zN, "I": zI}
-    """
+
     dev = next(behrt.parameters()).device
 
     mL_dev = (mL.to(dev) if mL is not None else None)
