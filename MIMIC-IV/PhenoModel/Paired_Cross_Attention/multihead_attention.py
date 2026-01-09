@@ -45,7 +45,9 @@ class MultiheadAttention(nn.Module):
         if self.bias_v is not None:
             nn.init.xavier_normal_(self.bias_v)
 
-    def forward(self, query, key, value, attn_mask=None):
+    def forward(self, query, key, value, attn_mask=None, key_padding_mask=None):
+
+        # --- DEBUG: print device placement once ---
         if not hasattr(self, "_printed_dev"):
             self._printed_dev = True
             print("[MHA dev] query:", query.device,
@@ -84,8 +86,10 @@ class MultiheadAttention(nn.Module):
             k = torch.cat([k, self.bias_k.repeat(1, bsz, 1)], dim=0)
             v = torch.cat([v, self.bias_v.repeat(1, bsz, 1)], dim=0)
             if attn_mask is not None:
+                # note: new_zeros is fine; not an in-place op
                 attn_mask = torch.cat([attn_mask, attn_mask.new_zeros(attn_mask.size(0), 1)], dim=1)
 
+        # reshape to (bsz*num_heads, seq, head_dim)
         q = q.contiguous().view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
         if k is not None:
             k = k.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
@@ -104,6 +108,7 @@ class MultiheadAttention(nn.Module):
         attn_weights = torch.bmm(q, k.transpose(1, 2))
         assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]
 
+
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
                 mask = attn_mask.unsqueeze(0) if attn_mask.dim() == 2 else attn_mask
@@ -112,6 +117,22 @@ class MultiheadAttention(nn.Module):
             else:
                 attn_weights = attn_weights + attn_mask.unsqueeze(0)
 
+        if key_padding_mask is not None:
+            if key_padding_mask.dim() != 2 or key_padding_mask.size(0) != bsz or key_padding_mask.size(1) != src_len:
+                raise ValueError(
+                    f"key_padding_mask must be [B, src_len]=[{bsz},{src_len}], got {tuple(key_padding_mask.shape)}"
+                )
+
+            kpm = key_padding_mask.to(device=attn_weights.device, dtype=torch.bool)  # [B,src]
+            kpm = kpm.unsqueeze(1).unsqueeze(2)  # [B,1,1,src_len]
+            kpm = kpm.expand(bsz, self.num_heads, tgt_len, src_len)  # [B,H,T,src]
+
+            attn_view = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+            neg_inf = torch.finfo(attn_view.dtype).min
+            attn_view = attn_view.masked_fill(kpm, neg_inf)
+            attn_weights = attn_view.view(bsz * self.num_heads, tgt_len, src_len)
+
+        # softmax in fp32 for stability, then cast back (out-of-place)
         attn_weights = F.softmax(attn_weights.float(), dim=-1).to(dtype=attn_weights.dtype)
         attn_weights = F.dropout(attn_weights, p=self.attn_dropout, training=self.training)
 
@@ -121,6 +142,7 @@ class MultiheadAttention(nn.Module):
         attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
         attn = self.out_proj(attn)
 
+        # return average attention weights across heads (out-of-place)
         attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
         attn_weights = attn_weights.sum(dim=1) / float(self.num_heads)
         return attn, attn_weights
