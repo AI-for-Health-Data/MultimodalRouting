@@ -1450,6 +1450,7 @@ def evaluate_epoch(
     epoch_idx: Optional[int] = None,
     split_name: str = "VAL",
     routing_out_dir: Optional[str] = None,
+    thr: Optional[np.ndarray] = None,
 ):
     behrt.eval()
     imgenc.eval()
@@ -1504,6 +1505,11 @@ def evaluate_epoch(
 
             if routing_coef is not None:
                 rc_raw = routing_coef  # expected [B,R,K]
+                if bidx == 0:
+                    rc_m = rc_raw.detach().float().mean(dim=0)   # [R,K]
+                    print("[debug] rc_raw std across phenotypes per route:", rc_m.std(dim=1).cpu().tolist())
+                    print("[debug] rc_raw std across routes per phenotype (mean):", rc_m.std(dim=0).mean().item())
+
                 assert rc_raw.ndim == 3, f"rc_raw must be [B,R,K], got {tuple(rc_raw.shape)}"
                 assert int(rc_raw.shape[1]) == int(N_ROUTES), f"Expected R={N_ROUTES}, got {int(rc_raw.shape[1])}"
 
@@ -1588,7 +1594,13 @@ def evaluate_epoch(
 
         total_loss += float(loss.item()) * y.size(0)
         probs = torch.sigmoid(logits)
-        pred  = (probs >= 0.5).float()
+
+        if thr is None:
+            pred = (probs >= 0.5).float()
+        else:
+            thr_t = torch.tensor(thr, device=probs.device, dtype=probs.dtype).view(1, -1)
+            pred = (probs >= thr_t).float()
+
         total_correct += (pred == y.float()).sum().item()
         total += y.numel()
         num_samples += y.size(0)
@@ -2168,9 +2180,20 @@ def main():
     global CFG, DEVICE
     CFG = E.CFG
     DEVICE = E.DEVICE
+    if torch.cuda.is_available():
+        DEVICE = torch.device("cuda")
+    else:
+        DEVICE = torch.device("cpu")
+    print("[forced] DEVICE =", DEVICE)
     import torch.backends.cudnn as cudnn
     cudnn.benchmark = True
     cudnn.deterministic = False   
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
     if hasattr(args, "finetune_text") and args.finetune_text:
         CFG.finetune_text = True
     print("[env_config] Device:", DEVICE)
@@ -2193,7 +2216,15 @@ def main():
     else:
         amp_ctx_enc = nullcontext()
 
-    amp_ctx_caps = nullcontext()
+    if use_amp:
+        if precision == "fp16":
+            amp_ctx_caps = torch_amp.autocast(device_type="cuda", dtype=torch.float16)
+        elif precision == "bf16":
+            amp_ctx_caps = torch_amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        else:
+            amp_ctx_caps = torch_amp.autocast(device_type="cuda")
+    else:
+        amp_ctx_caps = nullcontext()
 
     from torch.cuda.amp import GradScaler
     scaler = GradScaler(enabled=(use_amp and precision in {"auto", "fp16"}))
@@ -2228,6 +2259,7 @@ def main():
     num_phenos = train_ds.num_labels
     raw_label_cols = train_ds.label_cols
     label_names = [get_pheno_name(i) for i in range(num_phenos)]
+    best_thr = np.full(num_phenos, 0.5, dtype=np.float32)
     bce = nn.BCEWithLogitsLoss(reduction="mean", pos_weight=pos_weight_tensor)
     print("[loss] BCEWithLogitsLoss with per-label pos_weight")
 
@@ -2248,6 +2280,7 @@ def main():
         worker_init_fn=seed_worker,
         generator=g_train,
         persistent_workers=(args.num_workers > 0),
+        prefetch_factor=4 if args.num_workers > 0 else None,
     )
 
     val_loader = DataLoader(
@@ -2455,9 +2488,11 @@ def main():
             batch_size = y.size(0)
             seen_patients += batch_size
 
-            xL, mL = xL.to(DEVICE), mL.to(DEVICE)
-            imgs   = imgs.to(DEVICE)
-            y      = y.to(DEVICE)
+            xL  = xL.to(DEVICE, non_blocking=True)
+            mL  = mL.to(DEVICE, non_blocking=True)
+            imgs= imgs.to(DEVICE, non_blocking=True)
+            y   = y.to(DEVICE, non_blocking=True)
+
 
             if (epoch == start_epoch) and (step == 0):
                 pretty_print_small_batch(xL, mL, notes, dbg, k=3)
@@ -2512,11 +2547,11 @@ def main():
                     assert rc_raw.ndim == 3, f"routing_coef must be [B,R,K], got {tuple(rc_raw.shape)}"
                     assert int(rc_raw.shape[1]) == int(N_ROUTES), f"Expected R={N_ROUTES}, got {tuple(rc_raw.shape)}"
 
-                    sK = rc_raw.sum(dim=2)
-                    if not torch.allclose(sK, torch.ones_like(sK), atol=1e-3):
-                        if getattr(CFG, "verbose", False):
-                            print("[warn] TRAIN rc_raw not normalized over K. max|sumK-1|=",
-                                  (sK - 1).abs().max().item())
+                    sR = rc_raw.sum(dim=1)   # sum over routes
+                        if not torch.allclose(sR, torch.ones_like(sR), atol=1e-3):
+                            print("[warn] TRAIN rc_raw not normalized over ROUTES. max|sumR-1|=",
+                                  (sR - 1).abs().max().item())
+
 
                     rc_report = route_given_pheno(rc_raw, prim_acts, route_mask=route_mask)
                     assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name="TRAIN.rc_report")
@@ -2624,6 +2659,8 @@ def main():
             f"[epoch {epoch + 1}] TRAIN loss={train_loss:.4f} acc={train_acc:.4f} "
             f"avg_prim_act={', '.join(f'{a:.3f}' for a in train_avg_act)}"
         )
+        thr_to_use = best_thr if (epoch > start_epoch) else None
+
 
         val_loss, val_acc, val_act, val_rc_mat, val_pa = evaluate_epoch(
             behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
@@ -2632,6 +2669,7 @@ def main():
             detach_priors=False,
             route_debug=bool(getattr(args, "route_debug", False)),
             label_names=label_names,
+            thr=thr_to_use,
             epoch_idx=epoch + 1,
             split_name="VAL",
             routing_out_dir=os.path.join(ckpt_dir, "routing"),
@@ -2664,6 +2702,8 @@ def main():
         best_thr = find_best_thresholds(y_true, p1, n_steps=50)
         y_pred = (p1 >= best_thr[np.newaxis, :]).astype(float)
         m = epoch_metrics(y_true, p1, y_pred)
+        print("[debug] mean predicted positive rate:", float(y_pred.mean()))
+
         print(
             f"[epoch {epoch + 1}] VAL MACRO  "
             f"AUROC={m['AUROC']:.4f} AUPRC={m['AUPRC']:.4f} "
