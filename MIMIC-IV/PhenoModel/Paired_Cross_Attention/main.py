@@ -117,21 +117,12 @@ def print_route_matrix_detailed(
 
         print(f"\n3. ROUTE IMPORTANCE (averaged across all phenotypes):")
 
-        if rc_is_report:
-            effective = rc_mean
-        else:
-            effective = (rc * pa.unsqueeze(-1)).mean(dim=0).numpy()
+        # routing mean over phenotypes
+        rc_avg = rc_mean.mean(axis=1)  # [R]
 
-        rc_avg  = rc_mean.mean(axis=1)        # [R]
-        eff_avg = effective.mean(axis=1)      # [R]
-
-        for i, r in enumerate(routes):
-            print(
-                f"   {r:4s}: routing={rc_avg[i]:.3f} "
-                f"| effective={eff_avg[i]:.3f} "
-                f"| primary_act={pa_mean[i]:.3f}"
-            )
-
+        # effective = p(route|pheno) * primary_act
+        effective_mean = (rc * pa.unsqueeze(-1)).mean(dim=0).numpy()  # [R,K]
+        eff_avg = effective_mean.mean(axis=1)  # [R]
 
         for i, r in enumerate(routes):
             print(
@@ -139,6 +130,7 @@ def print_route_matrix_detailed(
                 f"| effective={eff_avg[i]:.3f} "
                 f"| primary_act={pa_mean[i]:.3f}"
             )
+
 
         print(f"\n4. ROUTE HEALTH CHECK:")
         for i, r in enumerate(routes):
@@ -319,6 +311,12 @@ def print_phenotype_routing_heatmap(
     top_k: Optional[int] = None,
     rc_is_report: bool = True,
 ):
+    """
+    If rc_is_report=True:
+        show p(route | phenotype) = mean over batch of routing_coef
+    else:
+        show effective = p(route | phenotype) * primary_act
+    """
     with torch.no_grad():
         rc = routing_coef.detach().float().cpu()   # [B,R,K]
         pa = prim_acts.detach().float().cpu()      # [B,R]
@@ -334,25 +332,30 @@ def print_phenotype_routing_heatmap(
             )
 
         B, R, K = rc.shape
-        rc_mean = rc.mean(dim=0).numpy()  # [R,K]
-        pa_mean = pa.mean(dim=0).numpy()  # [R]
+
+        # Means over batch
+        rc_mean = rc.mean(dim=0).numpy()          # [R,K]  mean p(route|pheno)
+        pa_mean = pa.mean(dim=0).numpy()          # [R]    mean primary_act
+        eff_mean = rc_mean * pa_mean[:, None]     # [R,K]  mean effective
+
         routes = ROUTE_NAMES
         if len(routes) != R:
             print(f"[warn] ROUTE_NAMES has len={len(routes)} but routing_coef has R={R}. Using first R names.")
             routes = routes[:R] if len(routes) >= R else routes + [f"route_{i}" for i in range(len(routes), R)]
 
         if rc_is_report:
-            effective = rc_mean
-            header = "Showing p(route | phenotype) (already includes primary activations):"
+            mat = rc_mean
+            header = "Showing p(route | phenotype) (mean over batch):"
         else:
-            effective = rc_mean * pa_mean[:, np.newaxis]
-            header = "Showing effective weights (primary_act × routing_coef_raw):"
+            mat = eff_mean
+            header = "Showing effective = p(route|phenotype) × primary_act (means):"
 
-        K_found = effective.shape[1]
+        K_found = mat.shape[1]
         if top_k is None or int(top_k) <= 0 or int(top_k) >= K_found:
             top_indices = list(range(K_found))
         else:
-            scores = effective.max(axis=0)  # [K]
+            # Rank phenotypes by their strongest route weight
+            scores = mat.max(axis=0)  # [K]
             top_indices = np.argsort(-scores)[:int(top_k)].tolist()
 
         print(header)
@@ -366,17 +369,17 @@ def print_phenotype_routing_heatmap(
             else:
                 name = get_pheno_name(idx)
 
-            weights = effective[:, idx]  # [R]
-            dominant_idx = int(weights.argmax())
+            weights = mat[:, idx]  # [R]
+            dominant_idx = int(np.argmax(weights))
             dominant_route = routes[dominant_idx]
             dominant_weight = float(weights[dominant_idx])
-            weight_str = " | ".join(
-                f"{r}:{float(weights[i]):.3f}" for i, r in enumerate(routes)
-            )
+
+            weight_str = " | ".join(f"{r}:{float(weights[i]):.3f}" for i, r in enumerate(routes))
             print(
                 f"  {name:60s} → DOMINANT: {dominant_route:4s} ({dominant_weight:.3f}) "
                 f"| ALL: {weight_str}"
             )
+
         print(f"{'=' * 120}\n")
 
 def save_routing_heatmap(
@@ -386,18 +389,44 @@ def save_routing_heatmap(
     where: str,
     out_dir: str,
 ):
-    with torch.no_grad():
-        rc = routing_coef.detach().float().cpu()
-        pa = prim_acts.detach().float().cpu()
+    """
+    Saves:
+      1) p(route|phenotype) heatmap (KxR)
+      2) effective = p(route|phenotype) * primary_act heatmap (KxR)
 
-        B, R, K = rc.shape          # [B, N_ROUTES, K]
-        rc_mean = rc.mean(dim=0).numpy()     # [N_ROUTES, K]
-        pa_mean = pa.mean(dim=0).numpy()     # [N_ROUTES]
-        effective = rc_mean
+    routing_coef: [B,R,K] assumed to be p(route|phenotype) (normalized over routes)
+    prim_acts:    [B,R]
+    """
+    with torch.no_grad():
+        rc = routing_coef.detach().float().cpu()   # [B,R,K]
+        pa = prim_acts.detach().float().cpu()      # [B,R]
+
+        if rc.ndim != 3:
+            raise ValueError(f"routing_coef must be [B,R,K], got shape={tuple(rc.shape)}")
+        if pa.ndim != 2:
+            raise ValueError(f"prim_acts must be [B,R], got shape={tuple(pa.shape)}")
+        if rc.shape[0] != pa.shape[0] or rc.shape[1] != pa.shape[1]:
+            raise ValueError(
+                f"Shape mismatch: routing_coef={tuple(rc.shape)} vs prim_acts={tuple(pa.shape)} "
+                f"(expect same B and R)"
+            )
+
+        B, R, K = rc.shape
+
+        rc_mean = rc.mean(dim=0).numpy()          # [R,K] p(route|pheno)
+        pa_mean = pa.mean(dim=0).numpy()          # [R]
+        eff_mean = rc_mean * pa_mean[:, None]     # [R,K] effective mean
+
         routes = ROUTE_NAMES
-        mat = effective.T  # [K, 10]
+        if len(routes) != R:
+            routes = routes[:R] if len(routes) >= R else routes + [f"route_{i}" for i in range(len(routes), R)]
+
         os.makedirs(out_dir, exist_ok=True)
 
+        # ----------------------------
+        # 1) Save p(route|phenotype)
+        # ----------------------------
+        mat = rc_mean.T  # [K,R]
         plt.figure(figsize=(10, 8))
         im = plt.imshow(mat, aspect="auto")
         plt.colorbar(im, label="p(route | phenotype)")
@@ -405,12 +434,30 @@ def save_routing_heatmap(
         plt.yticks(ticks=np.arange(K), labels=label_names, fontsize=6)
         plt.xlabel("Route")
         plt.ylabel("Phenotype")
-        plt.title(f"Phenotype Routing Heatmap ({where}, p(route|phenotype))")
+        plt.title(f"Phenotype Routing Heatmap ({where}) — p(route|phenotype)")
         plt.tight_layout()
-        fname = os.path.join(out_dir, f"phenotype_routing_{where}_heatmap.png")
+        fname = os.path.join(out_dir, f"phenotype_routing_{where}_p_route_given_pheno.png")
         plt.savefig(fname, dpi=300)
         plt.close()
-        print(f"[routing] saved phenotype routing heatmap → {fname}")
+        print(f"[routing] saved p(route|phenotype) heatmap → {fname}")
+
+        # ----------------------------
+        # 2) Save effective = p * act
+        # ----------------------------
+        mat2 = eff_mean.T  # [K,R]
+        plt.figure(figsize=(10, 8))
+        im2 = plt.imshow(mat2, aspect="auto")
+        plt.colorbar(im2, label="effective = p(route|phenotype) × primary_act")
+        plt.xticks(ticks=np.arange(len(routes)), labels=routes)
+        plt.yticks(ticks=np.arange(K), labels=label_names, fontsize=6)
+        plt.xlabel("Route")
+        plt.ylabel("Phenotype")
+        plt.title(f"Phenotype Routing Heatmap ({where}) — effective = p(route|phenotype)×primary_act")
+        plt.tight_layout()
+        fname2 = os.path.join(out_dir, f"phenotype_routing_{where}_effective.png")
+        plt.savefig(fname2, dpi=300)
+        plt.close()
+        print(f"[routing] saved effective heatmap → {fname2}")
 
 def _light_yellow_to_light_blue_cmap():
     return LinearSegmentedColormap.from_list(
@@ -1466,8 +1513,8 @@ def evaluate_epoch(
     printed_caps_once = False
     rpt_every = int(_cfg("routing_print_every", 0) or 0)
 
-    rc_sum_mat = None      # [R, K]
-    #eff_sum_mat = None     # [R, K]
+    rc_sum_mat  = None     # [R,K]
+    eff_sum_mat = None     # [R,K]
     has_routing = False
 
     for bidx, (xL, mL, notes, imgs, y, dbg) in enumerate(loader):
@@ -1519,6 +1566,7 @@ def evaluate_epoch(
                 )  
                 assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name=f"{split_name}.rc_report")
                 routing_coef = rc_report
+
                 if bidx == 0:
                     debug_routing_tensor(
                         routing_coef,
@@ -1540,14 +1588,20 @@ def evaluate_epoch(
 
             if routing_coef is not None:
                 has_routing = True
-                rc_cpu = routing_coef.detach().float().cpu()
-                pa_cpu = prim_acts.detach().float().cpu()
-                rc_sum = rc_cpu.sum(dim=0)   
-                eff_sum = rc_sum             
+                rc_cpu = routing_coef.detach().float().cpu()      # [B,R,K] = rc_report
+                pa_cpu = prim_acts.detach().float().cpu()         # [B,R]
+
+                rc_sum  = rc_cpu.sum(dim=0)                       # [R,K]
+                eff_cpu = rc_cpu * pa_cpu.unsqueeze(-1)           # [B,R,K]
+                eff_sum = eff_cpu.sum(dim=0)                      # [R,K]
+
                 if rc_sum_mat is None:
                     rc_sum_mat = torch.zeros_like(rc_sum)
-                rc_sum_mat += rc_sum
+                if eff_sum_mat is None:
+                    eff_sum_mat = torch.zeros_like(eff_sum)
 
+                rc_sum_mat  += rc_sum
+                eff_sum_mat += eff_sum
 
             if route_debug and routing_coef is not None and bidx == 0:
                 names = label_names if label_names is not None else \
@@ -1612,14 +1666,15 @@ def evaluate_epoch(
     avg_pa = (act_sum / max(1, num_samples)).numpy()  # [10]
     avg_act_dict = {r: float(avg_pa[i]) for i, r in enumerate(route_names)}
 
-    if num_samples > 0 and has_routing and rc_sum_mat is not None:
-        avg_rc_mat = (rc_sum_mat / num_samples).numpy()        # [R,K] exact
-        #avg_effective_mat = (eff_sum_mat / num_samples).numpy()# [R,K] exact
+    if num_samples > 0 and has_routing and (rc_sum_mat is not None) and (eff_sum_mat is not None):
+        avg_rc_mat  = (rc_sum_mat  / num_samples).numpy()   # [R,K]
+        avg_eff_mat = (eff_sum_mat / num_samples).numpy()   # [R,K]
     else:
-        avg_rc_mat = None
-        #avg_effective_mat = None
+        avg_rc_mat  = None
+        avg_eff_mat = None
 
-    return avg_loss, avg_acc, avg_act_dict, avg_rc_mat, avg_pa
+    return avg_loss, avg_acc, avg_act_dict, avg_rc_mat, avg_eff_mat, avg_pa
+
 
 
 def save_checkpoint(path: str, state: Dict):
@@ -2050,7 +2105,7 @@ def generate_split_heatmaps_and_tables(
     out_dir = os.path.join(ckpt_dir, "heatmaps", split_name.lower())
     os.makedirs(out_dir, exist_ok=True)
     dummy_bce = nn.BCEWithLogitsLoss(reduction="mean")
-    loss, acc, act_dict, rc_mat, pa_vec = evaluate_epoch(
+    loss, acc, act_dict, rc_mat, eff_mat, pa_vec = evaluate_epoch(
         behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
         loader, amp_ctx_enc, amp_ctx_caps, dummy_bce,
         route_debug=False,
@@ -2062,9 +2117,13 @@ def generate_split_heatmaps_and_tables(
 
     if rc_mat is None:
         raise RuntimeError(f"[{split_name}] rc_mat is None; routing_coef not returned in forward.")
+    if eff_mat is None:
+        raise RuntimeError(f"[{split_name}] eff_mat is None; effective routing not returned from evaluate_epoch.")
+
 
     K = rc_mat.shape[1]
     rc_k10  = rc_mat.T       # [K,N_ROUTES]
+    eff_k10 = eff_mat.T
     y_true_log, logits, _ = collect_epoch_logits(
         loader, behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
         amp_ctx_enc, amp_ctx_caps
@@ -2146,17 +2205,23 @@ def generate_split_heatmaps_and_tables(
         row_names=["AUROC", "Prevalence"], col_names=label_names,
         print_title=f"[{split_name}] AUROC + Prevalence [2xK] (raw + normalized)"
     )
-    save_heatmap_with_numbers(
-        mat_norm=combo_norm,
-        mat_raw=combo_raw,
-        row_names=["AUROC", "Prevalence"],
-        col_names=label_names,
-        title=f"{split_name} AUROC + Prevalence (2xK) | normalized color, raw numbers",
-        out_path=os.path.join(out_dir, f"{split_name.lower()}_auroc_prevalence_2xk.png"),
-        fontsize_cell=7,
-        fontsize_ticks=7
+    eff_norm, _, _ = save_array_with_versions(
+        eff_k10, out_dir, f"{split_name.lower()}_effective_kxr",
+        row_names=label_names, col_names=routes,
+        print_title=f"[{split_name}] effective = p(route|pheno)×primary_act [KxR] (raw + normalized)",
+        norm_fn=normalize_routes_per_phenotype,
     )
 
+    save_heatmap_with_numbers(
+        mat_norm=eff_norm,
+        mat_raw=eff_k10,
+        row_names=label_names,
+        col_names=routes,
+        title=f"{split_name} effective = p(route|pheno)×primary_act (KxR) | normalized color, raw numbers",
+        out_path=os.path.join(out_dir, f"{split_name.lower()}_effective_kxr.png"),
+        fontsize_cell=6,
+        fontsize_ticks=9
+    )
     print(f"\n[{split_name}] Summary:")
     print(f"  loss={loss:.4f} acc@0.5={acc:.4f} AUROC_macro={m['AUROC']:.4f} AUPRC_macro={m['AUPRC']:.4f}")
     return {
@@ -2165,7 +2230,7 @@ def generate_split_heatmaps_and_tables(
         "AUROC_macro": float(m["AUROC"]),
         "AUPRC_macro": float(m["AUPRC"]),
         "primary_activations": pa_vec.astype(np.float32),
-        #"effective_kx10": eff_k10.astype(np.float32),
+        "effective_kx10": eff_k10.astype(np.float32),
         "routing_coeff_kx10": rc_k10.astype(np.float32),
         "auroc_per_label": auroc_per.astype(np.float32),
         "prevalence_per_label": prev.astype(np.float32),
@@ -2493,10 +2558,6 @@ def main():
             imgs= imgs.to(DEVICE, non_blocking=True)
             y   = y.to(DEVICE, non_blocking=True)
 
-
-            if (epoch == start_epoch) and (step == 0):
-                pretty_print_small_batch(xL, mL, notes, dbg, k=3)
-
             optimizer.zero_grad(set_to_none=True)
 
             dbg_once = (epoch == start_epoch) and (step == 0)
@@ -2547,15 +2608,20 @@ def main():
                     assert rc_raw.ndim == 3, f"routing_coef must be [B,R,K], got {tuple(rc_raw.shape)}"
                     assert int(rc_raw.shape[1]) == int(N_ROUTES), f"Expected R={N_ROUTES}, got {tuple(rc_raw.shape)}"
 
-                    sR = rc_raw.sum(dim=1)   # sum over routes
-                        if not torch.allclose(sR, torch.ones_like(sR), atol=1e-3):
-                            print("[warn] TRAIN rc_raw not normalized over ROUTES. max|sumR-1|=",
-                                  (sR - 1).abs().max().item())
+                    sR = rc_raw.sum(dim=1)  # [B,K] sum over routes
+                    if not torch.allclose(sR, torch.ones_like(sR), atol=1e-3, rtol=0.0):
+                        print("[warn] TRAIN rc_raw not normalized over ROUTES. max|sumR-1|=",
+                              (sR - 1).abs().max().item())
+
 
 
                     rc_report = route_given_pheno(rc_raw, prim_acts, route_mask=route_mask)
                     assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name="TRAIN.rc_report")
                     routing_coef = rc_report
+
+                    if (epoch == start_epoch) and (step == 0):
+                        debug_route_exact_zero(rc_raw, routing_coef, route_mask, split_name="TRAIN", step_tag="e0s0", routes=ROUTE_NAMES)
+
                     if bool(getattr(args, "route_debug", False)) and (epoch == start_epoch) and (step == 0):
                         debug_routing_tensor(
                             routing_coef,
@@ -2573,18 +2639,23 @@ def main():
                     continue
 
                 loss = bce(logits, y.float())
-                cur_epoch = float(epoch + 1) 
-                if route_entropy_lambda > 0.0 and (route_entropy_warmup_epochs <= 0 or cur_epoch <= route_entropy_warmup_epochs):
-                    pa = prim_acts / (prim_acts.sum(dim=1, keepdim=True) + 1e-6)
-                    pa = torch.clamp(pa, 1e-6, 1.0)
-                    H = -(pa * pa.log()).sum(dim=1).mean()
-                    loss = loss - route_entropy_lambda * H
-                if route_uniform_lambda > 0.0 and (route_uniform_warmup_epochs <= 0 or cur_epoch <= route_uniform_warmup_epochs):
-                    pa_dist = prim_acts / (prim_acts.sum(dim=1, keepdim=True) + 1e-6)
-                    p_mean = pa_dist.mean(dim=0)
-                    target = torch.full_like(p_mean, 1.0 / p_mean.numel())
-                    uniform_loss = ((p_mean - target) ** 2).sum()
-                    loss = loss + route_uniform_lambda * uniform_loss
+                cur_epoch = float(epoch + 1)
+
+                if routing_coef is not None:
+                    rc = torch.clamp(routing_coef, 1e-6, 1.0)  # [B,R,K], sums to 1 over routes
+
+                    # (1) Entropy over routes PER phenotype (avoid route collapse per K)
+                    if route_entropy_lambda > 0.0 and (route_entropy_warmup_epochs <= 0 or cur_epoch <= route_entropy_warmup_epochs):
+                        H = -(rc * rc.log()).sum(dim=1).mean()   # sum routes -> [B,K], mean over B,K
+                        loss = loss - route_entropy_lambda * H   # maximize entropy
+
+                    # (2) Uniform route usage globally (aggregate across B and K)
+                    if route_uniform_lambda > 0.0 and (route_uniform_warmup_epochs <= 0 or cur_epoch <= route_uniform_warmup_epochs):
+                        rc_mean_r = rc.mean(dim=(0, 2))          # [R]
+                        target = torch.full_like(rc_mean_r, 1.0 / rc_mean_r.numel())
+                        uniform_loss = ((rc_mean_r - target) ** 2).sum()
+                        loss = loss + route_uniform_lambda * uniform_loss
+
             grad_clip = float(_cfg("grad_clip", 0.3))
             if not torch.isfinite(loss):
                 print(f"[skip] non-finite loss at epoch={epoch+1} step={step+1} -> skip")
@@ -2637,12 +2708,18 @@ def main():
                     )
                 )
                 if routing_coef is not None:
-                    rc_route_mean = routing_coef.detach().float().mean(dim=(0, 2))  
-                    eff_route_mean = rc_route_mean                                 
+                    routes = ROUTE_NAMES[:N_ROUTES]
+
+                    rc_route_mean = routing_coef.detach().float().mean(dim=(0, 2))  # [R]
+                    eff_route_mean = (routing_coef.detach().float() * prim_acts.detach().float().unsqueeze(-1)).mean(dim=(0, 2))  # [R]
+
                     rc_route_mean = rc_route_mean.cpu().tolist()
-                    rc_str = " | ".join(f"{r}:{rc_route_mean[i]:.3f}" for i, r in enumerate(routes))
-                    eff_str = " | ".join(f"{r}:{eff_route_mean[i].item():.3f}" for i, r in enumerate(routes))
-                    msg += f" | [p(route|pheno) mean] {rc_str}"
+                    eff_route_mean = eff_route_mean.cpu().tolist()
+
+                    rc_str  = " | ".join(f"{r}:{rc_route_mean[i]:.3f}" for i, r in enumerate(routes))
+                    eff_str = " | ".join(f"{r}:{eff_route_mean[i]:.3f}" for i, r in enumerate(routes))
+                    msg += f" | [p(route|pheno) mean] {rc_str} | [effective mean] {eff_str}"
+
                 print(msg)
                 if max(avg_act) > 0.95:
                     dom_route = int(np.argmax(avg_act))
@@ -2662,7 +2739,7 @@ def main():
         thr_to_use = best_thr if (epoch > start_epoch) else None
 
 
-        val_loss, val_acc, val_act, val_rc_mat, val_pa = evaluate_epoch(
+        val_loss, val_acc, val_act, val_rc_mat, val_eff_mat, val_pa = evaluate_epoch(
             behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
             val_loader, amp_ctx_enc, amp_ctx_caps, bce,
             act_temperature=1.0,
@@ -2801,7 +2878,7 @@ def main():
         projector.load_state_dict(ckpt["projector"])
         cap_head.load_state_dict(ckpt["cap_head"])
 
-    test_loss, test_acc, test_act, test_rc_mat, test_pa = evaluate_epoch(
+    test_loss, test_acc, test_act, test_rc_mat, test_eff_mat, test_pa = evaluate_epoch(
         behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
         test_loader, amp_ctx_enc, amp_ctx_caps, bce,
         act_temperature=1.0,
