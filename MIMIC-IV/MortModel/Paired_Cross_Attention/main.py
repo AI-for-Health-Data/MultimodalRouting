@@ -1672,20 +1672,19 @@ def evaluate_epoch(
 
 
             logits, prim_acts, route_embs = out[0], out[1], out[2]
-            routing_coef = out[3] if len(out) > 3 else None
 
-            rc_raw = None
+            rc_raw = out[3] if len(out) > 3 else None
             rc_report = None
 
-            if routing_coef is not None:
-                rc_raw = routing_coef  # [B,R,K]
+
+            if rc_raw is not None:
                 assert rc_raw.ndim == 3, f"rc_raw must be [B,R,K], got {tuple(rc_raw.shape)}"
                 assert int(rc_raw.shape[1]) == int(N_ROUTES), f"Expected R={N_ROUTES}, got {int(rc_raw.shape[1])}"
 
-                # sanity: should sum over routes
-                assert_routing_over_routes(rc_raw, routes_dim=1, atol=1e-2, name=f"{split_name}.rc_raw")  # looser atol ok
+                # raw should sum to 1 over routes
+                assert_routing_over_routes(rc_raw, routes_dim=1, atol=1e-2, name=f"{split_name}.rc_raw")
 
-                # Effective / report distribution (includes primary activations, then renormalizes over routes)
+                # THIS is what you want to interpret / average / heatmap
                 rc_report = route_given_pheno(rc_raw, prim_acts, route_mask=route_mask)
                 assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name=f"{split_name}.rc_report")
 
@@ -1693,17 +1692,9 @@ def evaluate_epoch(
                     debug_routing_tensor(rc_raw,    name=f"{split_name}.rc_raw",    expect_routes=N_ROUTES, expect_k=int(y.size(1)))
                     debug_routing_tensor(rc_report, name=f"{split_name}.rc_report", expect_routes=N_ROUTES, expect_k=int(y.size(1)))
 
-                if bidx == 0:
-                    debug_routing_tensor(
-                        routing_coef,
-                        name=f"{split_name}.routing_coef",
-                        expect_routes=N_ROUTES,
-                        expect_k=int(y.size(1))
-                    )
+            if route_debug and (rc_raw is not None) and bidx == 0:
+                quantization_check(rc_raw, name=f"{split_name}.rc_raw")
 
-
-            if route_debug and (routing_coef is not None) and bidx == 0:
-                quantization_check(routing_coef, name=f"{split_name}.routing_coef")
 
             if route_debug and bidx == 0:
                 mask_stats(mL, name=f"{split_name}.mL_batch")
@@ -2832,45 +2823,37 @@ def main():
 
 
                 logits, prim_acts, route_embs = out[0], out[1], out[2]
-                routing_coef = out[3] if len(out) > 3 else None
 
-                rc_raw = None
+                rc_raw = out[3] if len(out) > 3 else None
                 rc_report = None
 
-                if routing_coef is not None:
-                    rc_raw = routing_coef  # [B,R,K]
-                    rc_report = route_given_pheno(rc_raw, prim_acts, route_mask=route_mask)
-                    assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name="TRAIN.rc_report")
-
-
-                if routing_coef is not None:
-                    rc_raw = routing_coef  # [B,R,K]
-                    assert rc_raw.ndim == 3, f"routing_coef must be [B,R,K], got {tuple(rc_raw.shape)}"
+                if rc_raw is not None:
+                    assert rc_raw.ndim == 3, f"rc_raw must be [B,R,K], got {tuple(rc_raw.shape)}"
                     assert int(rc_raw.shape[1]) == int(N_ROUTES), f"Expected R={N_ROUTES}, got {tuple(rc_raw.shape)}"
 
-                    # Optional: raw CapsuleFC normalization check (your assumption)
-                    # Correct: routing distributions should sum to 1 over ROUTES (dim=1), for each class K
-                    sR = rc_raw.sum(dim=1)  # [B,K]
-                    if not torch.allclose(sR, torch.ones_like(sR), atol=1e-3):
+                    # raw normalization check (looser atol is fine)
+                    sR = rc_raw.sum(dim=1)
+                    if not torch.allclose(sR, torch.ones_like(sR), atol=1e-2):
                         if getattr(CFG, "verbose", False):
-                            print(f"[warn] rc_raw not normalized over routes. max|sumR-1|=",
-                                  (sR - 1).abs().max().item())
+                            print(f"[warn] TRAIN.rc_raw not normalized, max|sumR-1|={(sR-1).abs().max().item():.4e}")
 
-
-                    # Convert for logging/analysis
                     rc_report = route_given_pheno(rc_raw, prim_acts, route_mask=route_mask)
                     assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name="TRAIN.rc_report")
 
-                    routing_coef = rc_report
+                    if bool(getattr(args, "route_debug", False)) and (epoch == start_epoch) and (step == 0):
+                        debug_routing_tensor(rc_raw,    name="TRAIN.rc_raw",    expect_routes=N_ROUTES, expect_k=int(y.size(1)))
+                        debug_routing_tensor(rc_report, name="TRAIN.rc_report", expect_routes=N_ROUTES, expect_k=int(y.size(1)))
+
+                    assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name="TRAIN.rc_report")
 
 
                     if bool(getattr(args, "route_debug", False)) and (epoch == start_epoch) and (step == 0):
                         debug_routing_tensor(
-                            routing_coef,
-                            name="TRAIN.rc_report",
-                            expect_routes=N_ROUTES,
-                            expect_k=int(y.size(1)),
-                        )
+                        rc_report,
+                        name="TRAIN.rc_report",
+                        expect_routes=N_ROUTES,
+                        expect_k=int(y.size(1)),
+                    )
 
                 logits    = _safe_tensor(logits.float(),     "logits(fp32)")
                 prim_acts = _safe_tensor(prim_acts.float(), "prim_acts(fp32)")
@@ -2954,7 +2937,7 @@ def main():
                 )
                 if (rc_raw is not None) and (rc_report is not None):
                     raw_mean = rc_raw.detach().float().mean(dim=(0, 2)).cpu().tolist()       # [R]
-                    rep_mean = rc_report.detach().float().mean(dim=(0, 2)).cpu().tolist()    # [R]
+                    rep_mean = rc_report.detach().float().mean(dim=(0, 2)).cpu().tolist()
 
                     raw_str = " | ".join(f"{r}:{raw_mean[i]:.3f}" for i, r in enumerate(ROUTE_NAMES))
                     rep_str = " | ".join(f"{r}:{rep_mean[i]:.3f}" for i, r in enumerate(ROUTE_NAMES))
@@ -3174,7 +3157,7 @@ def main():
     )
 
     # Routing importance: global and per-phenotype (TEST) 
-    #routes = ["L","N","I","LN","NL","LI","IL","NI","IN","LNI"]
+    routes = ROUTE_NAMES
 
     if test_rc_mat is not None:
         rc_mean_test = test_rc_mat.mean(axis=1)  # [R]
