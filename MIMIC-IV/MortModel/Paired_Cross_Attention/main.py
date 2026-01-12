@@ -1299,16 +1299,20 @@ class ICUStayDataset(Dataset):
 
 
         # multi-label phenotype target [K]
+        # ---- binary mortality target (single label) ----
         lab_row = self.labels[self.labels.stay_id == stay_id]
         if lab_row.empty:
             raise RuntimeError(f"[ICUStayDataset] Missing labels for stay_id={stay_id}")
-        y_vec = lab_row[self.label_cols].iloc[0].to_numpy()
 
-        # make it safe + binary
-        y_vec = np.nan_to_num(y_vec, nan=0.0)
-        y_vec = (y_vec > 0).astype(np.float32)   # forces 0/1
+        # If labels_mortality.parquet has ONE label column, use it.
+        # (If it has multiple columns, we take the first after sorting.)
+        col = self.label_cols[0]
+        y0 = lab_row[col].iloc[0]
 
-        y = torch.tensor(y_vec, dtype=torch.float32)  # [K]
+        # force 0/1
+        y0 = 0 if (y0 is None or (isinstance(y0, float) and np.isnan(y0))) else int(float(y0) > 0.0)
+
+        y = torch.tensor(y0, dtype=torch.long)   # scalar: 0/1
 
 
         return {
@@ -1445,7 +1449,7 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
             print(f"[collate] image_zero_fraction(first batch) = {zero_frac:.3f}")
             print(f"[collate] xL_batch: {tuple(xL_batch.shape)} | ...")
             first_print["done"] = True
-        y_batch = torch.stack([b["y"].float().view(-1) for b in batch], dim=0)
+        y_batch = torch.stack([b["y"].view(()) for b in batch], dim=0)  # [B] long
         dbg = {"stay_ids": [b["stay_id"] for b in batch], "img_paths": img_paths_list}
         return xL_batch, mL_batch, notes_batch, imgs_batch, y_batch, dbg
     return _collate
@@ -1624,6 +1628,7 @@ def evaluate_epoch(
 ):
     behrt.eval()
     imgenc.eval()
+    bbert.eval()
     if getattr(bbert, "bert", None) is not None:
         bbert.bert.eval()
 
@@ -1689,8 +1694,9 @@ def evaluate_epoch(
                 assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name=f"{split_name}.rc_report")
 
                 if bidx == 0:
-                    debug_routing_tensor(rc_raw,    name=f"{split_name}.rc_raw",    expect_routes=N_ROUTES, expect_k=int(y.size(1)))
-                    debug_routing_tensor(rc_report, name=f"{split_name}.rc_report", expect_routes=N_ROUTES, expect_k=int(y.size(1)))
+                    expect_k = int(logits.size(1))  # <-- 2 for mortality (alive/death)
+                    debug_routing_tensor(rc_raw,    name=f"{split_name}.rc_raw",    expect_routes=N_ROUTES, expect_k=expect_k)
+                    debug_routing_tensor(rc_report, name=f"{split_name}.rc_report", expect_routes=N_ROUTES, expect_k=expect_k)
 
             if route_debug and (rc_raw is not None) and bidx == 0:
                 quantization_check(rc_raw, name=f"{split_name}.rc_raw")
@@ -1722,8 +1728,12 @@ def evaluate_epoch(
 
 
             if route_debug and (rc_raw is not None) and (rc_report is not None) and bidx == 0:
-                K = int(rc_raw.size(2))
-                names = (label_names[:K] if label_names is not None else [f"label_{i}" for i in range(K)])
+                K = int(logits.size(1))
+                if label_names is not None and len(label_names) >= K:
+                    names = label_names[:K]
+                else:
+                    names = [f"class_{i}" for i in range(K)]
+
 
                 print_route_matrix_detailed(
                     rc_raw=rc_raw,
@@ -1773,12 +1783,12 @@ def evaluate_epoch(
                 if route_debug and bidx == 0:
                     route_cosine_report(route_embs)
 
-            loss = loss_fn(logits, y.float())
+            loss = loss_fn(logits, y)   # CE expects y long
 
         total_loss += float(loss.item()) * y.size(0)
-        probs = torch.sigmoid(logits)
-        pred  = (probs >= 0.5).float()
-        total_correct += (pred == y.float()).sum().item()
+        p_death = torch.softmax(logits, dim=1)[:, 1]
+        pred = (p_death >= 0.5).long()
+        total_correct += (pred == y).sum().item()
         total += y.numel()
         num_samples += y.size(0)
         act_sum += prim_acts.detach().float().cpu().sum(dim=0)
@@ -1883,31 +1893,38 @@ def collect_epoch_logits(
 def fit_temperature_scalar_from_val(
     val_logits: np.ndarray,
     val_y_true: np.ndarray,
-    max_iter: int = 200,
-    lr: float = 0.01,
+    max_iter: int = 300,
+    lr: float = 0.05,
 ):
+    import torch.nn.functional as F
 
+    # logits: [N,2]
     val_logits_t = torch.tensor(val_logits, dtype=torch.float32, device=DEVICE)
-    val_y_t      = torch.tensor(val_y_true, dtype=torch.float32, device=DEVICE)
+
+    # y can come as [N] or [N,1]; convert to [N] long
+    y = np.asarray(val_y_true)
+    y = y.reshape(-1)
+    val_y_t = torch.tensor(y, dtype=torch.long, device=DEVICE)
+
     logT = torch.zeros((), device=DEVICE, requires_grad=True)
     opt = torch.optim.Adam([logT], lr=lr)
-    loss_fn = torch.nn.BCEWithLogitsLoss(reduction="mean")
+
     best_T = 1.0
     best_loss = float("inf")
+
     for _ in range(max_iter):
         opt.zero_grad(set_to_none=True)
         T = torch.exp(logT) + 1e-6
-        loss = loss_fn(val_logits_t / T, val_y_t)
+        loss = F.cross_entropy(val_logits_t / T, val_y_t)
         loss.backward()
         opt.step()
 
         l = float(loss.detach().cpu().item())
         if l < best_loss:
             best_loss = l
-            best_T = float((torch.exp(logT).detach().cpu().item()))
+            best_T = float(torch.exp(logT).detach().cpu().item())
 
-    best_T = float(np.clip(best_T, 0.05, 50.0))
-    return best_T
+    return float(np.clip(best_T, 0.05, 50.0))
 
 
 def apply_temperature(logits: np.ndarray, T: float) -> np.ndarray:
@@ -1918,6 +1935,16 @@ def apply_temperature(logits: np.ndarray, T: float) -> np.ndarray:
 def sigmoid_np(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     return 1.0 / (1.0 + np.exp(-x))
+
+def softmax_death_np(logits_2: np.ndarray) -> np.ndarray:
+    """
+    logits_2: [N,2] -> returns death prob [N,1] using softmax over dim=1
+    """
+    x = np.asarray(logits_2, dtype=np.float32)
+    x = x - x.max(axis=1, keepdims=True)  # stability
+    ex = np.exp(x)
+    p2 = ex / (ex.sum(axis=1, keepdims=True) + 1e-12)  # [N,2]
+    return p2[:, 1:2]  # [N,1] death prob
 
 @torch.no_grad()
 def collect_epoch_outputs(
@@ -1963,10 +1990,13 @@ def collect_epoch_outputs(
             )
             logits = _safe_tensor(out[0].float(), "collect.logits(fp32)")
 
-        probs = torch.sigmoid(logits)
+        # logits: [B,2] (alive, death)
+        probs2 = torch.softmax(logits, dim=1)        # [B,2]
+        p_death = probs2[:, 1].unsqueeze(1)          # [B,1]
 
-        y_true.append(y.detach().cpu())
-        p1.append(probs.detach().cpu())
+        y_true.append(y.detach().cpu().view(-1, 1).float())  # [B,1]
+        p1.append(p_death.detach().cpu())                    # [B,1]
+
         ids += dbg.get("stay_ids", [])
 
     y_true = torch.cat(y_true, dim=0).numpy()
@@ -2254,14 +2284,18 @@ def generate_split_heatmaps_and_tables(
       6) AUROC+Prevalence combined heatmap (2xK) [raw + norm saved/printed]
     """
     routes = ROUTE_NAMES
+    CLASS_NAMES  = ["alive", "death"]  # routing K=2
+    METRIC_NAMES = ["death"]          # metric K=1
+
 
     out_dir = os.path.join(ckpt_dir, "heatmaps", split_name.lower())
     os.makedirs(out_dir, exist_ok=True)
 
-    dummy_bce = nn.BCEWithLogitsLoss(reduction="mean")
+    dummy_ce = nn.CrossEntropyLoss()
+
     loss, acc, act_dict, rc_mat, pa_vec = evaluate_epoch(
         behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
-        loader, amp_ctx_enc, amp_ctx_caps, dummy_bce,
+        loader, amp_ctx_enc, amp_ctx_caps, dummy_ce,
         route_debug=False,
         label_names=label_names,
         epoch_idx=None,
@@ -2283,22 +2317,25 @@ def generate_split_heatmaps_and_tables(
         amp_ctx_enc, amp_ctx_caps
     )
 
-    prev = y_true_log.mean(axis=0)  # [K]
+    # y_true_log: [N] (0/1). Convert to [N,1] for your multi-label metric helpers.
+    y_true_bin = np.asarray(y_true_log).reshape(-1, 1).astype(np.float32)  # [N,1]
+    prev = y_true_bin.mean(axis=0)                                         # [1]
 
+    # death prob from CE logits [N,2]
     if T_cal is not None:
-        p = sigmoid_np(apply_temperature(logits, float(T_cal)))
+        p = softmax_death_np(apply_temperature(logits, float(T_cal)))       # [N,1]
     else:
-        p = sigmoid_np(logits)
+        p = softmax_death_np(logits)                                        # [N,1]
 
     if thr_val is not None:
-        thr_val = np.asarray(thr_val, dtype=np.float32).reshape(-1)
-        y_pred = (p >= thr_val[np.newaxis, :]).astype(float)
+        thr_val = np.asarray(thr_val, dtype=np.float32).reshape(-1)         # [1]
+        y_pred = (p >= thr_val[np.newaxis, :]).astype(float)                # [N,1]
     else:
         y_pred = (p >= 0.5).astype(float)
 
-    m = epoch_metrics(y_true_log, p, y_pred)
+    m = epoch_metrics(y_true_bin, p, y_pred)
+    auroc_per = m["AUROC_per_label"]  # [1]
 
-    auroc_per = m["AUROC_per_label"]  # [K] may include NaN
 
     auroc_vis = np.nan_to_num(auroc_per, nan=0.0).astype(np.float32)
     prev_vis  = np.nan_to_num(prev,      nan=0.0).astype(np.float32)
@@ -2329,7 +2366,7 @@ def generate_split_heatmaps_and_tables(
 
     rc_norm, _, _ = save_array_with_versions(
         rc_k10, out_dir, f"{split_name.lower()}_p_route_given_pheno_kxr",
-        row_names=label_names, col_names=routes,
+        row_names=CLASS_NAMES, col_names=routes,
         print_title=f"[{split_name}] p(route | label) [KxR] (raw + normalized)",
         norm_fn=normalize_routes_per_phenotype,
     )
@@ -2337,7 +2374,7 @@ def generate_split_heatmaps_and_tables(
     save_heatmap_with_numbers(
         mat_norm=rc_norm,
         mat_raw=rc_k10,
-        row_names=label_names,
+        row_names=CLASS_NAMES,
         col_names=routes,
         title=f"{split_name} p(route | label) (KxR) | normalized color, raw numbers",
         out_path=os.path.join(out_dir, f"{split_name.lower()}_p_route_given_pheno_kxr.png"),
@@ -2348,11 +2385,11 @@ def generate_split_heatmaps_and_tables(
 
     auroc_norm, _, _ = save_array_with_versions(
         auroc_per, out_dir, f"{split_name.lower()}_auroc_per_label",
-        row_names=None, col_names=label_names,
+        row_names=None, col_names=METRIC_NAMES,
         print_title=f"[{split_name}] AUROC per label [1xK] (raw + normalized)"
     )
     save_vector_heatmap_with_numbers(
-        auroc_vis, label_names,
+        auroc_vis, METRIC_NAMES,
         title=f"{split_name} AUROC per Label (normalized color, raw numbers)",
         out_path=os.path.join(out_dir, f"{split_name.lower()}_auroc_per_label.png"),
         fontsize_cell=7, fontsize_ticks=7
@@ -2360,11 +2397,11 @@ def generate_split_heatmaps_and_tables(
 
     prev_norm, _, _ = save_array_with_versions(
         prev, out_dir, f"{split_name.lower()}_prevalence_per_label",
-        row_names=None, col_names=label_names,
+        row_names=None, col_names=METRIC_NAMES,
         print_title=f"[{split_name}] Prevalence per label [1xK] (raw + normalized)"
     )
     save_vector_heatmap_with_numbers(
-        prev_vis, label_names,
+        prev_vis, METRIC_NAMES,
         title=f"{split_name} Prevalence per Label (normalized color, raw numbers)",
         out_path=os.path.join(out_dir, f"{split_name.lower()}_prevalence_per_label.png"),
         fontsize_cell=7, fontsize_ticks=7
@@ -2373,14 +2410,14 @@ def generate_split_heatmaps_and_tables(
     combo_raw = np.vstack([auroc_vis.reshape(1, -1), prev_vis.reshape(1, -1)])  # [2,K]
     combo_norm, _, _ = save_array_with_versions(
         combo_raw, out_dir, f"{split_name.lower()}_auroc_and_prevalence_2xk",
-        row_names=["AUROC", "Prevalence"], col_names=label_names,
+        row_names=["AUROC", "Prevalence"], col_names=METRIC_NAMES,
         print_title=f"[{split_name}] AUROC + Prevalence [2xK] (raw + normalized)"
     )
     save_heatmap_with_numbers(
         mat_norm=combo_norm,
         mat_raw=combo_raw,
         row_names=["AUROC", "Prevalence"],
-        col_names=label_names,
+        col_names=METRIC_NAMES,
         title=f"{split_name} AUROC + Prevalence (2xK) | normalized color, raw numbers",
         out_path=os.path.join(out_dir, f"{split_name.lower()}_auroc_prevalence_2xk.png"),
         fontsize_cell=7,
@@ -2478,8 +2515,11 @@ def main():
     # Datasets
     train_ds = ICUStayDataset(args.data_root, split="train")
 
-    label_names = list(train_ds.label_cols)   
-    num_labels  = int(train_ds.num_labels)    
+    CLASS_NAMES  = ["alive", "death"]   # routing/K=2
+    METRIC_NAMES = ["death"]            # metrics/K=1
+    num_labels   = 2
+
+
     CFG.structured_n_feats = int(getattr(CFG, "structured_n_feats", 76) or 76)
     CFG.structured_seq_len = int(getattr(CFG, "structured_seq_len", 48) or 48)
     print(f"[cfg] packed structured_n_feats={CFG.structured_n_feats} structured_seq_len={CFG.structured_seq_len}")
@@ -2488,14 +2528,14 @@ def main():
         train_ds.labels[train_ds.labels["stay_id"].isin(tri_ids)]
         .loc[:, ["stay_id"] + train_ds.label_cols]
         .drop_duplicates(subset=["stay_id"], keep="first")
-    )
+    )      
 
     N_train = len(train_label_df)
 
     compute_split_prevalence(
         train_label_df[train_ds.label_cols].values,
         split_name="TRAIN",
-        label_names=label_names,
+        label_names=METRIC_NAMES,
     )
     pos_counts = train_label_df[train_ds.label_cols].sum(axis=0).values
     neg_counts = N_train - pos_counts
@@ -2510,8 +2550,9 @@ def main():
 
     val_ds   = ICUStayDataset(args.data_root, split="val")
     test_ds  = ICUStayDataset(args.data_root, split="test")
-    bce = nn.BCEWithLogitsLoss(reduction="mean", pos_weight=pos_weight_tensor)
-    print("[loss] BCEWithLogitsLoss with per-label pos_weight")
+    ce = nn.CrossEntropyLoss()
+    print("[loss] CrossEntropyLoss (binary softmax)")
+
     collate_train = collate_fn_factory(tidx=TASK_MAP[args.task], img_tfms=build_image_transform("train"))
     collate_eval  = collate_fn_factory(tidx=TASK_MAP[args.task], img_tfms=build_image_transform("val"))
     pin = use_cuda
@@ -2623,7 +2664,8 @@ def main():
     d_in = int(getattr(CFG, "mult_d_in", d_l))  # common choice: d_in=d_l if you set d_l=d_n=d_i
     route_adapter = RouteDimAdapter(d_in=d_in, d_l=d_l, d_n=d_n, d_i=d_i).to(DEVICE)
     projector = RoutePrimaryProjector(d_in=d_in, pc_dim=CFG.capsule_pc_dim).to(DEVICE)
-    num_labels = train_ds.num_labels
+    class_names = ["alive", "death"]
+
     cap_head = CapsuleMortalityHead(
         pc_dim=CFG.capsule_pc_dim,
         mc_caps_dim=CFG.capsule_mc_caps_dim,
@@ -2632,7 +2674,7 @@ def main():
         act_type=CFG.capsule_act_type,
         layer_norm=CFG.capsule_layer_norm,
         dim_pose_to_vote=CFG.capsule_dim_pose_to_vote,
-        num_classes=num_labels,
+        num_classes=2,   # <-- BINARY
     ).to(DEVICE)
 
     print(
@@ -2841,19 +2883,20 @@ def main():
                     assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name="TRAIN.rc_report")
 
                     if bool(getattr(args, "route_debug", False)) and (epoch == start_epoch) and (step == 0):
-                        debug_routing_tensor(rc_raw,    name="TRAIN.rc_raw",    expect_routes=N_ROUTES, expect_k=int(y.size(1)))
-                        debug_routing_tensor(rc_report, name="TRAIN.rc_report", expect_routes=N_ROUTES, expect_k=int(y.size(1)))
+                        expect_k = int(logits.size(1))
+                        debug_routing_tensor(rc_raw,    name="TRAIN.rc_raw",    expect_routes=N_ROUTES, expect_k=expect_k)
+                        debug_routing_tensor(rc_report, name="TRAIN.rc_report", expect_routes=N_ROUTES, expect_k=expect_k)
 
                     assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name="TRAIN.rc_report")
 
 
                     if bool(getattr(args, "route_debug", False)) and (epoch == start_epoch) and (step == 0):
                         debug_routing_tensor(
-                        rc_report,
-                        name="TRAIN.rc_report",
-                        expect_routes=N_ROUTES,
-                        expect_k=int(y.size(1)),
-                    )
+                            rc_report,
+                            name="TRAIN.rc_report",
+                            expect_routes=N_ROUTES,
+                            expect_k=int(logits.size(1)),
+                        )
 
                 logits    = _safe_tensor(logits.float(),     "logits(fp32)")
                 prim_acts = _safe_tensor(prim_acts.float(), "prim_acts(fp32)")
@@ -2864,7 +2907,7 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
                     continue
 
-                loss = bce(logits, y.float())
+                loss = ce(logits, y)
 
                 cur_epoch = float(epoch + 1) 
 
@@ -2913,9 +2956,9 @@ def main():
             safe_zero_grad(optimizer)
             total_loss += float(loss.item()) * y.size(0)
 
-            probs = torch.sigmoid(logits)
-            pred = (probs >= 0.5).float()
-            total_correct += (pred == y.float()).sum().item()
+            p_death = torch.softmax(logits, dim=1)[:, 1]   # prob of class 1
+            pred = (p_death >= 0.5).long()
+            total_correct += (pred == y).sum().item()
             total += y.numel()
 
             act_sum += prim_acts.detach().cpu().sum(dim=0)
@@ -2968,11 +3011,11 @@ def main():
         # VAL metrics (BCE + 0.5 threshold / F1-based thresholds)
         val_loss, val_acc, val_act, val_rc_mat, val_pa = evaluate_epoch(
             behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
-            val_loader, amp_ctx_enc, amp_ctx_caps, bce,
+            val_loader, amp_ctx_enc, amp_ctx_caps, ce,
             act_temperature=1.0,
             detach_priors=False,
             route_debug=bool(getattr(args, "route_debug", False)),
-            label_names=label_names,
+            label_names=CLASS_NAMES,
             epoch_idx=epoch + 1,
             split_name="VAL",
             routing_out_dir=os.path.join(ckpt_dir, "routing"),
@@ -2980,6 +3023,9 @@ def main():
 
         # Routing importance: global and per-phenotype (VAL) 
         routes = ROUTE_NAMES
+        ROUTING_CLASS_NAMES = ["alive", "death"]   # for K=2 routing tables/plots
+        METRIC_NAMES        = ["death"]           # for AUROC/prevalence etc (K=1)
+
 
 
         if val_rc_mat is not None:
@@ -2991,8 +3037,7 @@ def main():
 
             # Per-route, per-phenotype routing importance (N_ROUTES x K) from routing coefficients
             K = val_rc_mat.shape[1]
-            label_names = list(train_ds.label_cols)   # already set
-            names = label_names
+            names = ROUTING_CLASS_NAMES if len(ROUTING_CLASS_NAMES) >= K else [f"class_{k}" for k in range(K)]
 
             print("\n[epoch %d] [VAL] per-route, per-label routing importance (p(route|label)):" % (epoch + 1))
             for i, r in enumerate(routes):
@@ -3058,7 +3103,7 @@ def main():
         f1_per  = m["F1_per_label"]
         rec_per = m["Recall_per_label"]
 
-        for k, name in enumerate(label_names):
+        for k, name in enumerate(METRIC_NAMES):
             print(
                 f"[epoch {epoch + 1}] VAL {name} "
                 f"AUROC={au_per[k]:.4f} "
@@ -3143,7 +3188,7 @@ def main():
 
     test_loss, test_acc, test_act, test_rc_mat, test_pa = evaluate_epoch(
         behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
-        test_loader, amp_ctx_enc, amp_ctx_caps, bce,
+        test_loader, amp_ctx_enc, amp_ctx_caps, ce,
         act_temperature=1.0,
         detach_priors=False,
         route_debug=False,
@@ -3202,21 +3247,26 @@ def main():
     T_star = fit_temperature_scalar_from_val(logits_v, y_true_v_log, max_iter=300, lr=0.05)
     print(f"[calibration] Fitted temperature on VAL only: T={T_star:.4f}")
 
-    p_v = sigmoid_np(apply_temperature(logits_v, T_star))  # use calibrated probs for threshold search
-    prev_val = compute_split_prevalence(y_true_v_log, split_name="VAL", label_names=label_names)
-    thr_val, f1_val_thr = grid_search_thresholds(y_true_v_log, p_v, n_steps=101)
-    save_split_thresholds(thr_val, ckpt_dir, split_name="VAL")  
+    # Convert to [N,1] for threshold utilities
+    y_true_v = np.asarray(y_true_v_log).reshape(-1, 1).astype(np.float32)   # [N,1]
+
+    p_v = softmax_death_np(apply_temperature(logits_v, T_star))             # [N,1]
+    prev_val = compute_split_prevalence(y_true_v, split_name="VAL", label_names=["death"])
+    thr_val, f1_val_thr = grid_search_thresholds(y_true_v, p_v, n_steps=101)
+    save_split_thresholds(thr_val, ckpt_dir, split_name="VAL")
+
     y_true_t_log, logits_t, _ = collect_epoch_logits(
         test_loader, behrt, bbert, imgenc, mult, route_adapter, projector, cap_head, amp_ctx_enc, amp_ctx_caps
     )
 
     # Uncalibrated + calibrated probabilities on TEST
-    p_test_uncal = sigmoid_np(logits_t)
-    p_test_cal   = sigmoid_np(apply_temperature(logits_t, T_star))
+    y_true_t = np.asarray(y_true_t_log).reshape(-1, 1).astype(np.float32)  # [N,1]
 
-    # Evaluate TEST using VAL thresholds (frozen) — calibrated probabilities
-    y_pred_t = (p_test_cal >= thr_val[np.newaxis, :]).astype(float)
-    mt = epoch_metrics(y_true_t_log, p_test_cal, y_pred_t)
+    p_test_uncal = softmax_death_np(logits_t)                               # [N,1]
+    p_test_cal   = softmax_death_np(apply_temperature(logits_t, T_star))    # [N,1]
+
+    y_pred_t = (p_test_cal >= thr_val[np.newaxis, :]).astype(float)         # [N,1]
+    mt = epoch_metrics(y_true_t, p_test_cal, y_pred_t)
 
     print(
         f"[TEST] (VAL-thresholds, CALIBRATED probs) MACRO  AUROC={mt['AUROC']:.4f} "
