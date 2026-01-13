@@ -22,6 +22,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
 from transformers import AutoTokenizer
 from transformers.utils import logging as hf_logging
 hf_logging.set_verbosity_error()
@@ -2665,6 +2666,7 @@ def main():
     route_adapter = RouteDimAdapter(d_in=d_in, d_l=d_l, d_n=d_n, d_i=d_i).to(DEVICE)
     projector = RoutePrimaryProjector(d_in=d_in, pc_dim=CFG.capsule_pc_dim).to(DEVICE)
     class_names = ["alive", "death"]
+    label_names = class_names
 
     cap_head = CapsuleMortalityHead(
         pc_dim=CFG.capsule_pc_dim,
@@ -3192,7 +3194,7 @@ def main():
         act_temperature=1.0,
         detach_priors=False,
         route_debug=False,
-        label_names=label_names,
+        label_names = class_names,
         split_name="TEST",
     )
 
