@@ -2,6 +2,9 @@ from __future__ import annotations
 import os as _os
 _os.environ.setdefault("HF_HOME", _os.path.expanduser("~/.cache/huggingface"))
 _os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+_os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+_os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
 import os
 import json
 import argparse
@@ -42,10 +45,8 @@ from routing_and_heads import (
     forward_capsule_from_route_dict,
     route_given_pheno,
 )
+from env_config import ROUTE_NAMES, N_ROUTES
 
-
-ROUTE_NAMES = ["L","N","I","LN","NL","LI","IL","NI","IN","LNI"]
-N_ROUTES = len(ROUTE_NAMES)
 
 def grads_are_finite(param_list):
     for p in param_list:
@@ -68,7 +69,7 @@ def seed_worker(worker_id: int):
     global TOKENIZER, MAXLEN
     if TOKENIZER is None:
         from transformers import AutoTokenizer
-        TOKENIZER = AutoTokenizer.from_pretrained(CFG.text_model_name)
+        TOKENIZER = AutoTokenizer.from_pretrained(CFG.text_model_name, local_files_only=True)
         MAXLEN = int(getattr(CFG, "max_text_len", 512))
 
 def _standardize_id_column(df: pd.DataFrame, name="stay_id") -> pd.DataFrame:
@@ -228,9 +229,15 @@ def debug_routing_tensor(
             K_found = rc.shape[k_dim]
             if int(K_found) != int(expect_k):
                 print(f"[debug] {name}: WARNING K mismatch: got K={K_found} but expect_k={expect_k} (k_dim={k_dim})")
-        s_routes = rc.sum(dim=routes_dim)
-        print(f"[debug] sum_over_routes(dim={routes_dim}): mean={s_routes.float().mean().item():.6f} "
-              f"min={s_routes.float().min().item():.6f} max={s_routes.float().max().item():.6f}")
+        # If this tensor is supposed to be p(route|phenotype), then sum over routes should be 1.
+        # If it's p(phenotype|route), then sum over phenotypes should be 1.
+        s_over_routes = rc.sum(dim=routes_dim)
+        s_over_k = rc.sum(dim=k_dim)
+
+        print(f"[debug] sum_over_routes(dim={routes_dim}): mean={s_over_routes.float().mean().item():.6f} "
+              f"min={s_over_routes.float().min().item():.6f} max={s_over_routes.float().max().item():.6f}")
+        print(f"[debug] sum_over_K(dim={k_dim}): mean={s_over_k.float().mean().item():.6f} "
+              f"min={s_over_k.float().min().item():.6f} max={s_over_k.float().max().item():.6f}")
 
         if routes_dim == 1:
             print("[debug] rc[0, :, 0] (routes for phenotype0):", rc[0, :, 0].detach().float().cpu().tolist())
@@ -336,7 +343,7 @@ def print_phenotype_routing_heatmap(
         # Means over batch
         rc_mean = rc.mean(dim=0).numpy()          # [R,K]  mean p(route|pheno)
         pa_mean = pa.mean(dim=0).numpy()          # [R]    mean primary_act
-        eff_mean = rc_mean * pa_mean[:, None]     # [R,K]  mean effective
+        eff_mean = (rc * pa.unsqueeze(-1)).mean(dim=0).numpy()
 
         routes = ROUTE_NAMES
         if len(routes) != R:
@@ -415,7 +422,7 @@ def save_routing_heatmap(
 
         rc_mean = rc.mean(dim=0).numpy()          # [R,K] p(route|pheno)
         pa_mean = pa.mean(dim=0).numpy()          # [R]
-        eff_mean = rc_mean * pa_mean[:, None]     # [R,K] effective mean
+        eff_mean = (rc * pa.unsqueeze(-1)).mean(dim=0).numpy()
 
         routes = ROUTE_NAMES
         if len(routes) != R:
@@ -1432,6 +1439,12 @@ def capsule_forward_from_encoded(
 ):
     z = {"L": outL, "N": outN, "I": outI}
     route_embs_in = make_route_inputs_mult(z, mult)
+    # --- HARD CHECK: ensure we truly have all expected routes ---
+    missing = [r for r in ROUTE_NAMES if r not in route_embs_in]
+    extra   = [r for r in route_embs_in.keys() if r not in ROUTE_NAMES]
+    assert not missing, f"Missing routes from make_route_inputs_mult: {missing}. Present: {sorted(route_embs_in.keys())}"
+    assert not extra,   f"Unexpected routes produced: {extra}. Expected only: {ROUTE_NAMES}"
+
     if route_adapter is not None:
         route_embs_in = route_adapter(route_embs_in)
     return forward_capsule_from_route_dict(
@@ -1445,11 +1458,18 @@ def capsule_forward_from_encoded(
     )
 
 def _clamp_norm(x: torch.Tensor, max_norm: float = 20.0) -> torch.Tensor:
-    if x.ndim < 2:
-        return x
-    n = x.norm(dim=1, keepdim=True) + 1e-6
-    scale = torch.clamp(max_norm / n, max=1.0)
-    return x * scale
+    if x.ndim == 2:
+        # [B, D] -> clamp across D
+        n = x.norm(dim=1, keepdim=True) + 1e-6
+        scale = torch.clamp(max_norm / n, max=1.0)
+        return x * scale
+    elif x.ndim == 3:
+        # [B, T, D] -> clamp across D
+        n = x.norm(dim=2, keepdim=True) + 1e-6
+        scale = torch.clamp(max_norm / n, max=1.0)
+        return x * scale
+    return x
+
 
 
 def _safe_tensor(x: torch.Tensor, name: str = "") -> torch.Tensor:
@@ -1482,6 +1502,45 @@ def _has_nonfinite(*tensors: torch.Tensor) -> bool:
         if not torch.isfinite(t).all():
             return True
     return False
+
+
+def coerce_rc_to_report(
+    rc_raw: torch.Tensor,
+    prim_acts: torch.Tensor,
+    route_mask: Optional[torch.Tensor],
+    split_name: str = "",
+    atol: float = 1e-3,
+):
+    """
+    Returns rc_report shaped [B,R,K] that is p(route|phenotype) normalized over routes (dim=1).
+    Auto-detects whether rc_raw is already p(route|pheno) or is p(pheno|route).
+    """
+    assert rc_raw.ndim == 3, f"{split_name}.rc_raw must be [B,R,K], got {tuple(rc_raw.shape)}"
+
+    s_over_routes = rc_raw.float().sum(dim=1)  # [B,K]
+    s_over_k      = rc_raw.float().sum(dim=2)  # [B,R]
+
+    err_routes = (s_over_routes - 1.0).abs().max().item()
+    err_k      = (s_over_k      - 1.0).abs().max().item()
+
+    ok_routes = err_routes < atol
+    ok_k      = err_k      < atol
+
+
+    if ok_routes:
+        # already p(route|pheno)
+        return rc_raw, "rc_raw is already p(route|phenotype) (sum over routes == 1)"
+
+    if ok_k:
+        # looks like p(pheno|route) -> convert
+        rc_report = route_given_pheno(rc_raw, prim_acts, route_mask=route_mask)
+        return rc_report, "converted rc_raw from p(phenotype|route) -> p(route|phenotype)"
+
+    # fallback: we don't know, but downstream expects normalization over routes
+    rc = torch.clamp(rc_raw, 1e-8, 1.0)
+    rc = rc / rc.sum(dim=1, keepdim=True).clamp(min=1e-8)
+    return rc, "WARNING: rc_raw not normalized over routes or K; renormalized over routes as fallback"
+
 
 @torch.no_grad()
 def evaluate_epoch(
@@ -1560,12 +1619,24 @@ def evaluate_epoch(
                 assert rc_raw.ndim == 3, f"rc_raw must be [B,R,K], got {tuple(rc_raw.shape)}"
                 assert int(rc_raw.shape[1]) == int(N_ROUTES), f"Expected R={N_ROUTES}, got {int(rc_raw.shape[1])}"
 
-                rc_report = route_given_pheno(
-                    rc_raw, prim_acts,
-                    route_mask=route_mask,  
-                )  
+                # rc_raw should be p(k | r) in most capsule routing implementations:
+                # -> sum over K (dim=2) should be ~1 for every route r
+                if bidx == 0:
+                    sR = rc_raw.sum(dim=1)  # [B,K]
+                    sK = rc_raw.sum(dim=2)  # [B,R]
+                    print(f"[debug] {split_name}.rc_raw sum over routes (dim=1) mean/min/max:",
+                          float(sR.mean()), float(sR.min()), float(sR.max()))
+                    print(f"[debug] {split_name}.rc_raw sum over K (dim=2) mean/min/max:",
+                          float(sK.mean()), float(sK.min()), float(sK.max()))
+
+
+                rc_report, info = coerce_rc_to_report(rc_raw, prim_acts, route_mask, split_name=split_name)
                 assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name=f"{split_name}.rc_report")
                 routing_coef = rc_report
+
+                if bidx == 0:
+                    print(f"[debug] {split_name}.rc_report info:", info)
+
 
                 if bidx == 0:
                     debug_routing_tensor(
@@ -1837,6 +1908,7 @@ def epoch_metrics(y_true, p, y_pred):
         f1_score,
         recall_score,
         confusion_matrix,
+        precision_score,
     )
 
     y_true = np.asarray(y_true)
@@ -1850,6 +1922,8 @@ def epoch_metrics(y_true, p, y_pred):
     auprc_per_label = np.full(K, np.nan, dtype=float)
     f1_per_label    = np.full(K, np.nan, dtype=float)
     rec_per_label   = np.full(K, np.nan, dtype=float)
+    prec_per_label  = np.full(K, np.nan, dtype=float)
+
 
     for k in range(K):
         yk  = y_true[:, k]
@@ -1887,6 +1961,14 @@ def epoch_metrics(y_true, p, y_pred):
         except Exception:
             pass
 
+        try:
+            pk_prec = precision_score(yk, ypk, zero_division=0)
+            precs.append(pk_prec)
+            prec_per_label[k] = pk_prec
+        except Exception:
+            pass
+
+
     out = {}
 
     # Macro metrics
@@ -1894,11 +1976,15 @@ def epoch_metrics(y_true, p, y_pred):
     out["AUPRC_macro"]  = float(np.nanmean(auprcs)) if len(auprcs) > 0 else float("nan")
     out["F1_macro"]     = float(np.nanmean(f1s))    if len(f1s) > 0 else float("nan")
     out["Recall_macro"] = float(np.nanmean(recs))   if len(recs) > 0 else float("nan")
+    out["Precision_macro"] = float(np.nanmean(precs)) if len(precs) > 0 else float("nan")
+
 
     out["AUROC"]  = out["AUROC_macro"]
     out["AUPRC"]  = out["AUPRC_macro"]
     out["F1"]     = out["F1_macro"]
     out["Recall"] = out["Recall_macro"]
+    out["Precision"] = out["Precision_macro"]   # if you want a single key like others
+
 
     # Micro metrics
     y_flat  = y_true.reshape(-1)
@@ -1929,6 +2015,8 @@ def epoch_metrics(y_true, p, y_pred):
     out["Precision_micro"] = micro_prec
     out["Recall_micro"]    = micro_rec
     out["F1_micro"]        = micro_f1
+    out["Precision_per_label"] = prec_per_label
+
 
     # Example-based F1
     example_f1s = []
@@ -2113,6 +2201,7 @@ def generate_split_heatmaps_and_tables(
         epoch_idx=None,
         split_name=split_name,
         routing_out_dir=None,
+        thr=thr_val,
     )
 
     if rc_mat is None:
@@ -2264,7 +2353,7 @@ def main():
     print("[env_config] Device:", DEVICE)
     print("[env_config] CFG:", json.dumps(asdict(CFG), indent=2))
     global TOKENIZER, MAXLEN
-    TOKENIZER = AutoTokenizer.from_pretrained(CFG.text_model_name)
+    TOKENIZER = AutoTokenizer.from_pretrained(CFG.text_model_name, local_files_only=True)
     MAXLEN = int(_cfg("max_text_len", 512))
     print(f"[setup] DEVICE={DEVICE} | batch_size={args.batch_size} | epochs={args.epochs}")
 
@@ -2608,19 +2697,19 @@ def main():
                     assert rc_raw.ndim == 3, f"routing_coef must be [B,R,K], got {tuple(rc_raw.shape)}"
                     assert int(rc_raw.shape[1]) == int(N_ROUTES), f"Expected R={N_ROUTES}, got {tuple(rc_raw.shape)}"
 
-                    sR = rc_raw.sum(dim=1)  # [B,K] sum over routes
-                    if not torch.allclose(sR, torch.ones_like(sR), atol=1e-3, rtol=0.0):
-                        print("[warn] TRAIN rc_raw not normalized over ROUTES. max|sumR-1|=",
-                              (sR - 1).abs().max().item())
-
-
-
-                    rc_report = route_given_pheno(rc_raw, prim_acts, route_mask=route_mask)
+                    rc_report, info = coerce_rc_to_report(rc_raw, prim_acts, route_mask, split_name="TRAIN")
                     assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name="TRAIN.rc_report")
                     routing_coef = rc_report
 
                     if (epoch == start_epoch) and (step == 0):
-                        debug_route_exact_zero(rc_raw, routing_coef, route_mask, split_name="TRAIN", step_tag="e0s0", routes=ROUTE_NAMES)
+                        sR = routing_coef.sum(dim=1)  # [B,K]
+                        sK = routing_coef.sum(dim=2)  # [B,R]
+                        print("[debug] TRAIN.rc_report info:", info)
+                        print("[debug] TRAIN.rc_report sum over routes (dim=1) mean/min/max:",
+                              float(sR.mean()), float(sR.min()), float(sR.max()))
+                        print("[debug] TRAIN.rc_report sum over K (dim=2) mean/min/max:",
+                              float(sK.mean()), float(sK.min()), float(sK.max()))
+
 
                     if bool(getattr(args, "route_debug", False)) and (epoch == start_epoch) and (step == 0):
                         debug_routing_tensor(
@@ -2629,6 +2718,7 @@ def main():
                             expect_routes=N_ROUTES,
                             expect_k=int(y.size(1)),
                         )
+
                 logits    = _safe_tensor(logits.float(),     "logits(fp32)")
                 prim_acts = _safe_tensor(prim_acts.float(), "prim_acts(fp32)")
 
@@ -2642,21 +2732,22 @@ def main():
                 cur_epoch = float(epoch + 1)
 
                 if routing_coef is not None:
-                    rc = torch.clamp(routing_coef, 1e-6, 1.0)  # [B,R,K], sums to 1 over routes
+                    rc = routing_coef.float().clamp(1e-6, 1.0)  # [B,R,K], sums to 1 over routes
 
                     # (1) Entropy over routes PER phenotype (avoid route collapse per K)
-                    if route_entropy_lambda > 0.0 and (route_entropy_warmup_epochs <= 0 or cur_epoch <= route_entropy_warmup_epochs):
-                        H = -(rc * rc.log()).sum(dim=1).mean()   # sum routes -> [B,K], mean over B,K
-                        loss = loss - route_entropy_lambda * H   # maximize entropy
+                    if route_entropy_lambda > 0.0 and (route_entropy_warmup_epochs <= 0 or cur_epoch > route_entropy_warmup_epochs):
+                        H = -(rc * rc.log()).sum(dim=1).mean()
+                        loss = loss - route_entropy_lambda * H
+
 
                     # (2) Uniform route usage globally (aggregate across B and K)
-                    if route_uniform_lambda > 0.0 and (route_uniform_warmup_epochs <= 0 or cur_epoch <= route_uniform_warmup_epochs):
+                    if route_uniform_lambda > 0.0 and (route_uniform_warmup_epochs <= 0 or cur_epoch > route_uniform_warmup_epochs):
                         rc_mean_r = rc.mean(dim=(0, 2))          # [R]
                         target = torch.full_like(rc_mean_r, 1.0 / rc_mean_r.numel())
                         uniform_loss = ((rc_mean_r - target) ** 2).sum()
                         loss = loss + route_uniform_lambda * uniform_loss
 
-            grad_clip = float(_cfg("grad_clip", 0.3))
+            grad_clip = float(_cfg("grad_clip_norm", 1.0))
             if not torch.isfinite(loss):
                 print(f"[skip] non-finite loss at epoch={epoch+1} step={step+1} -> skip")
                 safe_zero_grad(optimizer)
@@ -2723,10 +2814,37 @@ def main():
                 print(msg)
                 if max(avg_act) > 0.95:
                     dom_route = int(np.argmax(avg_act))
+
+
+                    if routing_coef is not None:
+                        rc = routing_coef.detach().float()          # [B,R,K]
+                        rc_mass = rc.mean(dim=2)                    # [B,R]
+
+                        # mean route mass distribution
+                        p = (rc_mass.mean(dim=0) + 1e-8)            # [R]
+                        p = p / p.sum()
+
+                        H = (-p * p.log()).sum().item()
+
+                        # your effective mean already printed in msg, but we print a scalar + top route
+                        rc_top_val = float(p.max().item())
+                        rc_top_idx = int(p.argmax().item())
+
+                        # activation top (from avg_act)
+                        act_top_val = float(max(avg_act))
+                        act_top_idx = int(np.argmax(avg_act))
+
+                        print(
+                            f"[collapse dbg] rc_entropy={H:.4f} rc_top={rc_top_val:.4f} rc_top_route={routes[rc_top_idx]} "
+                            f"| act_top={act_top_val:.4f} act_top_route={routes[act_top_idx]}"
+                        )
+
+                    # keep your existing alert
                     print(
                         f"[alert] potential collapse → route={routes[dom_route]} "
                         f"mean={max(avg_act):.3f}"
                     )
+
 
         train_loss = total_loss / max(1, num_samples)
         train_acc  = total_correct / max(1, total)
@@ -2945,6 +3063,42 @@ def main():
         f"[TEST] (VAL-thresholds, CALIBRATED probs) MACRO  AUROC={mt['AUROC']:.4f} "
         f"AUPRC={mt['AUPRC']:.4f} F1={mt['F1']:.4f} Recall={mt['Recall']:.4f}"
     )
+
+    # ----------------------------
+    # Per-phenotype TEST metrics
+    # ----------------------------
+    auroc_t  = mt["AUROC_per_label"]
+    auprc_t  = mt["AUPRC_per_label"]
+    f1_t     = mt["F1_per_label"]
+    rec_t    = mt["Recall_per_label"]
+    prec_t   = mt["Precision_per_label"]
+
+    print("\n[TEST] Per-phenotype metrics (CALIBRATED probs, VAL thresholds):")
+    for k, name in enumerate(label_names):
+        print(
+            f"  {name:60s} "
+            f"AUROC={auroc_t[k]:.4f} "
+            f"AUPRC={auprc_t[k]:.4f} "
+            f"F1={f1_t[k]:.4f} "
+            f"Recall={rec_t[k]:.4f} "
+            f"Precision={prec_t[k]:.4f}"
+        )
+
+    # Save CSV (sorted by AUROC desc)
+    df_test = pd.DataFrame({
+        "phenotype": label_names,
+        "AUROC": auroc_t,
+        "AUPRC": auprc_t,
+        "F1": f1_t,
+        "Recall": rec_t,
+        "Precision": prec_t,
+        "Prevalence_TEST": y_true_t_log.mean(axis=0),
+    })
+    df_test = df_test.sort_values("AUROC", ascending=False)
+    csv_path = os.path.join(ckpt_dir, "test_per_phenotype_metrics.csv")
+    df_test.to_csv(csv_path, index=False, float_format="%.6f")
+    print(f"[TEST] Saved per-phenotype metrics CSV → {csv_path}")
+
 
     ece_unc, centers_unc, bconf_unc, bacc_unc, _ = expected_calibration_error(
         p_test_uncal.reshape(-1), y_true_t_log.reshape(-1), n_bins=args.calib_bins
