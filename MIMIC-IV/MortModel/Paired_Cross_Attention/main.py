@@ -88,7 +88,6 @@ def print_route_matrix_detailed(
     rc_is_report: bool = True,
 ):
     with torch.no_grad():
-        # pick which routing tensor to display
         rc_src = rc_report if rc_is_report else rc_raw
         rc = rc_src.detach().float().cpu()         # [B,R,K]
         pa = prim_acts.detach().float().cpu()      # [B,R]
@@ -188,7 +187,7 @@ def encode_all_modalities(
             pad_chunks = (chunk_mask < 0.5)                               # [B,S]
             if pad_chunks.any():
                 cls_id = int(getattr(TOKENIZER, "cls_token_id", 101))
-                b_idx, s_idx = pad_chunks.nonzero(as_tuple=True)   # indices of padded chunks
+                b_idx, s_idx = pad_chunks.nonzero(as_tuple=True)   
                 notes_ids[b_idx, s_idx, 0]  = cls_id
                 notes_attn[b_idx, s_idx, 0] = 1
         notes_batch = {
@@ -339,7 +338,6 @@ def print_label_routing_heatmap(
 
         routes = ROUTE_NAMES
         if len(routes) != R:
-            # don't hard-crash, but make it obvious
             print(f"[warn] ROUTE_NAMES has len={len(routes)} but routing_coef has R={R}. Using first R names.")
             routes = routes[:R] if len(routes) >= R else routes + [f"route_{i}" for i in range(len(routes), R)]
 
@@ -398,8 +396,6 @@ def save_routing_heatmap(
         rc_mean = rc.mean(dim=0).numpy()     # [N_ROUTES, K]
         pa_mean = pa.mean(dim=0).numpy()     # [N_ROUTES]
 
-        # IMPORTANT:
-        # - If routing_coef is rc_report = p(route|mortality), it's already "effective".
         effective = rc_mean
 
         routes = ROUTE_NAMES
@@ -517,7 +513,6 @@ def save_heatmap_with_numbers(
 
     n_rows, n_cols = mat_norm.shape
 
-    # Bigger figure for readability (scales with size)
     w = max(10, 0.9 * n_cols + 6)
     h = max(6,  0.35 * n_rows + 4)
 
@@ -528,7 +523,6 @@ def save_heatmap_with_numbers(
     plt.xticks(np.arange(n_cols), col_names, fontsize=fontsize_ticks, rotation=0)
     plt.yticks(np.arange(n_rows), row_names, fontsize=fontsize_ticks)
 
-    # annotate raw values
     for i in range(n_rows):
         for j in range(n_cols):
             plt.text(
@@ -707,7 +701,6 @@ def pretok_batch_notes(batch_notes: List[List[str]]):
                 "input_ids": torch.zeros(0, MAXLEN, dtype=torch.long),
                 "attention_mask": torch.zeros(0, MAXLEN, dtype=torch.long),
             })
-
             continue
 
         all_ids, all_attn = [], []
@@ -792,7 +785,6 @@ def coerce_packed_ehr(x, stay_id: int, T: int = 48, F: int = 76) -> np.ndarray:
     if isinstance(x, (list, tuple, np.ndarray)):
         arr0 = np.asarray(x, dtype=object)
         if arr0.ndim == 1:
-            # object array of rows -> stack
             if arr0.dtype == object and arr0.size > 0 and isinstance(arr0[0], (list, tuple, np.ndarray)):
                 rows = [np.asarray(r, dtype=np.float32) for r in arr0.tolist()]
                 try:
@@ -803,7 +795,6 @@ def coerce_packed_ehr(x, stay_id: int, T: int = 48, F: int = 76) -> np.ndarray:
                         f"len={len(rows)} first_row_shape={getattr(rows[0],'shape',None)} err={e}"
                     )
             else:
-                # maybe flat numeric
                 try:
                     arr_num = np.asarray(x, dtype=np.float32)
                 except Exception:
@@ -889,8 +880,6 @@ def resolve_image_path(p: str, dataset_root: str) -> str:
     if image_root:
         return os.path.join(image_root, p)
     return os.path.join(dataset_root, p)
-
-
 
 def is_probably_image_file(p: str) -> bool:
     ext = os.path.splitext(str(p).lower())[1]
@@ -1021,7 +1010,6 @@ class ICUStayDataset(Dataset):
         self.images = _standardize_id_column(pd.read_parquet(images_fp))
         self.images = _standardize_image_path_column(self.images)
         self.labels = _standardize_id_column(pd.read_parquet(labels_fp))
-
 
         sample = self.images["cxr_path"].dropna().astype(str)
         sample = sample[sample.str.strip().ne("")]
@@ -1204,8 +1192,6 @@ class ICUStayDataset(Dataset):
 
         xs = torch.from_numpy(xs_np)        # [T,F]
 
-
-        # notes: use the first row for this stay_id (you can change policy later if needed)
         df_n = self.notes[self.notes.stay_id == stay_id]
         if df_n.empty:
             raise RuntimeError(f"[ICUStayDataset] stay_id={stay_id} missing notes row")
@@ -1243,15 +1229,12 @@ class ICUStayDataset(Dataset):
                 ids = _cell_to_list(row.get(c_id, None))
                 msk = _cell_to_list(row.get(c_m, None))
 
-                # Must have content in both
                 if len(ids) == 0 or len(msk) == 0:
                     continue
 
-                # Safety: ids/mask should align
                 if len(ids) != len(msk):
                     continue
 
-                # Key fix: ignore all-padding chunks (mask sum == 0)
                 if np.sum(np.asarray(msk, dtype=np.int64)) <= 0:
                     continue
 
@@ -1274,48 +1257,30 @@ class ICUStayDataset(Dataset):
                 "input_ids": ids_chunks,
                 "attention_mask": attn_chunks,
             }
-        # images: choose the last *valid existing* path for this stay
         df_i = self.images[self.images.stay_id == stay_id]
         if df_i.empty:
             raise RuntimeError(f"[ICUStayDataset] stay_id={stay_id} missing images row")
 
         raw_paths = df_i.cxr_path.dropna().astype(str).tolist()
         raw_paths = [p for p in raw_paths if str(p).strip()]
-
-        # resolve relative -> absolute using *dataset* root
         cand = [resolve_image_path(p, self.root) for p in raw_paths]
-
-        # filter: looks like image + exists
         cand = [p for p in cand if is_probably_image_file(p) and os.path.exists(p)]
-
         if not cand:
-            # print a useful debug message before failing
             sample_show = raw_paths[:3]
             raise RuntimeError(
                 f"[ICUStayDataset] stay_id={stay_id} has no valid existing image files. "
                 f"Example raw paths: {sample_show} | dataset_root={self.root}"
             )
 
-        img_paths = [cand[-1]]  # keep last valid only (stable policy)
-
-
-        # multi-label phenotype target [K]
-        # ---- binary mortality target (single label) ----
+        img_paths = [cand[-1]]  
         lab_row = self.labels[self.labels.stay_id == stay_id]
         if lab_row.empty:
             raise RuntimeError(f"[ICUStayDataset] Missing labels for stay_id={stay_id}")
 
-        # If labels_mortality.parquet has ONE label column, use it.
-        # (If it has multiple columns, we take the first after sorting.)
         col = self.label_cols[0]
         y0 = lab_row[col].iloc[0]
-
-        # force 0/1
         y0 = 0 if (y0 is None or (isinstance(y0, float) and np.isnan(y0))) else int(float(y0) > 0.0)
-
-        y = torch.tensor(y0, dtype=torch.long)   # scalar: 0/1
-
-
+        y = torch.tensor(y0, dtype=torch.long)   
         return {
             "stay_id": stay_id,
             "x_struct": xs,
@@ -1337,9 +1302,7 @@ def load_cxr_tensor(paths: List[str], tfms: T.Compose, return_path: bool = False
     if not paths:
         tensor = torch.zeros(3, 224, 224)
         return (tensor, "<none>") if return_path else tensor
-
     p_full = str(paths[-1]).strip()
-
     if not p_full or not os.path.exists(p_full):
         print(f"[warn] image path missing/does not exist: {p_full} -> returning zero tensor")
         tensor = torch.zeros(3, 224, 224)
@@ -1365,19 +1328,13 @@ def load_cxr_tensor(paths: List[str], tfms: T.Compose, return_path: bool = False
                 return (tensor, p_full) if return_path else tensor
         else:
             img = Image.open(p_full)
-
-        # Make sure PIL image is in a consistent mode
-        # (your transforms start with Grayscale->3ch; still good to ensure load works)
         img = img.convert("RGB")
 
         tensor = tfms(img)
-
     except Exception as e:
         print(f"[warn] failed to open image: {p_full} ({e}) -> returning zero tensor")
         tensor = torch.zeros(3, 224, 224)
-
     return (tensor, p_full) if return_path else tensor
-
 
 
 def collate_fn_factory(tidx: int, img_tfms: T.Compose):
@@ -1395,16 +1352,12 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
         xL_batch = torch.stack(
             [pad_or_trim_struct(b["x_struct"], T_len, F_dim) for b in batch], dim=0
         )
-
         lengths = torch.tensor([b["x_struct"].shape[0] for b in batch], dtype=torch.long)
-        
         idx = torch.arange(T_len).unsqueeze(0)  # [1, T_len]
         start = (T_len - torch.clamp(lengths, max=T_len)).unsqueeze(1)  # [B,1]
         mL_batch = (idx >= start).float()     # [B,T]
-
-        notes_list = [b["notes"] for b in batch]  # list of per-sample dicts
-        prep = prepare_notes_batch(notes_list)    # list of {"input_ids":[S_i,L], "attention_mask":[S_i,L]}
-
+        notes_list = [b["notes"] for b in batch] 
+        prep = prepare_notes_batch(notes_list)    
         L = int(getattr(CFG, "max_text_len", 512))
         S_cap = int(getattr(CFG, "notes_max_chunks", -1))
         S_max = max((p["input_ids"].shape[0] for p in prep), default=0)
@@ -1413,7 +1366,6 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
         else:
             S = S_max
         S = max(S, 1)
-
         B = len(prep)
         notes_ids  = torch.zeros((B, S, L), dtype=torch.long)
         notes_attn = torch.zeros((B, S, L), dtype=torch.long)
@@ -1520,7 +1472,6 @@ def capsule_forward_from_encoded(
     return_routing: bool = True,
 ):
     z = {"L": outL, "N": outN, "I": outI}
-
     route_embs_in = make_route_inputs_mult(z, mult)
     route_embs_in, route_mask = _coerce_route_embs(route_embs_in, route_mask, ROUTE_NAMES)
     if route_adapter is not None:
@@ -1559,7 +1510,6 @@ def _coerce_route_embs(route_embs_in: Dict[str, Any],
     B, D = any_v.shape
     dev = any_v.device
     dt  = any_v.dtype
-
     missing = [r for r in routes if r not in out]
     if missing:
         print("[warn] missing routes from make_route_inputs_mult:", missing)
@@ -1569,7 +1519,6 @@ def _coerce_route_embs(route_embs_in: Dict[str, Any],
             for r in missing:
                 j = routes.index(r)
                 route_mask[:, j] = 0.0
-
     return out, route_mask
 
 
@@ -1580,7 +1529,6 @@ def _clamp_norm(x: torch.Tensor, max_norm: float = 20.0) -> torch.Tensor:
     scale = torch.clamp(max_norm / n, max=1.0)
     return x * scale
 
-
 def _safe_tensor(x: torch.Tensor, name: str = "") -> torch.Tensor:
     if not torch.isfinite(x).all():
         n_nan = (~torch.isfinite(x)).sum().item()
@@ -1588,19 +1536,14 @@ def _safe_tensor(x: torch.Tensor, name: str = "") -> torch.Tensor:
         x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
     return x
 
-
 def _sanitize_encoder_out(out: Dict[str, torch.Tensor], name: str) -> Dict[str, torch.Tensor]:
     out2 = dict(out)
-
     if "seq" in out2 and out2["seq"] is not None:
         out2["seq"] = _safe_tensor(_clamp_norm(out2["seq"].float(), 20.0), f"{name}.seq").float()
-
     if "pool" in out2 and out2["pool"] is not None:
         out2["pool"] = _safe_tensor(_clamp_norm(out2["pool"].float(), 20.0), f"{name}.pool").float()
-
     if "mask" in out2 and out2["mask"] is not None:
         out2["mask"] = out2["mask"].float()
-
     return out2
 
 
@@ -1676,26 +1619,21 @@ def evaluate_epoch(
                 return_routing=True,
             )
 
-
             logits, prim_acts, route_embs = out[0], out[1], out[2]
-
             rc_raw = out[3] if len(out) > 3 else None
             rc_report = None
-
 
             if rc_raw is not None:
                 assert rc_raw.ndim == 3, f"rc_raw must be [B,R,K], got {tuple(rc_raw.shape)}"
                 assert int(rc_raw.shape[1]) == int(N_ROUTES), f"Expected R={N_ROUTES}, got {int(rc_raw.shape[1])}"
 
-                # raw should sum to 1 over routes
                 assert_routing_over_routes(rc_raw, routes_dim=1, atol=1e-2, name=f"{split_name}.rc_raw")
 
-                # THIS is what you want to interpret / average / heatmap
                 rc_report = route_given_pheno(rc_raw, prim_acts, route_mask=route_mask)
                 assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name=f"{split_name}.rc_report")
 
                 if bidx == 0:
-                    expect_k = int(logits.size(1))  # <-- 2 for mortality (alive/death)
+                    expect_k = int(logits.size(1))  
                     debug_routing_tensor(rc_raw,    name=f"{split_name}.rc_raw",    expect_routes=N_ROUTES, expect_k=expect_k)
                     debug_routing_tensor(rc_report, name=f"{split_name}.rc_report", expect_routes=N_ROUTES, expect_k=expect_k)
 
@@ -1706,7 +1644,6 @@ def evaluate_epoch(
             if route_debug and bidx == 0:
                 mask_stats(mL, name=f"{split_name}.mL_batch")
 
-
             logits    = _safe_tensor(logits.float(),    "eval.logits(fp32)")
             prim_acts = _safe_tensor(prim_acts.float(), "eval.prim_acts(fp32)")
 
@@ -1715,7 +1652,6 @@ def evaluate_epoch(
 
                 rc_raw_cpu    = rc_raw.detach().float().cpu()       # [B,R,K]
                 rc_report_cpu = rc_report.detach().float().cpu()    # [B,R,K]
-
                 raw_sum = rc_raw_cpu.sum(dim=0)        # [R,K]
                 rep_sum = rc_report_cpu.sum(dim=0)     # [R,K]
 
@@ -1726,8 +1662,6 @@ def evaluate_epoch(
                 rc_sum_mat  += raw_sum
                 rep_sum_mat += rep_sum
 
-
-
             if route_debug and (rc_raw is not None) and (rc_report is not None) and bidx == 0:
                 K = int(logits.size(1))
                 if label_names is not None and len(label_names) >= K:
@@ -1735,18 +1669,17 @@ def evaluate_epoch(
                 else:
                     names = [f"class_{i}" for i in range(K)]
 
-
                 print_route_matrix_detailed(
                     rc_raw=rc_raw,
                     rc_report=rc_report,
                     prim_acts=prim_acts,
                     label_names=names,
                     where=f"{split_name} Batch {bidx}",
-                    rc_is_report=True,   # shows p(route | label)
+                    rc_is_report=True,  
                 )
 
                 print_label_routing_heatmap(
-                    routing_coef=rc_report,   # IMPORTANT: pass report if rc_is_report=True
+                    routing_coef=rc_report,   
                     prim_acts=prim_acts,
                     label_names=names,
                     where=f"{split_name} Epoch {epoch_idx if epoch_idx is not None else '?'}",
@@ -1757,7 +1690,7 @@ def evaluate_epoch(
                 if routing_out_dir is not None and epoch_idx is not None:
                     where_tag = f"{split_name.lower()}_epoch{epoch_idx:03d}"
                     save_routing_heatmap(
-                        routing_coef=rc_report,  # IMPORTANT
+                        routing_coef=rc_report,  
                         prim_acts=prim_acts,
                         label_names=names,
                         where=where_tag,
@@ -1783,8 +1716,7 @@ def evaluate_epoch(
                 )
                 if route_debug and bidx == 0:
                     route_cosine_report(route_embs)
-
-            loss = loss_fn(logits, y)   # CE expects y long
+            loss = loss_fn(logits, y)   
 
         total_loss += float(loss.item()) * y.size(0)
         p_death = torch.softmax(logits, dim=1)[:, 1]
@@ -1796,7 +1728,6 @@ def evaluate_epoch(
 
     avg_loss = total_loss / max(1, num_samples)
     avg_acc  = total_correct / max(1, total)
-
     avg_pa = (act_sum / max(1, num_samples)).numpy()  # [10]
     avg_act_dict = {r: float(avg_pa[i]) for i, r in enumerate(route_names)}
 
@@ -1805,10 +1736,7 @@ def evaluate_epoch(
         avg_rc_report_mat = (rep_sum_mat / num_samples).numpy()   # [R,K]
     else:
         avg_rc_report_mat = None
-
     return avg_loss, avg_acc, avg_act_dict, avg_rc_report_mat, avg_pa
-
-
 
 def save_checkpoint(path: str, state: Dict):
     ensure_dir(os.path.dirname(path))
@@ -1821,7 +1749,6 @@ def load_checkpoint(path: str, behrt, bbert, imgenc, mult, route_adapter, projec
     imgenc.load_state_dict(ckpt["imgenc"])
     mult.load_state_dict(ckpt["mult"])
     route_adapter.load_state_dict(ckpt["route_adapter"])
-
 
     projector.load_state_dict(ckpt["projector"])
     cap_head.load_state_dict(ckpt["cap_head"])
@@ -1881,7 +1808,6 @@ def collect_epoch_logits(
             )
             logits = _safe_tensor(out[0].float(), "collect_logits.logits(fp32)")
 
-
         ys.append(y.detach().cpu())
         ls.append(logits.detach().cpu())
         ids += dbg.get("stay_ids", [])
@@ -1898,7 +1824,6 @@ def fit_temperature_scalar_from_val(
     lr: float = 0.05,
 ):
     import torch.nn.functional as F
-
     # logits: [N,2]
     val_logits_t = torch.tensor(val_logits, dtype=torch.float32, device=DEVICE)
 
@@ -1906,10 +1831,8 @@ def fit_temperature_scalar_from_val(
     y = np.asarray(val_y_true)
     y = y.reshape(-1)
     val_y_t = torch.tensor(y, dtype=torch.long, device=DEVICE)
-
     logT = torch.zeros((), device=DEVICE, requires_grad=True)
     opt = torch.optim.Adam([logT], lr=lr)
-
     best_T = 1.0
     best_loss = float("inf")
 
@@ -1924,7 +1847,6 @@ def fit_temperature_scalar_from_val(
         if l < best_loss:
             best_loss = l
             best_T = float(torch.exp(logT).detach().cpu().item())
-
     return float(np.clip(best_T, 0.05, 50.0))
 
 
@@ -1967,7 +1889,6 @@ def collect_epoch_outputs(
         mL = mL.to(DEVICE, non_blocking=True)
         imgs = imgs.to(DEVICE, non_blocking=True)
         y   = y.to(DEVICE,   non_blocking=True)
-
         outL, outN, outI = encode_all_modalities(
             behrt, bbert, imgenc,
             xL=xL, mL=mL, notes=notes, imgs=imgs,
@@ -1977,7 +1898,6 @@ def collect_epoch_outputs(
         with amp_ctx_caps:
             z = {"L": outL, "N": outN, "I": outI}
             route_mask = torch.ones(xL.size(0), N_ROUTES, device=DEVICE, dtype=torch.float32)
-
             out = capsule_forward_from_encoded(
                 mult=mult,
                 route_adapter=route_adapter,
@@ -2010,20 +1930,22 @@ def epoch_metrics(y_true, p, y_pred):
         average_precision_score,
         f1_score,
         recall_score,
+        precision_score,
         confusion_matrix,
-    )
+    )     
 
     y_true = np.asarray(y_true)
     p      = np.asarray(p)
     y_pred = np.asarray(y_pred)
-
     N, K = y_true.shape
 
-    aurocs, auprcs, f1s, recs = [], [], [], []
+    aurocs, auprcs, f1s, recs, precs = [], [], [], [], []
     auroc_per_label = np.full(K, np.nan, dtype=float)
     auprc_per_label = np.full(K, np.nan, dtype=float)
-    f1_per_label    = np.full(K, np.nan, dtype=float)
-    rec_per_label   = np.full(K, np.nan, dtype=float)
+
+    prec_per_label = np.full(K, np.nan, dtype=float)
+    f1_per_label   = np.full(K, np.nan, dtype=float)
+    rec_per_label  = np.full(K, np.nan, dtype=float)
 
     for k in range(K):
         yk  = y_true[:, k]
@@ -2032,7 +1954,6 @@ def epoch_metrics(y_true, p, y_pred):
 
         if len(np.unique(yk)) < 2:
             continue
-
         try:
             au = roc_auc_score(yk, pk)
             aurocs.append(au)
@@ -2061,18 +1982,28 @@ def epoch_metrics(y_true, p, y_pred):
         except Exception:
             pass
 
+        try:
+            prk = precision_score(yk, ypk, zero_division=0)
+            precs.append(prk)
+            prec_per_label[k] = prk
+        except Exception:
+            pass
+
     out = {}
 
-    # Macro metrics
-    out["AUROC_macro"]  = float(np.nanmean(aurocs)) if len(aurocs) > 0 else float("nan")
-    out["AUPRC_macro"]  = float(np.nanmean(auprcs)) if len(auprcs) > 0 else float("nan")
-    out["F1_macro"]     = float(np.nanmean(f1s))    if len(f1s) > 0 else float("nan")
-    out["Recall_macro"] = float(np.nanmean(recs))   if len(recs) > 0 else float("nan")
+    # Macro metrics 
+    out["AUROC_macro"]     = float(np.nanmean(aurocs)) if len(aurocs) > 0 else float("nan")
+    out["AUPRC_macro"]     = float(np.nanmean(auprcs)) if len(auprcs) > 0 else float("nan")
+    out["F1_macro"]        = float(np.nanmean(f1s))    if len(f1s) > 0 else float("nan")
+    out["Recall_macro"]    = float(np.nanmean(recs))   if len(recs) > 0 else float("nan")
+    out["Precision_macro"] = float(np.nanmean(precs))  if len(precs) > 0 else float("nan")
 
-    out["AUROC"]  = out["AUROC_macro"]
-    out["AUPRC"]  = out["AUPRC_macro"]
-    out["F1"]     = out["F1_macro"]
-    out["Recall"] = out["Recall_macro"]
+    # Convenient aliases
+    out["AUROC"]     = out["AUROC_macro"]
+    out["AUPRC"]     = out["AUPRC_macro"]
+    out["F1"]        = out["F1_macro"]
+    out["Recall"]    = out["Recall_macro"]
+    out["Precision"] = out["Precision_macro"]
 
     # Micro metrics
     y_flat  = y_true.reshape(-1)
@@ -2093,7 +2024,9 @@ def epoch_metrics(y_true, p, y_pred):
     fn = np.logical_and(y_flat == 1, yp_flat == 0).sum()
 
     micro_prec = float(tp) / float(tp + fp + 1e-8)
+    micro_rec  = float(fn) 
     micro_rec  = float(tp) / float(tp + fn + 1e-8)
+
     micro_f1   = (
         2.0 * micro_prec * micro_rec / (micro_prec + micro_rec + 1e-8)
         if (micro_prec + micro_rec) > 0
@@ -2103,6 +2036,7 @@ def epoch_metrics(y_true, p, y_pred):
     out["Precision_micro"] = micro_prec
     out["Recall_micro"]    = micro_rec
     out["F1_micro"]        = micro_f1
+    out["Precision_per_label"] = prec_per_label
 
     # Example-based F1
     example_f1s = []
@@ -2113,7 +2047,6 @@ def epoch_metrics(y_true, p, y_pred):
         if true_i.sum() == 0 and pred_i.sum() == 0:
             example_f1s.append(1.0)
             continue
-
         inter = np.logical_and(true_i, pred_i).sum()
         denom = true_i.sum() + pred_i.sum()
         if denom == 0:
@@ -2122,16 +2055,29 @@ def epoch_metrics(y_true, p, y_pred):
             example_f1s.append(2.0 * inter / float(denom))
 
     out["F1_example"] = float(np.mean(example_f1s)) if len(example_f1s) > 0 else float("nan")
-
     out["Hamming"] = float(np.mean(y_flat != yp_flat))
     out["CM"] = confusion_matrix(y_flat, yp_flat)
-
     out["AUROC_per_label"]  = auroc_per_label
     out["AUPRC_per_label"]  = auprc_per_label
     out["F1_per_label"]     = f1_per_label
     out["Recall_per_label"] = rec_per_label
     return out
 
+def print_metrics_block(tag: str, m: Dict[str, Any], cm: bool = True):
+    print(
+        f"[{tag}] MACRO  "
+        f"AUROC={m['AUROC']:.4f} AUPRC={m['AUPRC']:.4f} "
+        f"Precision={m.get('Precision', float('nan')):.4f} "
+        f"F1={m['F1']:.4f} Recall={m['Recall']:.4f}"
+    )
+    print(
+        f"[{tag}] MICRO  "
+        f"AUROC={m['AUROC_micro']:.4f} AUPRC={m['AUPRC_micro']:.4f} "
+        f"Precision={m['Precision_micro']:.4f} Recall={m['Recall_micro']:.4f} F1={m['F1_micro']:.4f}"
+    )
+    print(f"[{tag}] example-F1={m['F1_example']:.4f} Hamming={m['Hamming']:.4f}")
+    if cm and "CM" in m:
+        print(f"[{tag}] Confusion Matrix:\n{m['CM']}")
 
 def expected_calibration_error(p, y, n_bins=10):
     p = np.asarray(p)
@@ -2171,21 +2117,16 @@ def reliability_plot(bin_centers, bin_conf, bin_acc, out_path):
 
 def find_best_thresholds(y_true, p, n_steps: int = 50):
     from sklearn.metrics import f1_score
-
     y_true = np.asarray(y_true)
     p      = np.asarray(p)
-
     N, K = p.shape
     thresholds = np.linspace(0.01, 0.99, n_steps)
     best_t = np.full(K, 0.5, dtype=float)
-
     for k in range(K):
         yk = y_true[:, k]
         pk = p[:, k]
-
         if len(np.unique(yk)) < 2:
             continue
-
         best_f1 = 0.0
         best_thr = 0.5
         for t in thresholds:
@@ -2195,7 +2136,6 @@ def find_best_thresholds(y_true, p, n_steps: int = 50):
                 best_f1 = f1
                 best_thr = t
         best_t[k] = best_thr
-
     return best_t
 
 
@@ -2212,8 +2152,6 @@ def compute_split_prevalence(
         print(f"  {name}: {p:.4f}")
     return prev
 
-
-
 def grid_search_thresholds(
     y_true: np.ndarray,
     p: np.ndarray,
@@ -2222,20 +2160,16 @@ def grid_search_thresholds(
     y_true = np.asarray(y_true)
     p      = np.asarray(p)
     N, K = p.shape
-
     thresholds = np.linspace(0.0, 1.0, n_steps)
     best_thr = np.full(K, 0.5, dtype=float)
     best_f1 = np.zeros(K, dtype=float)
-
     from sklearn.metrics import f1_score
-
     for k in range(K):
         yk = y_true[:, k]
         pk = p[:, k]
 
         if len(np.unique(yk)) < 2:
             continue
-
         best = 0.0
         best_t = 0.5
         for t in thresholds:
@@ -2244,10 +2178,8 @@ def grid_search_thresholds(
             if f1 > best:
                 best = f1
                 best_t = t
-
         best_thr[k] = best_t
         best_f1[k] = best
-
     return best_thr, best_f1
 
 
@@ -2274,7 +2206,6 @@ def generate_split_heatmaps_and_tables(
     T_cal: Optional[float] = None,          
     thr_val: Optional[np.ndarray] = None,
 ):
-
     """
     Creates & saves (TRAIN/TEST only):
       1) Primary activations heatmap (1xN_ROUTES)  [raw + norm saved/printed]
@@ -2288,12 +2219,9 @@ def generate_split_heatmaps_and_tables(
     CLASS_NAMES  = ["alive", "death"]  # routing K=2
     METRIC_NAMES = ["death"]          # metric K=1
 
-
     out_dir = os.path.join(ckpt_dir, "heatmaps", split_name.lower())
     os.makedirs(out_dir, exist_ok=True)
-
     dummy_ce = nn.CrossEntropyLoss()
-
     loss, acc, act_dict, rc_mat, pa_vec = evaluate_epoch(
         behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
         loader, amp_ctx_enc, amp_ctx_caps, dummy_ce,
@@ -2310,15 +2238,12 @@ def generate_split_heatmaps_and_tables(
 
     K = rc_mat.shape[1]
     rc_k10  = rc_mat.T       # [K,N_ROUTES]
-    #eff_k10 = eff_mat.T      # [K,N_ROUTES]
-    # rc_k10 is [K,R] = p(route | label) (already includes primary activations)
 
     y_true_log, logits, _ = collect_epoch_logits(
         loader, behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
         amp_ctx_enc, amp_ctx_caps
     )
 
-    # y_true_log: [N] (0/1). Convert to [N,1] for your multi-label metric helpers.
     y_true_bin = np.asarray(y_true_log).reshape(-1, 1).astype(np.float32)  # [N,1]
     prev = y_true_bin.mean(axis=0)                                         # [1]
 
@@ -2330,13 +2255,12 @@ def generate_split_heatmaps_and_tables(
 
     if thr_val is not None:
         thr_val = np.asarray(thr_val, dtype=np.float32).reshape(-1)         # [1]
-        y_pred = (p >= thr_val[np.newaxis, :]).astype(float)                # [N,1]
+        y_pred = (p >= thr_val[np.newaxis, :]).astype(int)                # [N,1]
     else:
-        y_pred = (p >= 0.5).astype(float)
+        y_pred = (p >= 0.5).astype(int)
 
     m = epoch_metrics(y_true_bin, p, y_pred)
     auroc_per = m["AUROC_per_label"]  # [1]
-
 
     auroc_vis = np.nan_to_num(auroc_per, nan=0.0).astype(np.float32)
     prev_vis  = np.nan_to_num(prev,      nan=0.0).astype(np.float32)
@@ -2352,18 +2276,6 @@ def generate_split_heatmaps_and_tables(
         out_path=os.path.join(out_dir, f"{split_name.lower()}_primary_activations.png"),
         fontsize_cell=12, fontsize_ticks=11
     )
-
-
-    #save_heatmap_with_numbers(
-    #    mat_norm=eff_norm,
-        #mat_raw=eff_k10,
-    #    row_names=label_names,
-    #    col_names=routes,
-    #    title=f"{split_name} p(route | phenotype) (KxN_ROUTES) | normalized color, raw numbers",
-    #    out_path=os.path.join(out_dir, f"{split_name.lower()}_effective_weights_kxN_ROUTES.png"),
-    #    fontsize_cell=6,
-    #    fontsize_ticks=9
-    #)
 
     rc_norm, _, _ = save_array_with_versions(
         rc_k10, out_dir, f"{split_name.lower()}_p_route_given_pheno_kxr",
@@ -2382,7 +2294,6 @@ def generate_split_heatmaps_and_tables(
         fontsize_cell=6,
         fontsize_ticks=9
     )
-
 
     auroc_norm, _, _ = save_array_with_versions(
         auroc_per, out_dir, f"{split_name.lower()}_auroc_per_label",
@@ -2433,7 +2344,6 @@ def generate_split_heatmaps_and_tables(
         "AUROC_macro": float(m["AUROC"]),
         "AUPRC_macro": float(m["AUPRC"]),
         "primary_activations": pa_vec.astype(np.float32),
-        #"effective_kx10": eff_k10.astype(np.float32),
         "routing_coeff_kx10": rc_k10.astype(np.float32),
         "auroc_per_label": auroc_per.astype(np.float32),
         "prevalence_per_label": prev.astype(np.float32),
@@ -2449,18 +2359,15 @@ def main():
     global CFG, DEVICE
     CFG = E.CFG
     DEVICE = E.DEVICE
-    # ---- FORCE GPU IF AVAILABLE ----
     if torch.cuda.is_available():
         DEVICE = torch.device("cuda")
     else:
         DEVICE = torch.device("cpu")
     print("[forced] DEVICE =", DEVICE)
 
-
     import torch.backends.cudnn as cudnn
     cudnn.benchmark = True
     cudnn.deterministic = False  
-    # ---- TF32 SPEEDUP (A100/RTX30+) ----
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     try:
@@ -2468,7 +2375,6 @@ def main():
     except Exception:
         pass
  
-
     if hasattr(args, "finetune_text") and args.finetune_text:
         CFG.finetune_text = True
 
@@ -2479,9 +2385,7 @@ def main():
     MAXLEN = int(_cfg("max_text_len", 512))
     print(f"[setup] DEVICE={DEVICE} | batch_size={args.batch_size} | epochs={args.epochs}")
 
-
     use_cuda = (str(DEVICE).startswith("cuda") and torch.cuda.is_available())
-
     precision = str(args.precision).lower()
     use_amp = use_cuda and (precision != "off")
 
@@ -2497,7 +2401,6 @@ def main():
     else:
         amp_ctx_enc = nullcontext()
 
-    # ---- AMP FOR CAPSULE + MULT TOO ----
     if use_amp:
         if precision == "fp16":
             amp_ctx_caps = torch_amp.autocast(device_type="cuda", dtype=torch.float16)
@@ -2508,18 +2411,15 @@ def main():
     else:
         amp_ctx_caps = nullcontext()
 
-
     from torch.cuda.amp import GradScaler
     scaler = GradScaler(enabled=(use_amp and precision in {"auto", "fp16"}))
     print(f"[amp] use_amp={use_amp} precision={precision} scaler_enabled={scaler.is_enabled()}")
 
     # Datasets
     train_ds = ICUStayDataset(args.data_root, split="train")
-
     CLASS_NAMES  = ["alive", "death"]   # routing/K=2
     METRIC_NAMES = ["death"]            # metrics/K=1
     num_labels   = 2
-
 
     CFG.structured_n_feats = int(getattr(CFG, "structured_n_feats", 76) or 76)
     CFG.structured_seq_len = int(getattr(CFG, "structured_seq_len", 48) or 48)
@@ -2530,7 +2430,6 @@ def main():
         .loc[:, ["stay_id"] + train_ds.label_cols]
         .drop_duplicates(subset=["stay_id"], keep="first")
     )      
-
     N_train = len(train_label_df)
 
     compute_split_prevalence(
@@ -2561,7 +2460,6 @@ def main():
     g_train.manual_seed(int(CFG.seed) + 123)
     g_eval = torch.Generator()
     g_eval.manual_seed(int(CFG.seed) + 456)
-
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -2600,7 +2498,6 @@ def main():
         persistent_workers=(args.num_workers > 0),
     )
 
-
     # Encoders
     enc_cfg = EncoderConfig(
         d=_cfg("d", 256),
@@ -2627,7 +2524,6 @@ def main():
             p.requires_grad = False
         bbert.bert.eval()
         print("[encoders] Bio_ClinicalBERT frozen (feature extractor mode)")
-
 
     d_l = int(getattr(CFG, "mult_d_l", CFG.d))
     d_n = int(getattr(CFG, "mult_d_n", CFG.d))
@@ -2662,7 +2558,7 @@ def main():
         attn_mask=bool(getattr(CFG, "mult_attn_mask", False)),
     ).to(DEVICE)
 
-    d_in = int(getattr(CFG, "mult_d_in", d_l))  # common choice: d_in=d_l if you set d_l=d_n=d_i
+    d_in = int(getattr(CFG, "mult_d_in", d_l)) 
     route_adapter = RouteDimAdapter(d_in=d_in, d_l=d_l, d_n=d_n, d_i=d_i).to(DEVICE)
     projector = RoutePrimaryProjector(d_in=d_in, pc_dim=CFG.capsule_pc_dim).to(DEVICE)
     class_names = ["alive", "death"]
@@ -2676,7 +2572,7 @@ def main():
         act_type=CFG.capsule_act_type,
         layer_norm=CFG.capsule_layer_norm,
         dim_pose_to_vote=CFG.capsule_dim_pose_to_vote,
-        num_classes=2,   # <-- BINARY
+        num_classes=2,  
     ).to(DEVICE)
 
     print(
@@ -2687,7 +2583,6 @@ def main():
         f"[capsule] pc_dim={CFG.capsule_pc_dim} mc_caps_dim={CFG.capsule_mc_caps_dim} "
         f"iters={CFG.capsule_num_routing} act_type={CFG.capsule_act_type} out_caps={num_labels}"
     )
-
 
     encoder_warmup_epochs = int(getattr(args, "encoder_warmup_epochs", _cfg("encoder_warmup_epochs", 2)))
 
@@ -2703,25 +2598,19 @@ def main():
     else:
         head_params += [p for p in bbert.parameters() if p.requires_grad]
 
-
     head_params += [p for p in mult.parameters() if p.requires_grad]
     head_params += [p for p in route_adapter.parameters() if p.requires_grad]
     head_params += [p for p in projector.parameters() if p.requires_grad]
     head_params += [p for p in cap_head.parameters() if p.requires_grad]
-
-
     params = enc_params + head_params
-
     optimizer = torch.optim.AdamW(
         [
             {"params": enc_params,  "lr": args.lr, "weight_decay": args.weight_decay, "name": "enc"},
             {"params": head_params, "lr": args.lr, "weight_decay": args.weight_decay, "name": "head"},
         ]
     )
-
     print(f"[optim] enc_tensors={len(enc_params)} head_tensors={len(head_params)} total={len(params)}")
     print(f"[warmup] encoder_warmup_epochs={encoder_warmup_epochs}")
-
 
     # Checkpoint setup
     start_epoch = 0
@@ -2747,7 +2636,6 @@ def main():
     routing_warmup_epochs        = max(0, int(routing_warmup_epochs))
     route_entropy_warmup_epochs  = max(0.0, float(route_entropy_warmup_epochs))
     route_uniform_warmup_epochs = max(0, route_uniform_warmup_epochs)
-
 
     max_train_patients = int(os.environ.get("MIMICIV_MAX_TRAIN_PATIENTS", "-1"))
     seen_patients = 0
@@ -2777,7 +2665,6 @@ def main():
         enc_lr = 0.0 if (epoch - start_epoch) < encoder_warmup_epochs else args.lr
         optimizer.param_groups[0]["lr"] = enc_lr
         optimizer.param_groups[1]["lr"] = args.lr
-
         enc_train = (enc_lr > 0.0)
         for p in enc_params:
             p.requires_grad = enc_train
@@ -2793,7 +2680,6 @@ def main():
                 bbert.bert.train()
             else:
                 bbert.bert.eval()
-
 
         total_loss, total_correct, total = 0.0, 0, 0
         act_sum = torch.zeros(N_ROUTES, dtype=torch.float32)
@@ -2816,7 +2702,6 @@ def main():
             imgs= imgs.to(DEVICE, non_blocking=True)
             y   = y.to(DEVICE, non_blocking=True)
 
-
             if (epoch == start_epoch) and (step == 0):
                 pretty_print_small_batch(xL, mL, notes, dbg, k=3)
 
@@ -2829,7 +2714,6 @@ def main():
                 amp_ctx_enc=amp_ctx_enc,
                 dbg_once=dbg_once,     
             )
-
 
             if _has_nonfinite(outL.get("pool"), outN.get("pool"), outI.get("pool"),
                               outL.get("seq"),  outN.get("seq"),  outI.get("seq")):
@@ -2851,7 +2735,7 @@ def main():
 
                 
                 detach_priors_flag = (epoch - start_epoch) < routing_warmup_epochs
-                temp = 2.0 if (epoch - start_epoch) < 2 else 1.0   # or whatever schedule you want
+                temp = 2.0 if (epoch - start_epoch) < 2 else 1.0   
 
                 out = capsule_forward_from_encoded(
                     mult=mult,
@@ -2875,7 +2759,6 @@ def main():
                     assert rc_raw.ndim == 3, f"rc_raw must be [B,R,K], got {tuple(rc_raw.shape)}"
                     assert int(rc_raw.shape[1]) == int(N_ROUTES), f"Expected R={N_ROUTES}, got {tuple(rc_raw.shape)}"
 
-                    # raw normalization check (looser atol is fine)
                     sR = rc_raw.sum(dim=1)
                     if not torch.allclose(sR, torch.ones_like(sR), atol=1e-2):
                         if getattr(CFG, "verbose", False):
@@ -2890,7 +2773,6 @@ def main():
                         debug_routing_tensor(rc_report, name="TRAIN.rc_report", expect_routes=N_ROUTES, expect_k=expect_k)
 
                     assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name="TRAIN.rc_report")
-
 
                     if bool(getattr(args, "route_debug", False)) and (epoch == start_epoch) and (step == 0):
                         debug_routing_tensor(
@@ -2910,7 +2792,6 @@ def main():
                     continue
 
                 loss = ce(logits, y)
-
                 cur_epoch = float(epoch + 1) 
 
                 if route_entropy_lambda > 0.0 and (route_entropy_warmup_epochs <= 0 or cur_epoch <= route_entropy_warmup_epochs):
@@ -2935,7 +2816,6 @@ def main():
                 continue
 
             trainable_params = [p for p in params if p.requires_grad]
-
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -2958,7 +2838,7 @@ def main():
             safe_zero_grad(optimizer)
             total_loss += float(loss.item()) * y.size(0)
 
-            p_death = torch.softmax(logits, dim=1)[:, 1]   # prob of class 1
+            p_death = torch.softmax(logits, dim=1)[:, 1]  
             pred = (p_death >= 0.5).long()
             total_correct += (pred == y).sum().item()
             total += y.numel()
@@ -2970,7 +2850,6 @@ def main():
                 avg_loss_step = total_loss / max(1, num_samples)
                 avg_acc_step  = total_correct / max(1, total)
                 avg_act = (act_sum / max(1, num_samples)).tolist()
-
                 routes = ROUTE_NAMES[:N_ROUTES]
 
                 msg = (
@@ -2983,16 +2862,12 @@ def main():
                 if (rc_raw is not None) and (rc_report is not None):
                     raw_mean = rc_raw.detach().float().mean(dim=(0, 2)).cpu().tolist()       # [R]
                     rep_mean = rc_report.detach().float().mean(dim=(0, 2)).cpu().tolist()
-
                     raw_str = " | ".join(f"{r}:{raw_mean[i]:.3f}" for i, r in enumerate(ROUTE_NAMES))
                     rep_str = " | ".join(f"{r}:{rep_mean[i]:.3f}" for i, r in enumerate(ROUTE_NAMES))
-
                     msg += f" | [raw softmax p(route)] {raw_str}"
                     msg += f" | [effective p(route|pheno)] {rep_str}"
 
-
                 print(msg)
-
                 if max(avg_act) > 0.95:
                     dom_route = int(np.argmax(avg_act))
                     print(
@@ -3025,10 +2900,8 @@ def main():
 
         # Routing importance: global and per-phenotype (VAL) 
         routes = ROUTE_NAMES
-        ROUTING_CLASS_NAMES = ["alive", "death"]   # for K=2 routing tables/plots
-        METRIC_NAMES        = ["death"]           # for AUROC/prevalence etc (K=1)
-
-
+        ROUTING_CLASS_NAMES = ["alive", "death"]  
+        METRIC_NAMES        = ["death"]           
 
         if val_rc_mat is not None:
             # Data-derived mean routing coefficients per route (averaged over phenotypes)
@@ -3046,27 +2919,6 @@ def main():
                 row = " | ".join(f"{names[k]}:{val_rc_mat[i, k]:.3f}" for k in range(K))
                 print(f"  {r}: {row}")
 
-
-            # Heatmap of routing importance on VAL for this epoch
-            #mat_val = val_rc_mat.T  # [K, N_ROUTES]
-
-            #plt.figure(figsize=(10, 8))
-            #im = plt.imshow(mat_val, aspect="auto")
-            #plt.colorbar(im, label="Mean routing coefficient")
-
-            #plt.xticks(range(len(routes)), routes)
-            #plt.yticks(range(K), pheno_names, fontsize=6)
-
-            #plt.xlabel("Route")
-            #plt.ylabel("Phenotype")
-            #plt.title(f"Per-route, per-phenotype routing importance (VAL, epoch {epoch + 1})")
-            #plt.tight_layout()
-
-            #fname = os.path.join(ckpt_dir, f"routing_val_mean_rc_epoch{epoch + 1:03d}.png")
-            #plt.savefig(fname, dpi=300)
-            #plt.close()
-            #print(f"[routing] saved VAL per-route-per-phenotype map → {fname}")
-
         # Collect outputs for full VAL metrics
         y_true, p1, _ = collect_epoch_outputs(
             val_loader, behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
@@ -3077,8 +2929,7 @@ def main():
         )
 
         best_thr = find_best_thresholds(y_true, p1, n_steps=50)
-        y_pred = (p1 >= best_thr[np.newaxis, :]).astype(float)
-
+        y_pred = (p1 >= best_thr[np.newaxis, :]).astype(int)
         m = epoch_metrics(y_true, p1, y_pred)
 
         print(
@@ -3184,7 +3035,6 @@ def main():
         mult.load_state_dict(ckpt["mult"])
         route_adapter.load_state_dict(ckpt["route_adapter"])
 
-
         projector.load_state_dict(ckpt["projector"])
         cap_head.load_state_dict(ckpt["cap_head"])
 
@@ -3245,7 +3095,7 @@ def main():
         amp_ctx_enc, amp_ctx_caps
     )
 
-    # Fit temperature on VAL only (post-hoc, no training change)
+    # Fit temperature on VAL only 
     T_star = fit_temperature_scalar_from_val(logits_v, y_true_v_log, max_iter=300, lr=0.05)
     print(f"[calibration] Fitted temperature on VAL only: T={T_star:.4f}")
 
@@ -3267,13 +3117,21 @@ def main():
     p_test_uncal = softmax_death_np(logits_t)                               # [N,1]
     p_test_cal   = softmax_death_np(apply_temperature(logits_t, T_star))    # [N,1]
 
-    y_pred_t = (p_test_cal >= thr_val[np.newaxis, :]).astype(float)         # [N,1]
-    mt = epoch_metrics(y_true_t, p_test_cal, y_pred_t)
+    y_pred_unc_05 = (p_test_uncal >= 0.5).astype(int)
+    m_unc_05 = epoch_metrics(y_true_t, p_test_uncal, y_pred_unc_05)
+    print_metrics_block("TEST uncalibrated thr=0.5", m_unc_05, cm=True)
 
-    print(
-        f"[TEST] (VAL-thresholds, CALIBRATED probs) MACRO  AUROC={mt['AUROC']:.4f} "
-        f"AUPRC={mt['AUPRC']:.4f} F1={mt['F1']:.4f} Recall={mt['Recall']:.4f}"
-    )
+    y_pred_cal_05 = (p_test_cal >= 0.5).astype(int)
+    m_cal_05 = epoch_metrics(y_true_t, p_test_cal, y_pred_cal_05)
+    print_metrics_block("TEST calibrated thr=0.5", m_cal_05, cm=False)
+
+    y_pred_cal_valthr = (p_test_cal >= thr_val[np.newaxis, :]).astype(int)
+    m_cal_valthr = epoch_metrics(y_true_t, p_test_cal, y_pred_cal_valthr)
+    print_metrics_block("TEST calibrated thr=VAL", m_cal_valthr, cm=True)
+
+    y_pred_unc_valthr = (p_test_uncal >= thr_val[np.newaxis, :]).astype(int)
+    m_unc_valthr = epoch_metrics(y_true_t, p_test_uncal, y_pred_unc_valthr)
+    print_metrics_block("TEST uncalibrated thr=VAL", m_unc_valthr, cm=False)
 
     ece_unc, centers_unc, bconf_unc, bacc_unc, _ = expected_calibration_error(
         p_test_uncal.reshape(-1), y_true_t_log.reshape(-1), n_bins=args.calib_bins
