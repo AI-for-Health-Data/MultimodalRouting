@@ -76,7 +76,6 @@ def _mask_and_renorm_over_routes(
         m = route_mask.to(rc.device).float().unsqueeze(-1)  # [B,R,1]
     else:
         raise ValueError(f"route_mask must be [R] or [B,R], got {tuple(route_mask.shape)}")
-
     rc = rc * m
     denom = rc.sum(dim=routes_dim, keepdim=True)  # [B,1,K]
     active = m.sum(dim=routes_dim, keepdim=True).clamp_min(1.0)  # [B,1,1] or [1,1,1]
@@ -98,7 +97,19 @@ def route_given_pheno(
         prim = prim_act.unsqueeze(-1)
     resp = rc_k_given_r * prim  # [B,R,K]
     if route_mask is not None:
-        m = route_mask.view(1, -1, 1).type_as(resp)
+        m = route_mask
+
+        # Accept [R] or [B,R]
+        if m.ndim == 1:
+            m = m.view(1, -1, 1)                 # [1,R,1]
+        elif m.ndim == 2:
+            m = m.unsqueeze(-1)                  # [B,R,1]
+        else:
+            raise ValueError(f"route_mask must be [R] or [B,R], got {tuple(m.shape)}")
+
+        m = m.to(device=resp.device, dtype=resp.dtype)
+        assert m.shape[1] == resp.shape[1], \
+            f"route_mask routes dim mismatch: m.shape={tuple(m.shape)} resp.shape={tuple(resp.shape)}"
         resp = resp * m
     denom = resp.sum(dim=1, keepdim=True).clamp_min(eps)  # [B,1,K]
     rc_r_given_k = resp / denom
@@ -157,7 +168,6 @@ class CrossAttentionFusion(nn.Module):
     ):
         super().__init__()
         self.pool = pool
-
         self.attn = nn.MultiheadAttention(
             d, n_heads, dropout=attn_dropout, batch_first=True
         )
@@ -182,7 +192,6 @@ class CrossAttentionFusion(nn.Module):
 
         key_pad = (mB < 0.5)  # True=PAD for MultiheadAttention
         A2B, _ = self.attn(query=A, key=B, value=B, key_padding_mask=key_pad, need_weights=False)
-
         X = self.ln1(A + A2B)
         X = self.ln2(X + self.ff(X))
         if self.pool == "first":
@@ -200,7 +209,6 @@ class CrossAttentionFusion(nn.Module):
         return self.out(z)  # [B,D]
 
 class TriTokenAttentionFusion(nn.Module):
-
     def __init__(self, d: int, n_heads: int = 8, attn_dropout: float = 0.0):
         super().__init__()
         self.q = nn.Parameter(torch.zeros(1, 1, d))
@@ -274,8 +282,6 @@ def make_route_inputs(z, fusion) -> Dict[str, torch.Tensor]:
         raise RuntimeError(f"[make_route_inputs] Route key mismatch. missing={missing}, extra={extra}")
     return routes
 
-
-
 def make_route_inputs_mult(z, multmodel: MULTModel):
     Ls, Ns, Is = z["L"]["seq"], z["N"]["seq"], z["I"]["seq"]
     Lm, Nm, Im = z["L"]["mask"], z["N"]["mask"], z["I"]["mask"]
@@ -286,7 +292,6 @@ def make_route_inputs_mult(z, multmodel: MULTModel):
         mL=Lm, mN=Nm, mI=Im,
         L_pool=Lp, N_pool=Np, I_pool=Ip,
     )
-
     expected = set(ROUTES)
     got = set(routes.keys())
     if expected != got:
@@ -385,7 +390,6 @@ class CapsuleMortalityHead(nn.Module):
             small_std=True,                  
         )
 
-
         # Decision capsule embedding → logits
         self.embedding = nn.Parameter(
             torch.zeros(self.out_n_capsules, self.out_d_capsules)
@@ -462,7 +466,7 @@ def forward_capsule_from_route_dict(
     *,
     acts_override: Optional[torch.Tensor] = None,      # [B,len(ROUTES),1] optional external priors
     route_mask: Optional[torch.Tensor] = None,         # [B,len(ROUTES)]  (1=keep, 0=mask)
-    act_temperature: float = 1.0,                      # >1 softer, <1 sharper
+    act_temperature: float = 1.0,                      
     detach_priors: bool = False,
     return_routing: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor]]:
