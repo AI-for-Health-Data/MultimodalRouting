@@ -365,7 +365,8 @@ def print_label_routing_heatmap(
             if label_names is not None and idx < len(label_names):
                 name = label_names[idx]
             else:
-                name = label_names[idx] if label_names is not None else f"label_{idx}"
+                name = f"label_{idx}"
+
 
             weights = effective[:, idx]  # [R]
             dominant_idx = int(weights.argmax())
@@ -966,6 +967,94 @@ def _cell_to_list(x):
             return []
     return []
 
+def _coerce_any_2d(x, stay_id: int) -> np.ndarray:
+    """Parse a parquet cell into a numeric 2D array if possible (no shape enforcement)."""
+    import ast, json
+
+    def _as_py(v):
+        if hasattr(v, "as_py"):
+            try: return v.as_py()
+            except Exception: pass
+        return v
+
+    def _parse(v):
+        v = _as_py(v)
+        if isinstance(v, (str, bytes)):
+            s = v.decode("utf-8") if isinstance(v, bytes) else v
+            s = s.strip()
+            if not s:
+                return None
+            try: return json.loads(s)
+            except Exception: pass
+            try: return ast.literal_eval(s)
+            except Exception: return None
+        return v
+
+    v = _parse(x)
+    if v is None:
+        raise ValueError(f"[struct] stay_id={stay_id} empty/unparseable cell")
+
+    if isinstance(v, np.ndarray):
+        arr = v
+    else:
+        arr = np.asarray(v)
+
+    if arr.ndim == 2:
+        return np.nan_to_num(arr.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+
+    # handle list-of-rows in object arrays
+    if arr.ndim == 1 and arr.dtype == object and arr.size > 0 and isinstance(arr[0], (list, tuple, np.ndarray)):
+        rows = [np.asarray(r, dtype=np.float32) for r in arr.tolist()]
+        out = np.stack(rows, axis=0)
+        return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+    raise ValueError(f"[struct] stay_id={stay_id} got non-2D content: ndim={arr.ndim} shape={arr.shape}")
+
+def detect_struct_col(struct_df: pd.DataFrame, T_cfg: int, F_cfg: int) -> Tuple[str, Tuple[int,int]]:
+    """
+    Find a column in structured parquet that matches (T_cfg,F_cfg) if possible.
+    Falls back to the first parsable 2D column.
+    """
+    # prioritize likely candidates
+    cand = [c for c in struct_df.columns if str(c).startswith("x_") or "ehr" in str(c).lower()]
+    cand = [c for c in cand if c != "stay_id"]
+    if not cand:
+        raise ValueError(f"[struct] no candidate structured columns found. Columns={list(struct_df.columns)[:50]}")
+
+    # sample one row to infer shapes
+    sample_df = struct_df.dropna(subset=cand, how="all")
+    if sample_df.empty:
+        raise ValueError("[struct] all candidate structured columns are empty")
+
+    row = sample_df.iloc[0]
+    stay_id = int(row["stay_id"]) if "stay_id" in row else -1
+
+    shapes = {}
+    for c in cand:
+        try:
+            arr = _coerce_any_2d(row[c], stay_id=stay_id)
+            shapes[c] = (int(arr.shape[0]), int(arr.shape[1]))
+        except Exception:
+            continue
+
+    if not shapes:
+        raise ValueError("[struct] could not parse any candidate structured columns into 2D arrays")
+
+    # perfect match first
+    for c, (t,f) in shapes.items():
+        if int(t) == int(T_cfg) and int(f) == int(F_cfg):
+            return c, (t,f)
+
+    # feature-dim match next (common when you pad/trim time)
+    for c, (t,f) in shapes.items():
+        if int(f) == int(F_cfg):
+            return c, (t,f)
+
+    # otherwise just take the first parsable one
+    c0 = next(iter(shapes.keys()))
+    return c0, shapes[c0]
+
+
 class ICUStayDataset(Dataset):
     def __init__(self, root: str, split: str = "train"):
         super().__init__()
@@ -1005,7 +1094,13 @@ class ICUStayDataset(Dataset):
         images_fp = os.path.join(root, "images.parquet")
         labels_fp = os.path.join(root, "labels_mortality.parquet")
 
+        # --- ICUStayDataset.__init__ fix (indentation must match)
         self.struct = _standardize_id_column(pd.read_parquet(struct_fp))
+        T_cfg = int(getattr(CFG, "structured_seq_len", 48) or 48)
+        F_cfg = int(getattr(CFG, "structured_n_feats", 76) or 76)
+        self.struct_col, (t0, f0) = detect_struct_col(self.struct, T_cfg=T_cfg, F_cfg=F_cfg)
+        print(f"[dataset:{split}] structured_col='{self.struct_col}' sample_shape=({t0},{f0}) cfg_TF=({T_cfg},{F_cfg})")
+
         self.notes  = _standardize_id_column(pd.read_parquet(notes_fp))
         self.images = _standardize_id_column(pd.read_parquet(images_fp))
         self.images = _standardize_image_path_column(self.images)
@@ -1174,7 +1269,8 @@ class ICUStayDataset(Dataset):
         if df_row.empty:
             raise KeyError(f"stay_id {stay_id} not found in structured parquet.")
         row = df_row.iloc[0]
-        x = row["x_ehr_48h_2h_76"]
+        x = row[self.struct_col]
+
 
         T = int(getattr(CFG, "structured_seq_len", 48) or 48)
         F = int(getattr(CFG, "structured_n_feats", 76) or 76)
@@ -1257,6 +1353,7 @@ class ICUStayDataset(Dataset):
                 "input_ids": ids_chunks,
                 "attention_mask": attn_chunks,
             }
+
         df_i = self.images[self.images.stay_id == stay_id]
         if df_i.empty:
             raise RuntimeError(f"[ICUStayDataset] stay_id={stay_id} missing images row")
@@ -1402,7 +1499,12 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
             print(f"[collate] image_zero_fraction(first batch) = {zero_frac:.3f}")
             print(f"[collate] xL_batch: {tuple(xL_batch.shape)} | ...")
             first_print["done"] = True
-        y_batch = torch.stack([b["y"].view(()) for b in batch], dim=0)  # [B] long
+        ys = []
+        for b in batch:
+            yi = b["y"]
+            ys.append(yi if yi.ndim > 0 else yi.view(()))
+        y_batch = torch.stack(ys, dim=0)
+
         dbg = {"stay_ids": [b["stay_id"] for b in batch], "img_paths": img_paths_list}
         return xL_batch, mL_batch, notes_batch, imgs_batch, y_batch, dbg
     return _collate
@@ -1584,10 +1686,11 @@ def evaluate_epoch(
     printed_unimodal = False
     printed_caps_once = False
     rpt_every = int(_cfg("routing_print_every", 0) or 0)
-    rc_sum_mat = None      # [R, K]
-    rep_sum_mat = None
+    rep_sum_mat    = None   # sum of rc_report over batch -> [R,K]
+    rc_raw_sum_mat = None   # sum of rc_raw over batch    -> [R,K]
+    eff_sum_mat    = None   # sum of (rc_raw * prim_act)  -> [R,K]
+    has_routing    = False
 
-    has_routing = False
 
     for bidx, (xL, mL, notes, imgs, y, dbg) in enumerate(loader):
         xL = xL.to(DEVICE, non_blocking=True)
@@ -1652,15 +1755,21 @@ def evaluate_epoch(
 
                 rc_raw_cpu    = rc_raw.detach().float().cpu()       # [B,R,K]
                 rc_report_cpu = rc_report.detach().float().cpu()    # [B,R,K]
-                raw_sum = rc_raw_cpu.sum(dim=0)        # [R,K]
-                rep_sum = rc_report_cpu.sum(dim=0)     # [R,K]
+                pa_cpu = prim_acts.detach().float().cpu()                 # [B,R]
+                eff_b  = rc_raw_cpu * pa_cpu.unsqueeze(-1)                # [B,R,K]
+                raw_sum = rc_raw_cpu.sum(dim=0)                           # [R,K]
+                rep_sum = rc_report_cpu.sum(dim=0)                        # [R,K]
+                eff_sum = eff_b.sum(dim=0)                                # [R,K]
 
-                if rc_sum_mat is None:
-                    rc_sum_mat = torch.zeros_like(raw_sum)
-                    rep_sum_mat = torch.zeros_like(rep_sum)
+                if rc_raw_sum_mat is None:
+                    rc_raw_sum_mat = torch.zeros_like(raw_sum)
+                    rep_sum_mat    = torch.zeros_like(rep_sum)
+                    eff_sum_mat    = torch.zeros_like(eff_sum)
 
-                rc_sum_mat  += raw_sum
-                rep_sum_mat += rep_sum
+                rc_raw_sum_mat += raw_sum
+                rep_sum_mat    += rep_sum
+                eff_sum_mat    += eff_sum
+
 
             if route_debug and (rc_raw is not None) and (rc_report is not None) and bidx == 0:
                 K = int(logits.size(1))
@@ -1728,15 +1837,18 @@ def evaluate_epoch(
 
     avg_loss = total_loss / max(1, num_samples)
     avg_acc  = total_correct / max(1, total)
-    avg_pa = (act_sum / max(1, num_samples)).numpy()  # [10]
+    avg_pa = (act_sum / max(1, num_samples)).numpy()  # [R]
     avg_act_dict = {r: float(avg_pa[i]) for i, r in enumerate(route_names)}
 
-    if num_samples > 0 and has_routing:
-        avg_rc_raw_mat    = (rc_sum_mat  / num_samples).numpy()   # [R,K]
-        avg_rc_report_mat = (rep_sum_mat / num_samples).numpy()   # [R,K]
-    else:
-        avg_rc_report_mat = None
-    return avg_loss, avg_acc, avg_act_dict, avg_rc_report_mat, avg_pa
+    # default when routing wasn't returned
+    avg_rc_rep_mat = None
+
+    if has_routing and (rep_sum_mat is not None):
+        avg_rc_rep_mat = (rep_sum_mat / max(1, num_samples)).numpy()  # [R,K]
+
+    return avg_loss, avg_acc, avg_act_dict, avg_rc_rep_mat, avg_pa
+
+
 
 def save_checkpoint(path: str, state: Dict):
     ensure_dir(os.path.dirname(path))
@@ -2024,7 +2136,6 @@ def epoch_metrics(y_true, p, y_pred):
     fn = np.logical_and(y_flat == 1, yp_flat == 0).sum()
 
     micro_prec = float(tp) / float(tp + fp + 1e-8)
-    micro_rec  = float(fn) 
     micro_rec  = float(tp) / float(tp + fn + 1e-8)
 
     micro_f1   = (
@@ -2440,6 +2551,13 @@ def main():
     pos_counts = train_label_df[train_ds.label_cols].sum(axis=0).values
     neg_counts = N_train - pos_counts
     pos_weight = neg_counts / (pos_counts + 1e-6)
+    # after you compute pos_counts/neg_counts
+    w0 = 1.0
+    w1 = float(neg_counts[0] / (pos_counts[0] + 1e-6))
+    w1 = min(w1, float(_cfg("pos_weight_max", 20.0)))
+    ce = nn.CrossEntropyLoss(weight=torch.tensor([w0, w1], device=DEVICE, dtype=torch.float32))
+    print(f"[loss] Weighted CrossEntropyLoss w=[{w0:.3f},{w1:.3f}]")
+
 
     # Prevent extreme imbalance from exploding gradients
     max_pw = float(_cfg("pos_weight_max", 20.0))
@@ -2450,8 +2568,8 @@ def main():
 
     val_ds   = ICUStayDataset(args.data_root, split="val")
     test_ds  = ICUStayDataset(args.data_root, split="test")
-    ce = nn.CrossEntropyLoss()
-    print("[loss] CrossEntropyLoss (binary softmax)")
+    #ce = nn.CrossEntropyLoss()
+    #print("[loss] CrossEntropyLoss (binary softmax)")
 
     collate_train = collate_fn_factory(tidx=TASK_MAP[args.task], img_tfms=build_image_transform("train"))
     collate_eval  = collate_fn_factory(tidx=TASK_MAP[args.task], img_tfms=build_image_transform("val"))
