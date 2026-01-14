@@ -39,8 +39,9 @@ BLOCKS = {
     "bi": ["LN", "NL", "LI", "IL", "NI", "IN"],
     "tri": ["LNI"],
 }
+ROUTE_NAMES = ["L","N","I","LN","NL","LI","IL","NI","IN","LNI"]
+N_ROUTES = len(ROUTE_NAMES)
 TASKS: List[str] = ["pheno"]
-
 PHENO_NAMES: List[str] = [
     "Acute and unspecified renal failure",
     "Acute cerebrovascular disease",
