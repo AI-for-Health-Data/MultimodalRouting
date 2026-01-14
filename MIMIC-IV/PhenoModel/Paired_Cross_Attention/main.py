@@ -1918,6 +1918,7 @@ def epoch_metrics(y_true, p, y_pred):
     N, K = y_true.shape
 
     aurocs, auprcs, f1s, recs = [], [], [], []
+    precs = []
     auroc_per_label = np.full(K, np.nan, dtype=float)
     auprc_per_label = np.full(K, np.nan, dtype=float)
     f1_per_label    = np.full(K, np.nan, dtype=float)
@@ -1977,6 +1978,7 @@ def epoch_metrics(y_true, p, y_pred):
     out["F1_macro"]     = float(np.nanmean(f1s))    if len(f1s) > 0 else float("nan")
     out["Recall_macro"] = float(np.nanmean(recs))   if len(recs) > 0 else float("nan")
     out["Precision_macro"] = float(np.nanmean(precs)) if len(precs) > 0 else float("nan")
+
 
 
     out["AUROC"]  = out["AUROC_macro"]
