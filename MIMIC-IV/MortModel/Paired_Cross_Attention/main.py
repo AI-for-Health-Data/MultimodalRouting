@@ -58,10 +58,16 @@ def safe_zero_grad(optimizer):
     optimizer.zero_grad(set_to_none=True)
 
 def seed_worker(worker_id: int):
+    import env_config as E
+    if not hasattr(E, "CFG") or E.CFG is None:
+        E.load_cfg()
+    global CFG, DEVICE
+    CFG = E.CFG
+    DEVICE = E.DEVICE
+
     ws = (int(CFG.seed) + int(worker_id)) % (2**32)
-    np.random.seed(ws)
-    random.seed(ws)
-    torch.manual_seed(ws)
+    np.random.seed(ws); random.seed(ws); torch.manual_seed(ws)
+
     global TOKENIZER, MAXLEN
     if TOKENIZER is None:
         from transformers import AutoTokenizer
@@ -178,23 +184,38 @@ def encode_all_modalities(
                       mL.sum(dim=1)[:5].detach().cpu().tolist())
             _peek_tensor("enc.L_pool", L_pool)
             _peek_tensor("enc.L_seq",  L_seq)
+        
+        notes_ids  = notes["input_ids"].to(DEVICE, non_blocking=True)
+        notes_attn = notes["attention_mask"].to(DEVICE, non_blocking=True)
 
-        notes_ids  = notes["input_ids"].to(DEVICE, non_blocking=True)        # [B,S,L]
-        notes_attn = notes["attention_mask"].to(DEVICE, non_blocking=True)   # [B,S,L]
         chunk_mask = notes.get("chunk_mask", None)
         if chunk_mask is not None:
-            chunk_mask = chunk_mask.to(DEVICE, non_blocking=True)               # [B,S]
-            pad_chunks = (chunk_mask < 0.5)                               # [B,S]
+            chunk_mask = chunk_mask.to(DEVICE, non_blocking=True).float()
+            pad_chunks = (chunk_mask < 0.5)
+
             if pad_chunks.any():
+                # clone ONLY if we will write into them
+                notes_ids  = notes_ids.clone()
+                notes_attn = notes_attn.clone()
                 cls_id = int(getattr(TOKENIZER, "cls_token_id", 101))
-                b_idx, s_idx = pad_chunks.nonzero(as_tuple=True)   
-                notes_ids[b_idx, s_idx, 0]  = cls_id
+                b_idx, s_idx = pad_chunks.nonzero(as_tuple=True)
+                notes_ids[b_idx, s_idx, :] = 0
+                notes_attn[b_idx, s_idx, :] = 0
+                notes_ids[b_idx, s_idx, 0] = cls_id
                 notes_attn[b_idx, s_idx, 0] = 1
-        notes_batch = {
-            "input_ids": notes_ids,
-            "attention_mask": notes_attn,
-            "chunk_mask": chunk_mask,
-        }
+
+            notes_batch = {
+                "input_ids": notes_ids,
+                "attention_mask": notes_attn,
+                "chunk_mask": chunk_mask,   # <-- critical: pass collate mask through
+            }
+        else:
+            # No chunk_mask provided → encoder will fall back to attention-derived chunk mask
+            notes_batch = {
+                "input_ids": notes_ids,
+                "attention_mask": notes_attn,
+            }
+
         N_seq, N_mask, N_pool = bbert.encode_seq_and_pool(notes_batch)
 
 
@@ -209,6 +230,23 @@ def encode_all_modalities(
     outI = {"seq": I_seq, "mask": I_mask.float(), "pool": I_pool}
 
     return _sanitize_encoder_out(outL, "L"), _sanitize_encoder_out(outN, "N"), _sanitize_encoder_out(outI, "I")
+
+
+def normalize_rc_shape_to_brk(rc: torch.Tensor, expect_routes: int, name: str = "rc") -> torch.Tensor:
+    """
+    Ensure rc is [B,R,K]. If rc is [B,K,R], transpose it.
+    """
+    if rc is None:
+        return rc
+    if rc.ndim != 3:
+        raise ValueError(f"{name}: expected 3D, got {tuple(rc.shape)}")
+
+    B, A, C = rc.shape
+    if A == expect_routes:
+        return rc
+    if C == expect_routes:
+        return rc.permute(0, 2, 1).contiguous()
+    raise ValueError(f"{name}: cannot find routes axis with size={expect_routes}, shape={tuple(rc.shape)}")
 
 def debug_routing_tensor(
     rc: torch.Tensor,
@@ -882,6 +920,17 @@ def resolve_image_path(p: str, dataset_root: str) -> str:
         return os.path.join(image_root, p)
     return os.path.join(dataset_root, p)
 
+
+def assert_probs_over_dim(p: torch.Tensor, dim: int, atol: float = 1e-2, name: str = "p"):
+    s = p.sum(dim=dim)
+    err = (s - 1.0).abs()
+    if not torch.isfinite(err).all() or err.mean().item() > atol:
+        raise AssertionError(
+            f"{name}: NOT normalized over dim={dim}. "
+            f"sum -> min={s.min().item():.6f} max={s.max().item():.6f} "
+            f"abs_err mean={err.mean().item():.3e} max={err.max().item():.3e}"
+        )
+
 def is_probably_image_file(p: str) -> bool:
     ext = os.path.splitext(str(p).lower())[1]
     return ext in VALID_IMG_EXTS
@@ -913,7 +962,15 @@ def _detect_notes_schema(notes_df: pd.DataFrame):
         if len(aligned_ids) != len(aligned_attn):
             raise ValueError("Pretokenized notes columns not aligned (ids vs masks).")
 
-        return ("pretokenized", aligned_ids, aligned_attn)
+            return ("pretokenized", aligned_ids, aligned_attn)
+
+        # ✅ add note_chunk_ support
+        for pref in ("chunk_", "text_chunk_", "note_chunk_"):
+            cols = sorted([c for c in notes_df.columns if str(c).startswith(pref)])
+            if len(cols) > 0:
+                return ("text", cols, None)
+
+        raise ValueError("notes schema not recognized")
 
     chunk_cols = sorted([c for c in notes_df.columns if str(c).startswith("chunk_")])
     if len(chunk_cols) > 0:
@@ -1105,7 +1162,14 @@ class ICUStayDataset(Dataset):
         self.images = _standardize_id_column(pd.read_parquet(images_fp))
         self.images = _standardize_image_path_column(self.images)
         self.labels = _standardize_id_column(pd.read_parquet(labels_fp))
+        
+        # ✅ ADD set_index HERE (after loading)
+        self.struct = self.struct.drop_duplicates("stay_id").set_index("stay_id", drop=False)
+        self.notes  = self.notes.drop_duplicates("stay_id").set_index("stay_id", drop=False)
+        self.labels = self.labels.drop_duplicates("stay_id").set_index("stay_id", drop=False)
+        # images can be multi-row; keep self.img_map for that
 
+        
         sample = self.images["cxr_path"].dropna().astype(str)
         sample = sample[sample.str.strip().ne("")]
 
@@ -1193,7 +1257,22 @@ class ICUStayDataset(Dataset):
         )
 
         split_img_candidates = split_img_candidates & ids_set  # limit to split ids
-        img_ids = set([sid for sid in split_img_candidates if _has_existing_image(sid)])
+        # after self.images is loaded & standardized
+        img_map = {}
+        for sid, g in self.images.groupby("stay_id", sort=False):
+            raw_paths = g["cxr_path"].dropna().astype(str).tolist()
+            raw_paths = [p for p in raw_paths if p.strip()]
+            if not raw_paths:
+                continue
+            cand = [resolve_image_path(p, self.root) for p in raw_paths]
+            cand = [p for p in cand if is_probably_image_file(p) and os.path.exists(p)]
+            if cand:
+                img_map[int(sid)] = cand
+
+        self.img_map = img_map
+        img_ids = set(img_map.keys()) & ids_set
+        print(f"[dataset:{split}] img_ids={len(img_ids)} (precomputed)")
+
 
         print(f"[dataset:{split}] ids_set={len(ids_set)}")
         print(f"[dataset:{split}] struct_ids={len(struct_ids)}")
@@ -1265,119 +1344,74 @@ class ICUStayDataset(Dataset):
 
     def __getitem__(self, idx: int):
         stay_id = int(self.ids[idx])
-        df_row = self.struct.loc[self.struct["stay_id"] == stay_id]
-        if df_row.empty:
-            raise KeyError(f"stay_id {stay_id} not found in structured parquet.")
-        row = df_row.iloc[0]
-        x = row[self.struct_col]
 
+        # --- structured: O(1)
+        row_s = self.struct.loc[stay_id]
+        if isinstance(row_s, pd.DataFrame):
+            row_s = row_s.iloc[0]
+        x = row_s[self.struct_col]
 
         T = int(getattr(CFG, "structured_seq_len", 48) or 48)
         F = int(getattr(CFG, "structured_n_feats", 76) or 76)
+        xs_np = coerce_packed_ehr(x, stay_id=stay_id, T=T, F=F)
+        xs = torch.from_numpy(xs_np)  # [T,F]
 
-        xs_np = coerce_packed_ehr(x, stay_id=stay_id, T=T, F=F) 
-        xs = torch.from_numpy(xs_np)
-
-        T = int(getattr(CFG, "structured_seq_len", xs_np.shape[0]))
-        if T > 0:
-            if xs_np.shape[0] < T:
-                pad = np.zeros((T - xs_np.shape[0], xs_np.shape[1]), dtype=np.float32)
-                xs_np = np.concatenate([xs_np, pad], axis=0)
-            elif xs_np.shape[0] > T:
-                xs_np = xs_np[:T]
-
-        xs = torch.from_numpy(xs_np)        # [T,F]
-
-        df_n = self.notes[self.notes.stay_id == stay_id]
-        if df_n.empty:
-            raise RuntimeError(f"[ICUStayDataset] stay_id={stay_id} missing notes row")
-        row = df_n.iloc[0]
+        # --- notes: O(1)
+        row_n = self.notes.loc[stay_id]
+        if isinstance(row_n, pd.DataFrame):
+            row_n = row_n.iloc[0]
 
         if self.notes_mode == "text":
-            notes_list: List[str] = []
+            notes_list = []
             for c in self.chunk_cols:
-                val = row.get(c, "")
+                val = row_n.get(c, "")
                 if pd.notna(val) and str(val).strip():
                     notes_list.append(str(val))
-
             if not notes_list:
-                raise RuntimeError(f"[ICUStayDataset] stay_id={stay_id} has no non-empty chunk_* text")
-
+                raise RuntimeError(f"[ICUStayDataset] stay_id={stay_id} has no non-empty chunk text")
             M = int(getattr(CFG, "notes_max_chunks", -1))
             if M > 0:
                 notes_list = notes_list[:M]
-
             notes_payload = {"mode": "text", "chunks": notes_list}
-
         else:
-            try:
-                n_chunks = int(row.get("n_chunks", 0) or 0)
-            except Exception:
-                n_chunks = 0
-
-            ids_chunks: List[List[int]] = []
-            attn_chunks: List[List[int]] = []
-
+            n_chunks = int(row_n.get("n_chunks", 0) or 0)
+            ids_chunks, attn_chunks = [], []
             for j, (c_id, c_m) in enumerate(zip(self.input_id_cols, self.attn_mask_cols)):
                 if n_chunks > 0 and j >= n_chunks:
                     break
-
-                ids = _cell_to_list(row.get(c_id, None))
-                msk = _cell_to_list(row.get(c_m, None))
-
-                if len(ids) == 0 or len(msk) == 0:
+                ids = _cell_to_list(row_n.get(c_id, None))
+                msk = _cell_to_list(row_n.get(c_m, None))
+                if len(ids) == 0 or len(msk) == 0 or len(ids) != len(msk):
                     continue
-
-                if len(ids) != len(msk):
-                    continue
-
                 if np.sum(np.asarray(msk, dtype=np.int64)) <= 0:
                     continue
-
                 ids_chunks.append(ids)
                 attn_chunks.append(msk)
 
             if len(ids_chunks) == 0:
-                raise RuntimeError(
-                    f"[ICUStayDataset] stay_id={stay_id} has no valid non-pad chunks "
-                    f"(all attention masks are zero or missing)"
-                )
+                raise RuntimeError(f"[ICUStayDataset] stay_id={stay_id} has no valid chunks")
 
             M = int(getattr(CFG, "notes_max_chunks", -1))
             if M > 0:
                 ids_chunks = ids_chunks[:M]
                 attn_chunks = attn_chunks[:M]
+            notes_payload = {"mode": "pretokenized", "input_ids": ids_chunks, "attention_mask": attn_chunks}
 
-            notes_payload = {
-                "mode": "pretokenized",
-                "input_ids": ids_chunks,
-                "attention_mask": attn_chunks,
-            }
-
-        df_i = self.images[self.images.stay_id == stay_id]
-        if df_i.empty:
-            raise RuntimeError(f"[ICUStayDataset] stay_id={stay_id} missing images row")
-
-        raw_paths = df_i.cxr_path.dropna().astype(str).tolist()
-        raw_paths = [p for p in raw_paths if str(p).strip()]
-        cand = [resolve_image_path(p, self.root) for p in raw_paths]
-        cand = [p for p in cand if is_probably_image_file(p) and os.path.exists(p)]
+        # --- image: use precomputed map (fast)
+        cand = self.img_map.get(stay_id, [])
         if not cand:
-            sample_show = raw_paths[:3]
-            raise RuntimeError(
-                f"[ICUStayDataset] stay_id={stay_id} has no valid existing image files. "
-                f"Example raw paths: {sample_show} | dataset_root={self.root}"
-            )
+            raise RuntimeError(f"[ICUStayDataset] stay_id={stay_id} has no valid image in img_map")
+        img_paths = [cand[-1]]  # pick last
 
-        img_paths = [cand[-1]]  
-        lab_row = self.labels[self.labels.stay_id == stay_id]
-        if lab_row.empty:
-            raise RuntimeError(f"[ICUStayDataset] Missing labels for stay_id={stay_id}")
-
+        # --- label: O(1)
+        row_y = self.labels.loc[stay_id]
+        if isinstance(row_y, pd.DataFrame):
+            row_y = row_y.iloc[0]
         col = self.label_cols[0]
-        y0 = lab_row[col].iloc[0]
+        y0 = row_y[col]
         y0 = 0 if (y0 is None or (isinstance(y0, float) and np.isnan(y0))) else int(float(y0) > 0.0)
-        y = torch.tensor(y0, dtype=torch.long)   
+        y = torch.tensor(y0, dtype=torch.long)
+
         return {
             "stay_id": stay_id,
             "x_struct": xs,
@@ -1385,6 +1419,7 @@ class ICUStayDataset(Dataset):
             "image_paths": img_paths,
             "y": y,
         }
+
 
 
 def pad_or_trim_struct(x: torch.Tensor, T: int, F: int) -> torch.Tensor:
@@ -1727,16 +1762,18 @@ def evaluate_epoch(
             rc_report = None
 
             if rc_raw is not None:
-                assert rc_raw.ndim == 3, f"rc_raw must be [B,R,K], got {tuple(rc_raw.shape)}"
-                assert int(rc_raw.shape[1]) == int(N_ROUTES), f"Expected R={N_ROUTES}, got {int(rc_raw.shape[1])}"
+                rc_raw = normalize_rc_shape_to_brk(rc_raw, expect_routes=N_ROUTES, name=f"{split_name}.rc_raw")
 
-                assert_routing_over_routes(rc_raw, routes_dim=1, atol=1e-2, name=f"{split_name}.rc_raw")
+                assert_probs_over_dim(rc_raw, dim=2, atol=1e-2, name=f"{split_name}.rc_raw_over_classes")
+                # rc_raw should be normalized over classes (dim=2), not routes
+                assert_probs_over_dim(rc_raw, dim=2, atol=1e-2, name=f"{split_name}.rc_raw_over_classes")
 
                 rc_report = route_given_pheno(rc_raw, prim_acts, route_mask=route_mask)
+
                 assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name=f"{split_name}.rc_report")
 
                 if bidx == 0:
-                    expect_k = int(logits.size(1))  
+                    expect_k = int(rc_raw.shape[2])
                     debug_routing_tensor(rc_raw,    name=f"{split_name}.rc_raw",    expect_routes=N_ROUTES, expect_k=expect_k)
                     debug_routing_tensor(rc_report, name=f"{split_name}.rc_report", expect_routes=N_ROUTES, expect_k=expect_k)
 
@@ -2790,8 +2827,15 @@ def main():
         if epoch in {start_epoch, start_epoch + encoder_warmup_epochs}:
             print(f"[warmup] epoch={epoch+1} enc_lr={enc_lr} head_lr={args.lr} enc_train={enc_train}")
 
-        behrt.train()
-        imgenc.train()
+        if enc_train:
+            behrt.train()
+            imgenc.train()
+        else:
+            # frozen -> avoid BN/Dropout updates
+            behrt.eval()
+            imgenc.eval()
+
+        # text encoder handling
         bbert.train()
         if getattr(bbert, "bert", None) is not None:
             if CFG.finetune_text:
@@ -2801,7 +2845,6 @@ def main():
 
         total_loss, total_correct, total = 0.0, 0, 0
         act_sum = torch.zeros(N_ROUTES, dtype=torch.float32)
-
         num_samples = 0
 
         for step, (xL, mL, notes, imgs, y, dbg) in enumerate(train_loader):
@@ -2872,24 +2915,13 @@ def main():
 
                 rc_raw = out[3] if len(out) > 3 else None
                 rc_report = None
-
                 if rc_raw is not None:
-                    assert rc_raw.ndim == 3, f"rc_raw must be [B,R,K], got {tuple(rc_raw.shape)}"
-                    assert int(rc_raw.shape[1]) == int(N_ROUTES), f"Expected R={N_ROUTES}, got {tuple(rc_raw.shape)}"
+                    rc_raw = normalize_rc_shape_to_brk(rc_raw, expect_routes=N_ROUTES, name="TRAIN.rc_raw")
 
-                    sR = rc_raw.sum(dim=1)
-                    if not torch.allclose(sR, torch.ones_like(sR), atol=1e-2):
-                        if getattr(CFG, "verbose", False):
-                            print(f"[warn] TRAIN.rc_raw not normalized, max|sumR-1|={(sR-1).abs().max().item():.4e}")
+                    # rc_raw is per-route class distribution -> check over classes
+                    assert_probs_over_dim(rc_raw, dim=2, atol=1e-2, name="TRAIN.rc_raw_over_classes")
 
                     rc_report = route_given_pheno(rc_raw, prim_acts, route_mask=route_mask)
-                    assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name="TRAIN.rc_report")
-
-                    if bool(getattr(args, "route_debug", False)) and (epoch == start_epoch) and (step == 0):
-                        expect_k = int(logits.size(1))
-                        debug_routing_tensor(rc_raw,    name="TRAIN.rc_raw",    expect_routes=N_ROUTES, expect_k=expect_k)
-                        debug_routing_tensor(rc_report, name="TRAIN.rc_report", expect_routes=N_ROUTES, expect_k=expect_k)
-
                     assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name="TRAIN.rc_report")
 
                     if bool(getattr(args, "route_debug", False)) and (epoch == start_epoch) and (step == 0):
@@ -3086,12 +3118,12 @@ def main():
         val_macro_auroc = float(m["AUROC"])   # macro AUROC
 
         # Epoch-level early stopping on VAL macro AUROC 
+        val_macro_auroc = float(m["AUROC"])  
         if val_macro_auroc > best_val_auroc + min_delta:
             best_val_auroc = val_macro_auroc
             epochs_no_improve = 0
             print(f"[early-stop] AUROC improved to {best_val_auroc:.4f} (epoch {epoch + 1})")
         else:
-            # Only start counting patience after min_epochs
             if (epoch + 1) >= min_epochs:
                 epochs_no_improve += 1
                 print(
@@ -3106,6 +3138,7 @@ def main():
                     f"[early-stop] No improvement but epoch {epoch + 1} < min_epochs={min_epochs} "
                     f"→ not counting patience yet."
                 )
+
 
         # Calibration
         ece, centers, bconf, bacc, bcnt = expected_calibration_error(
