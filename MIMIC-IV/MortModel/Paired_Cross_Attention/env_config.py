@@ -342,14 +342,6 @@ def _sync_routing_aliases(cfg: Config) -> None:
         setattr(cfg, "gate_max", float(getattr(cfg, "gate_max")))
 
 
-def _normalize_task_name(name: str) -> str:
-    n = (name or "").strip().lower()
-    if n in TASKS_PHENO_ALIAS:
-        return "mortality"
-    if n == "":
-        return "mortality"
-    return n
-
 def load_cfg(yaml_path: Optional[str] = None,
              overrides: Optional[Dict[str, Any]] = None) -> Config:
     global CFG, DEVICE, TASK2IDX, SELECTED_TASK_IDX
@@ -461,7 +453,6 @@ def load_cfg(yaml_path: Optional[str] = None,
                 cfg_dict[cfg_key] = os.environ[env_key]
 
     CFG = Config(**cfg_dict)
-    CFG.task_name = _normalize_task_name(CFG.task_name)
     CFG.structured_format = str(CFG.structured_format).lower().strip()
     if CFG.structured_format not in {"packed", "long"}:
         CFG.structured_format = "packed"
@@ -588,8 +579,7 @@ def apply_cli_overrides(args: Any) -> None:
     if hasattr(args, "finetune_text") and getattr(args, "finetune_text") is not None:
         CFG.finetune_text = _str2bool(getattr(args, "finetune_text"))
 
-    if hasattr(args, "task") and getattr(args, "task") is not None:
-        CFG.task_name = _normalize_task_name(str(getattr(args, "task")))
+
     CFG.route_num = len(ROUTES)
     _sync_routing_aliases(CFG)
     ensure_dir(CFG.ckpt_root)
@@ -602,9 +592,6 @@ def get_label_name(idx: int, label_names: Optional[List[str]] = None) -> str:
         return str(names[idx])
     return f"label_{idx:02d}"
 
-
-def get_pheno_name(idx: int) -> str:
-    return get_label_name(idx)
 
 def get_device() -> torch.device:
     return torch.device(DEVICE)
