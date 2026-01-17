@@ -35,67 +35,69 @@ class MULTModel(nn.Module):
         self.trans_n = self.get_network(self_type='n_only', layers=self.self_layers)
         self.trans_i = self.get_network(self_type='i_only', layers=self.self_layers)
 
-        if self.lonly:
-            self.trans_l_with_n = self.get_network(self_type='ln')
-            self.trans_l_with_i = self.get_network(self_type='li')
-        if self.nonly:
-            self.trans_n_with_l = self.get_network(self_type='nl')
-            self.trans_n_with_i = self.get_network(self_type='ni')
-        if self.ionly:
-            self.trans_i_with_l = self.get_network(self_type='il')
-            self.trans_i_with_n = self.get_network(self_type='in')
+        self.trans_l_with_n = self.get_network(self_type='ln')
+        self.trans_l_with_i = self.get_network(self_type='li')
 
-        # Align N / I embeddings into d_l for pairing (no change to existing returned routes)
+        self.trans_n_with_l = self.get_network(self_type='nl')
+        self.trans_n_with_i = self.get_network(self_type='ni')
+
+        self.trans_i_with_l = self.get_network(self_type='il')
+        self.trans_i_with_n = self.get_network(self_type='in')
+
         self.proj_n_to_l = nn.Identity() if self.d_n == self.d_l else nn.Linear(self.d_n, self.d_l, bias=True)
         self.proj_i_to_l = nn.Identity() if self.d_i == self.d_l else nn.Linear(self.d_i, self.d_l, bias=True)
 
-        # Pair projections (2*d_l -> d_l)
         self.proj_pair_ln = nn.Linear(2 * self.d_l, self.d_l, bias=True)
         self.proj_pair_li = nn.Linear(2 * self.d_l, self.d_l, bias=True)
         self.proj_pair_ni = nn.Linear(2 * self.d_l, self.d_l, bias=True)
 
-        # Trimodal projection (3*d_l -> d_l)
         self.final_lni = nn.Linear(3 * self.d_l, self.d_l, bias=True)
 
-    def get_network(self, self_type='l', layers=-1):
-        if self_type in ['l', 'nl', 'il']:
+    def get_network(self, self_type: str = 'l', layers: int = -1):
+        n_layers = self.layers if layers == -1 else layers
+        
+        q = self_type[0]
+        if q == 'l':
             embed_dim, attn_dropout = self.d_l, self.attn_dropout
-        elif self_type in ['n', 'ln', 'in']:
+        elif q == 'n':
             embed_dim, attn_dropout = self.d_n, self.attn_dropout_n
-        elif self_type in ['i', 'li', 'ni']:
-            embed_dim, attn_dropout = self.d_i, self.attn_dropout_i
-        elif self_type == "l_only":
-            embed_dim, attn_dropout = self.d_l, self.attn_dropout
-        elif self_type == "n_only":
-            embed_dim, attn_dropout = self.d_n, self.attn_dropout_n
-        elif self_type == "i_only":
+        elif q == 'i':
             embed_dim, attn_dropout = self.d_i, self.attn_dropout_i
         else:
-            raise ValueError("Unknown network type")
+            raise ValueError(f"Unknown network type: {self_type}")
 
         return TransformerEncoder(
             embed_dim=embed_dim,
             num_heads=self.num_heads,
-            layers=max(self.layers, layers),
+            layers=n_layers,              
             attn_dropout=attn_dropout,
             relu_dropout=self.relu_dropout,
             res_dropout=self.res_dropout,
             embed_dropout=self.embed_dropout,
-            attn_mask=self.attn_mask
+            attn_mask=self.attn_mask,
         )
 
     def _masked_mean_tbd(self, h_tbd, m_bt):
-        """
-        h_tbd: [T,B,D]
-        m_bt:  [B,T] float (1=keep, 0=pad)
-        returns [B,D]
-        """
         if m_bt is None:
             return h_tbd.mean(dim=0)  # mean over T -> [B,D]
         m = m_bt.float()
         denom = m.sum(dim=1, keepdim=True).clamp_min(1.0)  # [B,1]
         h_btd = h_tbd.permute(1, 0, 2)                     # [B,T,D]
         return (h_btd * m.unsqueeze(-1)).sum(dim=1) / denom
+
+    def _masked_last_tbd(self, h_tbd, m_bt):
+        if m_bt is None:
+            return h_tbd[-1]  # [B,D]
+        m = (m_bt > 0.5).long()          # [B,T]
+        lengths = m.sum(dim=1)           # [B]
+        idx = (lengths - 1).clamp_min(0) # [B]
+        h_btd = h_tbd.permute(1, 0, 2)   # [B,T,D]
+        out = h_btd[torch.arange(h_btd.size(0), device=h_btd.device), idx]  # [B,D]
+        if (lengths == 0).any():
+            out = out.clone()
+            out[lengths == 0] = 0.0
+        return out
+
 
     def _ensure_float_mask(self, m, B, T, device):
         if m is None:
@@ -136,12 +138,6 @@ class MULTModel(nn.Module):
         proj_x_n = proj_x_n.permute(2, 0, 1)  # [TN,B,d_n]
         proj_x_i = proj_x_i.permute(2, 0, 1)  # [TI,B,d_i]
 
-        if not (self.lonly and self.nonly and self.ionly):
-            raise RuntimeError(
-                "forward_from_encoders requires lonly=nonly=ionly=True so cross modules exist "
-                "(trans_l_with_n/trans_l_with_i/trans_n_with_l/trans_n_with_i/trans_i_with_l/trans_i_with_n)."
-        )
-
         # Cross (directional) with masks
         h_l_with_ns = self.trans_l_with_n(proj_x_l, proj_x_n, proj_x_n, q_mask=mL, kv_mask=mN)
         h_l_with_is = self.trans_l_with_i(proj_x_l, proj_x_i, proj_x_i, q_mask=mL, kv_mask=mI)
@@ -152,17 +148,15 @@ class MULTModel(nn.Module):
         h_i_with_ls = self.trans_i_with_l(proj_x_i, proj_x_l, proj_x_l, q_mask=mI, kv_mask=mL)
         h_i_with_ns = self.trans_i_with_n(proj_x_i, proj_x_n, proj_x_n, q_mask=mI, kv_mask=mN)
 
-        # Pool cross outputs WITH QUERY mask (never use [-1] when padded)
-        zLN = self._masked_mean_tbd(h_l_with_ns, mL)   # [B,d_l]  e_{L<-N}
-        zLI = self._masked_mean_tbd(h_l_with_is, mL)   # [B,d_l]  e_{L<-I}
+        zLN = self._masked_last_tbd(h_l_with_ns, mL)
+        zLI = self._masked_last_tbd(h_l_with_is, mL)
 
-        zNL = self._masked_mean_tbd(h_n_with_ls, mN)   # [B,d_n]  e_{N<-L}
-        zNI = self._masked_mean_tbd(h_n_with_is, mN)   # [B,d_n]  e_{N<-I}
+        zNL = self._masked_last_tbd(h_n_with_ls, mN)
+        zNI = self._masked_last_tbd(h_n_with_is, mN)
 
-        zIL = self._masked_mean_tbd(h_i_with_ls, mI)   # [B,d_i]  e_{I<-L}
-        zIN = self._masked_mean_tbd(h_i_with_ns, mI)   # [B,d_i]  e_{I<-N}
+        zIL = self._masked_last_tbd(h_i_with_ls, mI)
+        zIN = self._masked_last_tbd(h_i_with_ns, mI)
 
-        # UPDATED Tri: build from (LN, LI, NI) pair embeddings 
         zNL_l = self.proj_n_to_l(zNL)  # [B,d_l]
         zNI_l = self.proj_n_to_l(zNI)  # [B,d_l]
         zIL_l = self.proj_i_to_l(zIL)  # [B,d_l]
@@ -188,9 +182,6 @@ class MULTModel(nn.Module):
         }
 
     def forward(self, x_l, x_n, x_i):
-        """
-        Inputs MUST be [B, T, D]
-        """
         x_l = F.dropout(x_l.transpose(1, 2), p=self.embed_dropout, training=self.training)  # [B,D,T]
         x_n = x_n.transpose(1, 2)
         x_i = x_i.transpose(1, 2)
@@ -218,7 +209,6 @@ class MULTModel(nn.Module):
         h_i_with_ls = self.trans_i_with_l(proj_x_i, proj_x_l, proj_x_l)
         h_i_with_ns = self.trans_i_with_n(proj_x_i, proj_x_n, proj_x_n)
 
-        # last timestep pooled (as in your original forward)
         h_l_last = h_l_only[-1]      # [B, d_l]
         h_n_last = h_n_only[-1]      # [B, d_n]
         h_i_last = h_i_only[-1]      # [B, d_i]
