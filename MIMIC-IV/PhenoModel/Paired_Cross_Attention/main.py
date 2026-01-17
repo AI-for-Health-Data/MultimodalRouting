@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 import os as _os
 _os.environ.setdefault("HF_HOME", _os.path.expanduser("~/.cache/huggingface"))
@@ -64,8 +65,6 @@ def seed_worker(worker_id: int):
     np.random.seed(ws)
     random.seed(ws)
     torch.manual_seed(ws)
-
-    # ADD THIS:
     global TOKENIZER, MAXLEN
     if TOKENIZER is None:
         from transformers import AutoTokenizer
@@ -229,8 +228,7 @@ def debug_routing_tensor(
             K_found = rc.shape[k_dim]
             if int(K_found) != int(expect_k):
                 print(f"[debug] {name}: WARNING K mismatch: got K={K_found} but expect_k={expect_k} (k_dim={k_dim})")
-        # If this tensor is supposed to be p(route|phenotype), then sum over routes should be 1.
-        # If it's p(phenotype|route), then sum over phenotypes should be 1.
+
         s_over_routes = rc.sum(dim=routes_dim)
         s_over_k = rc.sum(dim=k_dim)
 
@@ -318,12 +316,6 @@ def print_phenotype_routing_heatmap(
     top_k: Optional[int] = None,
     rc_is_report: bool = True,
 ):
-    """
-    If rc_is_report=True:
-        show p(route | phenotype) = mean over batch of routing_coef
-    else:
-        show effective = p(route | phenotype) * primary_act
-    """
     with torch.no_grad():
         rc = routing_coef.detach().float().cpu()   # [B,R,K]
         pa = prim_acts.detach().float().cpu()      # [B,R]
@@ -396,14 +388,6 @@ def save_routing_heatmap(
     where: str,
     out_dir: str,
 ):
-    """
-    Saves:
-      1) p(route|phenotype) heatmap (KxR)
-      2) effective = p(route|phenotype) * primary_act heatmap (KxR)
-
-    routing_coef: [B,R,K] assumed to be p(route|phenotype) (normalized over routes)
-    prim_acts:    [B,R]
-    """
     with torch.no_grad():
         rc = routing_coef.detach().float().cpu()   # [B,R,K]
         pa = prim_acts.detach().float().cpu()      # [B,R]
@@ -430,9 +414,6 @@ def save_routing_heatmap(
 
         os.makedirs(out_dir, exist_ok=True)
 
-        # ----------------------------
-        # 1) Save p(route|phenotype)
-        # ----------------------------
         mat = rc_mean.T  # [K,R]
         plt.figure(figsize=(10, 8))
         im = plt.imshow(mat, aspect="auto")
@@ -448,9 +429,6 @@ def save_routing_heatmap(
         plt.close()
         print(f"[routing] saved p(route|phenotype) heatmap → {fname}")
 
-        # ----------------------------
-        # 2) Save effective = p * act
-        # ----------------------------
         mat2 = eff_mean.T  # [K,R]
         plt.figure(figsize=(10, 8))
         im2 = plt.imshow(mat2, aspect="auto")
@@ -1297,8 +1275,6 @@ def load_cxr_tensor(paths: List[str], tfms: T.Compose, return_path: bool = False
         tensor = torch.zeros(3, 224, 224)
     return (tensor, p_full) if return_path else tensor
 
-
-
 def collate_fn_factory(tidx: int, img_tfms: T.Compose):
     first_print = {"done": False}
 
@@ -1354,7 +1330,6 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
             "chunk_mask": notes_cmask,
             "mode": "batched"
         }
-
         imgs_list, img_paths_list = [], []
         for b in batch:
             assert len(b["image_paths"]) > 0 and str(b["image_paths"][-1]).strip(), \
@@ -1372,8 +1347,6 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
         dbg = {"stay_ids": [b["stay_id"] for b in batch], "img_paths": img_paths_list}
         return xL_batch, mL_batch, notes_batch, imgs_batch, y_batch, dbg
     return _collate
-
-
 
 @torch.no_grad()
 def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
@@ -1439,7 +1412,6 @@ def capsule_forward_from_encoded(
 ):
     z = {"L": outL, "N": outN, "I": outI}
     route_embs_in = make_route_inputs_mult(z, mult)
-    # --- HARD CHECK: ensure we truly have all expected routes ---
     missing = [r for r in ROUTE_NAMES if r not in route_embs_in]
     extra   = [r for r in route_embs_in.keys() if r not in ROUTE_NAMES]
     assert not missing, f"Missing routes from make_route_inputs_mult: {missing}. Present: {sorted(route_embs_in.keys())}"
@@ -1459,18 +1431,14 @@ def capsule_forward_from_encoded(
 
 def _clamp_norm(x: torch.Tensor, max_norm: float = 20.0) -> torch.Tensor:
     if x.ndim == 2:
-        # [B, D] -> clamp across D
         n = x.norm(dim=1, keepdim=True) + 1e-6
         scale = torch.clamp(max_norm / n, max=1.0)
         return x * scale
     elif x.ndim == 3:
-        # [B, T, D] -> clamp across D
         n = x.norm(dim=2, keepdim=True) + 1e-6
         scale = torch.clamp(max_norm / n, max=1.0)
         return x * scale
     return x
-
-
 
 def _safe_tensor(x: torch.Tensor, name: str = "") -> torch.Tensor:
     if not torch.isfinite(x).all():
@@ -1479,21 +1447,15 @@ def _safe_tensor(x: torch.Tensor, name: str = "") -> torch.Tensor:
         x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
     return x
 
-
 def _sanitize_encoder_out(out: Dict[str, torch.Tensor], name: str) -> Dict[str, torch.Tensor]:
     out2 = dict(out)
-
     if "seq" in out2 and out2["seq"] is not None:
         out2["seq"] = _safe_tensor(_clamp_norm(out2["seq"].float(), 20.0), f"{name}.seq").float()
-
     if "pool" in out2 and out2["pool"] is not None:
         out2["pool"] = _safe_tensor(_clamp_norm(out2["pool"].float(), 20.0), f"{name}.pool").float()
-
     if "mask" in out2 and out2["mask"] is not None:
         out2["mask"] = out2["mask"].float()
-
     return out2
-
 
 def _has_nonfinite(*tensors: torch.Tensor) -> bool:
     for t in tensors:
@@ -1511,10 +1473,6 @@ def coerce_rc_to_report(
     split_name: str = "",
     atol: float = 1e-3,
 ):
-    """
-    Returns rc_report shaped [B,R,K] that is p(route|phenotype) normalized over routes (dim=1).
-    Auto-detects whether rc_raw is already p(route|pheno) or is p(pheno|route).
-    """
     assert rc_raw.ndim == 3, f"{split_name}.rc_raw must be [B,R,K], got {tuple(rc_raw.shape)}"
 
     s_over_routes = rc_raw.float().sum(dim=1)  # [B,K]
@@ -1528,15 +1486,12 @@ def coerce_rc_to_report(
 
 
     if ok_routes:
-        # already p(route|pheno)
         return rc_raw, "rc_raw is already p(route|phenotype) (sum over routes == 1)"
 
     if ok_k:
-        # looks like p(pheno|route) -> convert
         rc_report = route_given_pheno(rc_raw, prim_acts, route_mask=route_mask)
         return rc_report, "converted rc_raw from p(phenotype|route) -> p(route|phenotype)"
 
-    # fallback: we don't know, but downstream expects normalization over routes
     rc = torch.clamp(rc_raw, 1e-8, 1.0)
     rc = rc / rc.sum(dim=1, keepdim=True).clamp(min=1e-8)
     return rc, "WARNING: rc_raw not normalized over routes or K; renormalized over routes as fallback"
@@ -2018,7 +1973,6 @@ def epoch_metrics(y_true, p, y_pred):
     out["Recall_micro"]    = micro_rec
     out["F1_micro"]        = micro_f1
     out["Precision_per_label"] = prec_per_label
-
 
     # Example-based F1
     example_f1s = []
@@ -2543,7 +2497,6 @@ def main():
         f"[capsule] pc_dim={CFG.capsule_pc_dim} mc_caps_dim={CFG.capsule_mc_caps_dim} "
         f"iters={CFG.capsule_num_routing} act_type={CFG.capsule_act_type} out_caps={num_phenos}"
     )
-
     encoder_warmup_epochs = int(getattr(args, "encoder_warmup_epochs", _cfg("encoder_warmup_epochs", 2)))
 
     enc_params: List[torch.nn.Parameter] = []
@@ -2562,7 +2515,6 @@ def main():
     head_params += [p for p in route_adapter.parameters() if p.requires_grad]
     head_params += [p for p in projector.parameters() if p.requires_grad]
     head_params += [p for p in cap_head.parameters() if p.requires_grad]
-
 
     params = enc_params + head_params
     optimizer = torch.optim.AdamW(
@@ -2677,7 +2629,7 @@ def main():
                         route_mask[:, drop_idx2] = 0.0
 
                 detach_priors_flag = (epoch - start_epoch) < routing_warmup_epochs
-                temp = 2.0 if (epoch - start_epoch) < 2 else 1.0   # or whatever schedule you want
+                temp = 2.0 if (epoch - start_epoch) < 2 else 1.0   
 
                 out = capsule_forward_from_encoded(
                     mult=mult,
@@ -2712,7 +2664,6 @@ def main():
                         print("[debug] TRAIN.rc_report sum over K (dim=2) mean/min/max:",
                               float(sK.mean()), float(sK.min()), float(sK.max()))
 
-
                     if bool(getattr(args, "route_debug", False)) and (epoch == start_epoch) and (step == 0):
                         debug_routing_tensor(
                             routing_coef,
@@ -2720,10 +2671,8 @@ def main():
                             expect_routes=N_ROUTES,
                             expect_k=int(y.size(1)),
                         )
-
                 logits    = _safe_tensor(logits.float(),     "logits(fp32)")
                 prim_acts = _safe_tensor(prim_acts.float(), "prim_acts(fp32)")
-
 
                 if _has_nonfinite(logits, prim_acts):
                     print(f"[skip] non-finite capsule outputs at epoch={epoch+1} step={step+1} -> skip")
@@ -2734,15 +2683,12 @@ def main():
                 cur_epoch = float(epoch + 1)
 
                 if routing_coef is not None:
-                    rc = routing_coef.float().clamp(1e-6, 1.0)  # [B,R,K], sums to 1 over routes
+                    rc = routing_coef.float().clamp(1e-6, 1.0)  
 
-                    # (1) Entropy over routes PER phenotype (avoid route collapse per K)
                     if route_entropy_lambda > 0.0 and (route_entropy_warmup_epochs <= 0 or cur_epoch > route_entropy_warmup_epochs):
                         H = -(rc * rc.log()).sum(dim=1).mean()
                         loss = loss - route_entropy_lambda * H
 
-
-                    # (2) Uniform route usage globally (aggregate across B and K)
                     if route_uniform_lambda > 0.0 and (route_uniform_warmup_epochs <= 0 or cur_epoch > route_uniform_warmup_epochs):
                         rc_mean_r = rc.mean(dim=(0, 2))          # [R]
                         target = torch.full_like(rc_mean_r, 1.0 / rc_mean_r.numel())
@@ -2817,22 +2763,18 @@ def main():
                 if max(avg_act) > 0.95:
                     dom_route = int(np.argmax(avg_act))
 
-
                     if routing_coef is not None:
                         rc = routing_coef.detach().float()          # [B,R,K]
                         rc_mass = rc.mean(dim=2)                    # [B,R]
 
-                        # mean route mass distribution
                         p = (rc_mass.mean(dim=0) + 1e-8)            # [R]
                         p = p / p.sum()
 
                         H = (-p * p.log()).sum().item()
 
-                        # your effective mean already printed in msg, but we print a scalar + top route
                         rc_top_val = float(p.max().item())
                         rc_top_idx = int(p.argmax().item())
 
-                        # activation top (from avg_act)
                         act_top_val = float(max(avg_act))
                         act_top_idx = int(np.argmax(avg_act))
 
@@ -2840,13 +2782,10 @@ def main():
                             f"[collapse dbg] rc_entropy={H:.4f} rc_top={rc_top_val:.4f} rc_top_route={routes[rc_top_idx]} "
                             f"| act_top={act_top_val:.4f} act_top_route={routes[act_top_idx]}"
                         )
-
-                    # keep your existing alert
                     print(
                         f"[alert] potential collapse → route={routes[dom_route]} "
                         f"mean={max(avg_act):.3f}"
                     )
-
 
         train_loss = total_loss / max(1, num_samples)
         train_acc  = total_correct / max(1, total)
@@ -2857,7 +2796,6 @@ def main():
             f"avg_prim_act={', '.join(f'{a:.3f}' for a in train_avg_act)}"
         )
         thr_to_use = best_thr if (epoch > start_epoch) else None
-
 
         val_loss, val_acc, val_act, val_rc_mat, val_eff_mat, val_pa = evaluate_epoch(
             behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
@@ -3066,9 +3004,6 @@ def main():
         f"AUPRC={mt['AUPRC']:.4f} F1={mt['F1']:.4f} Recall={mt['Recall']:.4f}"
     )
 
-    # ----------------------------
-    # Per-phenotype TEST metrics
-    # ----------------------------
     auroc_t  = mt["AUROC_per_label"]
     auprc_t  = mt["AUPRC_per_label"]
     f1_t     = mt["F1_per_label"]
@@ -3086,7 +3021,6 @@ def main():
             f"Precision={prec_t[k]:.4f}"
         )
 
-    # Save CSV (sorted by AUROC desc)
     df_test = pd.DataFrame({
         "phenotype": label_names,
         "AUROC": auroc_t,
@@ -3100,7 +3034,6 @@ def main():
     csv_path = os.path.join(ckpt_dir, "test_per_phenotype_metrics.csv")
     df_test.to_csv(csv_path, index=False, float_format="%.6f")
     print(f"[TEST] Saved per-phenotype metrics CSV → {csv_path}")
-
 
     ece_unc, centers_unc, bconf_unc, bacc_unc, _ = expected_calibration_error(
         p_test_uncal.reshape(-1), y_true_t_log.reshape(-1), n_bins=args.calib_bins
