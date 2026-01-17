@@ -1,9 +1,8 @@
+
 from __future__ import annotations
-from typing import Dict, Tuple, Sequence, Optional
+from typing import Dict, Tuple, Optional
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
 from env_config import ROUTES, DEVICE, CFG
 import capsule_layers
 from mult_model import MULTModel
@@ -38,52 +37,6 @@ def _nan_guard(tag: str, x: torch.Tensor) -> None:
             f"inf={torch.isinf(x).any().item()}"
         )
 
-def _gate_norm_routes(
-    rc: torch.Tensor,
-    *,
-    routes_dim: int = 1,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    rc = rc.float().clamp_min(0.0)
-    denom = rc.sum(dim=routes_dim, keepdim=True)   # [B,1,K]
-    R = rc.size(routes_dim)
-    rc_norm = rc / denom.clamp_min(eps)
-    small = (denom < eps)
-    if small.any():
-        uniform = torch.full_like(rc_norm, 1.0 / float(R))
-        rc_norm = torch.where(small.expand_as(rc_norm), uniform, rc_norm)
-    rc_norm = rc_norm.clamp_min(eps)
-    rc_norm = rc_norm / rc_norm.sum(dim=routes_dim, keepdim=True).clamp_min(eps)
-    return rc_norm
-
-def _mask_and_renorm_over_routes(
-    rc: torch.Tensor,
-    route_mask: Optional[torch.Tensor],
-    *,
-    routes_dim: int = 1,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    if route_mask is None:
-        return rc / rc.sum(dim=routes_dim, keepdim=True).clamp_min(eps)
-
-    if route_mask.ndim == 1:
-        view = [1] * rc.ndim
-        view[routes_dim] = -1
-        m = route_mask.to(rc.device).float().view(*view)
-    elif route_mask.ndim == 2:
-        if routes_dim != 1:
-            raise ValueError("route_mask [B,R] currently supported only for routes_dim=1")
-        m = route_mask.to(rc.device).float().unsqueeze(-1)  # [B,R,1]
-    else:
-        raise ValueError(f"route_mask must be [R] or [B,R], got {tuple(route_mask.shape)}")
-    rc = rc * m
-    denom = rc.sum(dim=routes_dim, keepdim=True)  # [B,1,K]
-    active = m.sum(dim=routes_dim, keepdim=True).clamp_min(1.0)  # [B,1,1] or [1,1,1]
-    uniform = m / active                                        
-    rc = torch.where(denom > eps, rc / denom.clamp_min(eps), uniform.expand_as(rc))
-    return rc
-
-
 def route_given_pheno(
     rc_k_given_r: torch.Tensor,      # [B,R,K] == query_key
     prim_act: torch.Tensor,          # [B,R] or [B,R,1]
@@ -98,19 +51,17 @@ def route_given_pheno(
     resp = rc_k_given_r * prim  # [B,R,K]
     if route_mask is not None:
         m = route_mask
-
-        # Accept [R] or [B,R]
         if m.ndim == 1:
             m = m.view(1, -1, 1)                 # [1,R,1]
         elif m.ndim == 2:
             m = m.unsqueeze(-1)                  # [B,R,1]
         else:
             raise ValueError(f"route_mask must be [R] or [B,R], got {tuple(m.shape)}")
-
         m = m.to(device=resp.device, dtype=resp.dtype)
         assert m.shape[1] == resp.shape[1], \
             f"route_mask routes dim mismatch: m.shape={tuple(m.shape)} resp.shape={tuple(resp.shape)}"
         resp = resp * m
+
     denom = resp.sum(dim=1, keepdim=True).clamp_min(eps)  # [B,1,K]
     rc_r_given_k = resp / denom
     return rc_r_given_k  # [B,R,K], sums to 1 over R (dim=1)
@@ -128,7 +79,7 @@ def _normalize_routing_coef(
     if rc.ndim != 3:
         raise ValueError(f"routing_coef must be 3D, got shape={tuple(rc.shape)}")
 
-    mode = str(mode or getattr(CFG, "routing_coef_mode", "gate_norm")).lower().strip()
+    mode = str(mode or getattr(CFG, "routing_coef_mode", "none")).lower().strip()
     eps = float(eps if eps is not None else getattr(CFG, "routing_coef_eps", 1e-6))
 
     B, d1, d2 = rc.shape
@@ -145,142 +96,7 @@ def _normalize_routing_coef(
 
     if mode == "none":
         return rc_brk
-
-    if mode == "gate_norm":
-        return _gate_norm_routes(rc_brk, routes_dim=1, eps=eps)
-
     raise ValueError(f"Unknown routing_coef_mode={mode!r}")
-
-def masked_mean(x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
-    # x: [B,T,D], m: [B,T] with 1=keep
-    m = m.float()
-    denom = m.sum(dim=1, keepdim=True).clamp_min(1.0)
-    return (x * m.unsqueeze(-1)).sum(dim=1) / denom
-
-class CrossAttentionFusion(nn.Module):
-    def __init__(
-        self,
-        d: int,
-        n_heads: int = 8,
-        attn_dropout: float = 0.0,
-        pool: str = "mean",        
-        ff_mult: int = 4,
-    ):
-        super().__init__()
-        self.pool = pool
-        self.attn = nn.MultiheadAttention(
-            d, n_heads, dropout=attn_dropout, batch_first=True
-        )
-        self.ln1 = nn.LayerNorm(d)
-        self.ff = nn.Sequential(
-            nn.Linear(d, ff_mult * d),
-            nn.ReLU(),
-            nn.Linear(ff_mult * d, d),
-        )
-        self.ln2 = nn.LayerNorm(d)
-        self.out = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d))
-
-    def forward(
-        self,
-        A: torch.Tensor, mA: torch.Tensor,
-        B: torch.Tensor, mB: torch.Tensor
-    ) -> torch.Tensor:
-        # A: [B,TA,D], mA:[B,TA] (1=keep)
-        # B: [B,TB,D], mB:[B,TB] (1=keep)
-        mA = mA.float()
-        mB = mB.float()
-
-        key_pad = (mB < 0.5)  # True=PAD for MultiheadAttention
-        A2B, _ = self.attn(query=A, key=B, value=B, key_padding_mask=key_pad, need_weights=False)
-        X = self.ln1(A + A2B)
-        X = self.ln2(X + self.ff(X))
-        if self.pool == "first":
-            # first valid token in A (fallback to 0 if all padded)
-            has_any = (mA > 0.5).any(dim=1)
-            idx = torch.where(
-                has_any,
-                (mA > 0.5).float().argmax(dim=1),
-                torch.zeros_like(has_any, dtype=torch.long),
-            )
-            z = X[torch.arange(X.size(0), device=X.device), idx]  # [B,D]
-        else:
-            z = masked_mean(X, mA)
-
-        return self.out(z)  # [B,D]
-
-class TriTokenAttentionFusion(nn.Module):
-    def __init__(self, d: int, n_heads: int = 8, attn_dropout: float = 0.0):
-        super().__init__()
-        self.q = nn.Parameter(torch.zeros(1, 1, d))
-        nn.init.normal_(self.q, std=0.02)
-        self.attn = nn.MultiheadAttention(d, n_heads, dropout=attn_dropout, batch_first=True)
-        self.ln_kv = nn.LayerNorm(d)
-        self.out = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d))
-
-    def forward(self, L_seq, mL, N_seq, mN, I_seq, mI) -> torch.Tensor:
-        B = L_seq.size(0)
-        q = self.q.expand(B, 1, -1)  # [B,1,D]
-        kv = torch.cat([L_seq, N_seq, I_seq], dim=1)  # [B, Tsum, D]
-        kv = self.ln_kv(kv)
-        m = torch.cat([mL, mN, mI], dim=1)            # [B, Tsum]
-        kv_pad = (m < 0.5)
-        out, _ = self.attn(query=q, key=kv, value=kv, key_padding_mask=kv_pad, need_weights=False)
-        z = out[:, 0, :]  # [B,D]
-        return self.out(z)
-
-
-def build_fusions(d: int, feature_mode: str = "seq", p_drop: float = 0.0):
-    dev = torch.device(DEVICE)
-    h = int(getattr(CFG, "cross_attn_heads", 8))
-    p = float(getattr(CFG, "cross_attn_dropout", p_drop))
-    pool = str(getattr(CFG, "cross_attn_pool", "mean")).lower().strip()
-    if pool not in {"mean", "first"}:
-        if getattr(CFG, "verbose", False):
-            print(f"[build_fusions] invalid cross_attn_pool={pool}; using 'mean'")
-        pool = "mean"
-
-    LN  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p, pool=getattr(CFG, "cross_attn_pool", "mean")).to(dev)
-    NL  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p, pool=getattr(CFG, "cross_attn_pool", "mean")).to(dev)
-    LI  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p, pool=getattr(CFG, "cross_attn_pool", "mean")).to(dev)
-    IL  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p, pool=getattr(CFG, "cross_attn_pool", "mean")).to(dev)
-    NI  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p, pool=getattr(CFG, "cross_attn_pool", "mean")).to(dev)
-    IN  = CrossAttentionFusion(d, n_heads=h, attn_dropout=p, pool=getattr(CFG, "cross_attn_pool", "mean")).to(dev)
-    LNI = TriTokenAttentionFusion(d, n_heads=h, attn_dropout=p).to(dev)
-
-    return {"LN": LN, "NL": NL, "LI": LI, "IL": IL, "NI": NI, "IN": IN, "LNI": LNI}
-
-@torch.no_grad()
-def _safe_clone(x: torch.Tensor) -> torch.Tensor:
-    return x.clone()
-
-def make_route_inputs(z, fusion) -> Dict[str, torch.Tensor]:
-    Ls, Ns, Is = z["L"]["seq"], z["N"]["seq"], z["I"]["seq"]
-    Lm, Nm, Im = z["L"]["mask"], z["N"]["mask"], z["I"]["mask"]
-
-    routes = {
-        # unimodal
-        "L":  z["L"]["pool"],
-        "N":  z["N"]["pool"],
-        "I":  z["I"]["pool"],
-
-        # bimodal directional (keep these exactly)
-        "LN": fusion["LN"](Ls, Lm, Ns, Nm),  # L attends N
-        "NL": fusion["NL"](Ns, Nm, Ls, Lm),  # N attends L
-        "LI": fusion["LI"](Ls, Lm, Is, Im),  # L attends I
-        "IL": fusion["IL"](Is, Im, Ls, Lm),  # I attends L
-        "NI": fusion["NI"](Ns, Nm, Is, Im),  # N attends I
-        "IN": fusion["IN"](Is, Im, Ns, Nm),  # I attends N
-
-        # trimodal
-        "LNI": fusion["LNI"](Ls, Lm, Ns, Nm, Is, Im),
-    }
-    expected = set(ROUTES)
-    got = set(routes.keys())
-    if expected != got:
-        missing = expected - got
-        extra = got - expected
-        raise RuntimeError(f"[make_route_inputs] Route key mismatch. missing={missing}, extra={extra}")
-    return routes
 
 def make_route_inputs_mult(z, multmodel: MULTModel):
     Ls, Ns, Is = z["L"]["seq"], z["N"]["seq"], z["I"]["seq"]
@@ -292,23 +108,22 @@ def make_route_inputs_mult(z, multmodel: MULTModel):
         mL=Lm, mN=Nm, mI=Im,
         L_pool=Lp, N_pool=Np, I_pool=Ip,
     )
+
     expected = set(ROUTES)
     got = set(routes.keys())
     if expected != got:
         missing = expected - got
         extra = got - expected
         raise RuntimeError(f"[make_route_inputs_mult] Route key mismatch. missing={missing}, extra={extra}")
-
     return routes
-
 
 class RoutePrimaryProjector(nn.Module):
     def __init__(self, d_in: int, pc_dim: int):
         super().__init__()
+        self.d_in = int(d_in)          
         self.pc_dim = int(pc_dim)
-
         self.proj = nn.ModuleDict({
-            r: nn.Linear(d_in, self.pc_dim + 1, bias=True)
+            r: nn.Linear(self.d_in, self.pc_dim + 1, bias=True)
             for r in ROUTES
         })
 
@@ -321,7 +136,7 @@ class RoutePrimaryProjector(nn.Module):
         poses = pc_all[:, :, :self.pc_dim]
         raw_logits = pc_all[:, :, self.pc_dim:]     # [B, len(ROUTES), 1]
 
-        acts = torch.sigmoid(raw_logits)            # no extra bias term
+        acts = torch.sigmoid(raw_logits)           
         return poses, acts
 
 
@@ -352,7 +167,6 @@ class RouteDimAdapter(nn.Module):
         })
 
     def forward(self, route_embs_in: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        # Keep keys identical; just map each tensor
         out: Dict[str, torch.Tensor] = {}
         for r in ROUTES:
             x = route_embs_in[r]
@@ -389,8 +203,6 @@ class CapsuleMortalityHead(nn.Module):
             act_type=act_type,
             small_std=True,                  
         )
-
-        # Decision capsule embedding → logits
         self.embedding = nn.Parameter(
             torch.zeros(self.out_n_capsules, self.out_d_capsules)
         )
@@ -403,7 +215,6 @@ class CapsuleMortalityHead(nn.Module):
         prim_act: torch.Tensor,    # [B, len(ROUTES)] or [B, len(ROUTES), 1]
         uniform_routing: bool = False,
     ):
-        # Ensure activations are [B, len(ROUTES), 1] (CapsuleFC expects [B, N_in, 1])
         if prim_act.dim() == 2:
             prim_act = prim_act.unsqueeze(-1)
         elif prim_act.dim() == 3 and prim_act.size(-1) == 1:
@@ -435,7 +246,6 @@ class CapsuleMortalityHead(nn.Module):
                         next_act = next_act.squeeze(-1)
                     if next_act.dim() != 2:
                         raise ValueError(f"next_act must be [B,M], got {tuple(next_act.shape)}")
-
             decision_pose, decision_act, routing_coef = self.capsule(
                 input=prim_pose,
                 current_act=prim_act,
@@ -444,19 +254,13 @@ class CapsuleMortalityHead(nn.Module):
                 next_act=next_act,                 
                 uniform_routing=uniform_routing,
             )
-
-
         logits = torch.einsum("bmd, md -> bm", decision_pose, self.embedding) + self.bias
-
         prim_act_out = prim_act.squeeze(-1)  # [B, len(ROUTES)]
-
         routing_coef = _normalize_routing_coef(
             routing_coef,
             mode="none",                     
             expect_routes=self.in_n_capsules,
         )
-
-
         return logits, prim_act_out, routing_coef
 
 def forward_capsule_from_route_dict(
@@ -466,7 +270,7 @@ def forward_capsule_from_route_dict(
     *,
     acts_override: Optional[torch.Tensor] = None,      # [B,len(ROUTES),1] optional external priors
     route_mask: Optional[torch.Tensor] = None,         # [B,len(ROUTES)]  (1=keep, 0=mask)
-    act_temperature: float = 1.0,                      
+    act_temperature: float = 1.0,                      # >1 softer, <1 sharper
     detach_priors: bool = False,
     return_routing: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor]]:
@@ -486,7 +290,6 @@ def forward_capsule_from_route_dict(
         if not torch.is_tensor(x):
             raise TypeError(f"route_embs_in['{r}'] must be a Tensor, got {type(x)}")
 
-        # allow [B,d] OR [B,1,d] (squeeze the middle)
         if x.dim() == 3 and x.size(1) == 1:
             x = x.squeeze(1)
         if x.dim() != 2:
@@ -506,7 +309,25 @@ def forward_capsule_from_route_dict(
     acts_prior = acts if acts_override is None else acts_override.to(device=acts.device, dtype=acts.dtype)
 
     if route_mask is not None:
-        acts_prior = acts_prior * route_mask.unsqueeze(-1) + 1e-6  # keep grads
+        rm = route_mask
+
+        if rm.ndim == 1:
+            rm = rm.view(1, -1).expand(acts_prior.size(0), -1)   # [B,R]
+        elif rm.ndim == 2:
+            pass
+        else:
+            raise ValueError(f"route_mask must be [R] or [B,R], got {tuple(rm.shape)}")
+
+        if rm.shape[1] != acts_prior.shape[1]:
+            raise ValueError(
+                f"route_mask routes dim mismatch: rm.shape={tuple(rm.shape)} "
+                f"acts_prior.shape={tuple(acts_prior.shape)}"
+            )
+
+        rm = rm.to(device=acts_prior.device, dtype=acts_prior.dtype)
+
+        # Apply mask (keep grads) + small floor
+        acts_prior = acts_prior * rm.unsqueeze(-1) + 1e-6
 
     if act_temperature != 1.0:
         eps = 1e-6
@@ -532,13 +353,9 @@ def forward_capsule_from_route_dict(
     if routing_coef is not None:
         routing_coef = _normalize_routing_coef(
             routing_coef,
-            mode="none",                  
+            mode="none",
             expect_routes=len(ROUTES),
         )
-        routing_coef = _mask_and_renorm_over_routes(
-            routing_coef, route_mask, routes_dim=1, eps=1e-6
-        )
-
 
     prim_acts = prim_act_out.detach()
     _peek_tensor("caps-bridge.prim_acts", prim_acts)
@@ -555,14 +372,14 @@ def forward_capsule_from_multmodel(
     projector: RoutePrimaryProjector,
     capsule_head: CapsuleMortalityHead,
     *,
-    route_adapter: Optional[RouteDimAdapter] = None,        # if dims differ, pass adapter
+    route_adapter: Optional[RouteDimAdapter] = None,        
     acts_override: Optional[torch.Tensor] = None,           # [B,len(ROUTES),1]
     route_mask: Optional[torch.Tensor] = None,              # [B,len(ROUTES)]
     act_temperature: float = 1.0,
     detach_priors: bool = False,
     return_routing: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor]]:
-    route_embs_in = multmodel(x_l, x_n, x_i)  # keys must match ROUTES, tensors usually [B,d_*]
+    route_embs_in = multmodel(x_l, x_n, x_i)  
 
     expected = set(ROUTES)
     got = set(route_embs_in.keys())
@@ -571,11 +388,9 @@ def forward_capsule_from_multmodel(
         extra = got - expected
         raise RuntimeError(f"[mult->caps] Route key mismatch. missing={missing}, extra={extra}")
 
-    # Optional: adapt dims to projector's d_in
     if route_adapter is not None:
         route_embs_in = route_adapter(route_embs_in)
 
-    # Now reuse the canonical bridge
     return forward_capsule_from_route_dict(
         route_embs_in=route_embs_in,
         projector=projector,
@@ -587,14 +402,10 @@ def forward_capsule_from_multmodel(
         return_routing=return_routing,
     )
 
-
 __all__ = [
-    "CrossAttentionFusion",
-    "TriTokenAttentionFusion",
-    "build_fusions",
-    "make_route_inputs",
     "RoutePrimaryProjector",
     "RouteDimAdapter",
+    "make_route_inputs_mult",
     "CapsuleMortalityHead",
     "forward_capsule_from_route_dict",
     "forward_capsule_from_multmodel",
