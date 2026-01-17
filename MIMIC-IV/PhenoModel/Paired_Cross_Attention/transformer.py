@@ -2,10 +2,8 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
-
 from position_embedding import SinusoidalPositionalEmbedding
 from multihead_attention import MultiheadAttention
-
 
 class TransformerEncoder(nn.Module):
     def __init__(
@@ -50,22 +48,14 @@ class TransformerEncoder(nn.Module):
         self.layer_norm = nn.LayerNorm(self.embed_dim) if self.normalize else None
 
     def forward(self, x_in, x_in_k=None, x_in_v=None, q_mask=None, kv_mask=None):
-        """
-        x_in:   [T, B, C]
-        x_in_k: [T2, B, C] optional
-        x_in_v: [T2, B, C] optional
-        """
         x = self.embed_scale * x_in
-
         if self.embed_positions is not None:
-            # Build dummy token ids [B,T] just to get positions
             B = x_in.size(1)
             T = x_in.size(0)
             dummy = torch.ones(B, T, device=x_in.device, dtype=torch.long)
             pos = self.embed_positions(dummy).transpose(0, 1)  # [T,B,C]
             pos = pos.to(dtype=x.dtype)
             x = x + pos
-
 
         x = F.dropout(x, p=self.dropout, training=self.training)
 
@@ -77,10 +67,17 @@ class TransformerEncoder(nn.Module):
             x_k = self.embed_scale * x_in_k
             x_v = self.embed_scale * x_in_v
             if self.embed_positions is not None:
-                pos_k = self.embed_positions(x_in_k.transpose(0, 1)[:, :, 0]).transpose(0, 1)
-                pos_v = self.embed_positions(x_in_v.transpose(0, 1)[:, :, 0]).transpose(0, 1)
+                B = x_in_k.size(1)
+                Tk = x_in_k.size(0)
+                dummy_k = torch.ones(B, Tk, device=x_in_k.device, dtype=torch.long)
+                pos_k = self.embed_positions(dummy_k).transpose(0, 1).to(dtype=x_k.dtype)
                 x_k = x_k + pos_k
+
+                # same for v (same length as k)
+                dummy_v = dummy_k
+                pos_v = self.embed_positions(dummy_v).transpose(0, 1).to(dtype=x_v.dtype)
                 x_v = x_v + pos_v
+
             x_k = F.dropout(x_k, p=self.dropout, training=self.training)
             x_v = F.dropout(x_v, p=self.dropout, training=self.training)
         else:
@@ -135,19 +132,10 @@ class TransformerEncoderLayer(nn.Module):
         self.layer_norms = nn.ModuleList([nn.LayerNorm(self.embed_dim) for _ in range(2)])
 
     def forward(self, x, x_k=None, x_v=None, q_mask=None, kv_mask=None):
-        """
-        x:   [Tq,B,C]
-        x_k: [Tk,B,C] optional
-        x_v: [Tk,B,C] optional
-        q_mask:  [B,Tq] float (1=keep, 0=pad)
-        kv_mask: [B,Tk] float (1=keep, 0=pad) for cross-attn; for self-attn you can pass q_mask
-        """
-        # Build keep mask for query positions so PAD stays zero
         q_keep = None
         if q_mask is not None:
             q_keep = q_mask.transpose(0, 1).to(device=x.device, dtype=x.dtype).unsqueeze(-1)  # [Tq,B,1]
 
-        # Choose key padding mask for attention (True means PAD)
         key_padding_mask = None
         if x_k is None and x_v is None:
             if q_mask is not None:
@@ -164,6 +152,7 @@ class TransformerEncoderLayer(nn.Module):
             x = x * q_keep
 
         mask = buffered_future_mask(x, x_k) if self.attn_mask else None
+
         if x_k is None and x_v is None:
             x, _ = self.self_attn(
                 query=x, key=x, value=x,
@@ -212,7 +201,6 @@ class TransformerEncoderLayer(nn.Module):
 def fill_with_neg_inf(t):
     return t.float().fill_(float("-inf")).type_as(t)
 
-
 def buffered_future_mask(tensor, tensor2=None):
     dim1 = tensor.size(0)
     dim2 = tensor2.size(0) if tensor2 is not None else dim1
@@ -220,7 +208,6 @@ def buffered_future_mask(tensor, tensor2=None):
     future_mask = torch.triu(fill_with_neg_inf(torch.ones(dim1, dim2)), 1 + abs(dim2 - dim1))
     future_mask = future_mask.to(tensor.device)
     return future_mask[:dim1, :dim2]
-
 
 def Linear(in_features, out_features, bias=True):
     m = nn.Linear(in_features, out_features, bias)
