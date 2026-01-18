@@ -1546,6 +1546,7 @@ def epoch_metrics(y_true, p, y_pred):
         average_precision_score,
         f1_score,
         recall_score,
+        precision_score, 
         confusion_matrix,
     )
 
@@ -1555,45 +1556,56 @@ def epoch_metrics(y_true, p, y_pred):
 
     N, K = y_true.shape
 
-    aurocs, auprcs, f1s, recs = [], [], [], []
+    aurocs, auprcs, f1s, recs, precs = [], [], [], [], []  
+
     auroc_per_label = np.full(K, np.nan, dtype=float)
     auprc_per_label = np.full(K, np.nan, dtype=float)
     f1_per_label    = np.full(K, np.nan, dtype=float)
     rec_per_label   = np.full(K, np.nan, dtype=float)
+    prec_per_label  = np.full(K, np.nan, dtype=float)
 
     for k in range(K):
         yk  = y_true[:, k]
         pk  = p[:, k]
         ypk = y_pred[:, k]
 
-        if len(np.unique(yk)) < 2:
-            continue
+        has_both = (len(np.unique(yk)) >= 2)
 
-        try:
-            au = roc_auc_score(yk, pk)
-            aurocs.append(au)
-            auroc_per_label[k] = au
-        except Exception:
-            pass
+        # AUROC/AUPRC only if both classes exist
+        if has_both:
+            try:
+                au = roc_auc_score(yk, pk)
+                aurocs.append(au)
+                auroc_per_label[k] = au
+            except Exception:
+                pass
 
-        try:
-            ap = average_precision_score(yk, pk)
-            auprcs.append(ap)
-            auprc_per_label[k] = ap
-        except Exception:
-            pass
+            try:
+                ap = average_precision_score(yk, pk)
+                auprcs.append(ap)
+                auprc_per_label[k] = ap
+            except Exception:
+                pass
 
+        # F1/Recall/Precision: compute always (avoid warnings/div-by-zero)
         try:
-            f1k = f1_score(yk, ypk)
+            f1k = f1_score(yk, ypk, zero_division=0)
             f1s.append(f1k)
             f1_per_label[k] = f1k
         except Exception:
             pass
 
         try:
-            rk = recall_score(yk, ypk)
+            rk = recall_score(yk, ypk, zero_division=0)
             recs.append(rk)
             rec_per_label[k] = rk
+        except Exception:
+            pass
+
+        try:
+            prk = precision_score(yk, ypk, zero_division=0)   # <<< ADD THIS BLOCK
+            precs.append(prk)
+            prec_per_label[k] = prk
         except Exception:
             pass
 
@@ -1604,11 +1616,13 @@ def epoch_metrics(y_true, p, y_pred):
     out["AUPRC_macro"]  = float(np.nanmean(auprcs)) if len(auprcs) > 0 else float("nan")
     out["F1_macro"]     = float(np.nanmean(f1s))    if len(f1s) > 0 else float("nan")
     out["Recall_macro"] = float(np.nanmean(recs))   if len(recs) > 0 else float("nan")
+    out["Precision_macro"] = float(np.nanmean(precs)) if len(precs) > 0 else float("nan")
 
     out["AUROC"]  = out["AUROC_macro"]
     out["AUPRC"]  = out["AUPRC_macro"]
     out["F1"]     = out["F1_macro"]
     out["Recall"] = out["Recall_macro"]
+    out["Precision"] = out["Precision_macro"]   # optional, matches your macro naming style
 
     # Micro metrics
     y_flat  = y_true.reshape(-1)
@@ -1639,6 +1653,7 @@ def epoch_metrics(y_true, p, y_pred):
     out["Precision_micro"] = micro_prec
     out["Recall_micro"]    = micro_rec
     out["F1_micro"]        = micro_f1
+    out["Precision_per_label"] = prec_per_label
 
     # Example-based F1
     example_f1s = []
@@ -2116,8 +2131,8 @@ def main():
     # Encoders
     enc_cfg = EncoderConfig(
         d=_cfg("d", 256), dropout=_cfg("dropout", 0.0),
-        structured_seq_len=_cfg("structured_seq_len", -1),
-        structured_n_feats=_cfg("structured_n_feats", 17),
+        structured_seq_len=_cfg("structured_seq_len", 256),
+        structured_n_feats=_cfg("structured_n_feats", 61),
         structured_layers=_cfg("structured_layers", 2),
         structured_heads=_cfg("structured_heads", 8),
         structured_pool="cls",
@@ -2556,6 +2571,7 @@ def main():
         ap_per  = m["AUPRC_per_label"]
         f1_per  = m["F1_per_label"]
         rec_per = m["Recall_per_label"]
+        prec_per = m["Precision_per_label"]
 
         for k, name in enumerate(label_names):
             print(
@@ -2563,8 +2579,10 @@ def main():
                 f"AUROC={au_per[k]:.4f} "
                 f"AUPRC={ap_per[k]:.4f} "
                 f"F1={f1_per[k]:.4f} "
-                f"Recall={rec_per[k]:.4f}"
+                f"Recall={rec_per[k]:.4f} "
+                f"Precision={prec_per[k]:.4f}"
             )
+
         
         val_macro_auroc = float(m["AUROC"])   # macro AUROC
 
