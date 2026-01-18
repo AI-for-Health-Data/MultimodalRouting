@@ -248,43 +248,31 @@ def normalize_rc_shape_to_brk(rc: torch.Tensor, expect_routes: int, name: str = 
         return rc.permute(0, 2, 1).contiguous()
     raise ValueError(f"{name}: cannot find routes axis with size={expect_routes}, shape={tuple(rc.shape)}")
 
-def debug_routing_tensor(
-    rc: torch.Tensor,
-    name: str = "routing_coef",
-    expect_routes: int = 10,
-    expect_k: Optional[int] = None,
-):
+def debug_routing_tensor(rc: torch.Tensor, name="rc", expect_routes=10, kind="raw"):
+    """
+    kind="raw"    -> rc is p(class|route), should sum over classes (dim=2) to 1
+    kind="report" -> rc is p(route|class), should sum over routes (dim=1) to 1
+    """
     with torch.no_grad():
         print(f"\n[debug] {name}.shape={tuple(rc.shape)} dtype={rc.dtype} device={rc.device}")
-        if rc.ndim != 3:
-            print(f"[debug] {name}: expected 3D [B,R,K], got {rc.ndim}D")
-            return
+        assert rc.ndim == 3, f"{name}: expected [B,R,K]"
 
-        B, D1, D2 = rc.shape
-        if D1 == expect_routes:
-            routes_dim = 1
-            k_dim = 2
-        elif D2 == expect_routes:
-            routes_dim = 2
-            k_dim = 1
-        else:
-            routes_dim = 1
-            k_dim = 2
-            print(f"[debug] {name}: WARNING could not find routes axis by size={expect_routes}, using dim=1 as routes.")
-        if expect_k is not None:
-            K_found = rc.shape[k_dim]
-            if int(K_found) != int(expect_k):
-                print(f"[debug] {name}: WARNING K mismatch: got K={K_found} but expect_k={expect_k} (k_dim={k_dim})")
-        s_routes = rc.sum(dim=routes_dim)
-        print(f"[debug] sum_over_routes(dim={routes_dim}): mean={s_routes.float().mean().item():.6f} "
-              f"min={s_routes.float().min().item():.6f} max={s_routes.float().max().item():.6f}")
-        if routes_dim == 1:
-            print("[debug] rc[0, :, 0] (routes for phenotype0):", rc[0, :, 0].detach().float().cpu().tolist())
-            print("[debug] rc[0, :, 0].sum() =", float(rc[0, :, 0].sum().detach().cpu()))
-        else:
-            print("[debug] rc[0, 0, :] (routes for phenotype0):", rc[0, 0, :].detach().float().cpu().tolist())
-            print("[debug] rc[0, 0, :].sum() =", float(rc[0, 0, :].sum().detach().cpu()))
+        # coerce to [B,R,K] if needed
+        rc = normalize_rc_shape_to_brk(rc, expect_routes=expect_routes, name=name)
 
+        if kind == "raw":
+            s = rc.sum(dim=2)  # sum over classes
+            print(f"[debug] {name}: sum_over_classes(dim=2): mean={s.float().mean().item():.6f} "
+                  f"min={s.float().min().item():.6f} max={s.float().max().item():.6f}")
+            print("[debug] example rc[0, route0, :]= ", rc[0, 0, :].detach().float().cpu().tolist(),
+                  " sum=", float(rc[0, 0, :].sum().detach().cpu()))
+            print("[debug] example p(death|route) rc[0,:,1] = ", rc[0, :, 1].detach().float().cpu().tolist())
+        else:
+            s = rc.sum(dim=1)  # sum over routes
+            print(f"[debug] {name}: sum_over_routes(dim=1): mean={s.float().mean().item():.6f} "
+                  f"min={s.float().min().item():.6f} max={s.float().max().item():.6f}")
+            print("[debug] example rc[0, :, class0]= ", rc[0, :, 0].detach().float().cpu().tolist(),
+                  " sum=", float(rc[0, :, 0].sum().detach().cpu()))
 
 def assert_routing_over_routes(rc: torch.Tensor, routes_dim: int = 1, atol: float = 1e-3, name: str = "routing_coef"):
     if rc.ndim != 3:
@@ -941,6 +929,7 @@ def _detect_notes_schema(notes_df: pd.DataFrame):
     if len(attn_cols) == 0:
         attn_cols = sorted([c for c in notes_df.columns if str(c).startswith("attn_mask_")])
 
+    # --- pretokenized schema
     if len(input_id_cols) > 0 and len(attn_cols) > 0:
         id_sufs = {c.split("input_ids_")[-1] for c in input_id_cols}
         if any(str(c).startswith("attention_mask_") for c in attn_cols):
@@ -959,18 +948,20 @@ def _detect_notes_schema(notes_df: pd.DataFrame):
                 aligned_attn.append(f"attention_mask_{s}")
             elif f"attn_mask_{s}" in notes_df.columns:
                 aligned_attn.append(f"attn_mask_{s}")
+
         if len(aligned_ids) != len(aligned_attn):
             raise ValueError("Pretokenized notes columns not aligned (ids vs masks).")
 
-            return ("pretokenized", aligned_ids, aligned_attn)
+        return ("pretokenized", aligned_ids, aligned_attn)
 
-        # ✅ add note_chunk_ support
-        for pref in ("chunk_", "text_chunk_", "note_chunk_"):
-            cols = sorted([c for c in notes_df.columns if str(c).startswith(pref)])
-            if len(cols) > 0:
-                return ("text", cols, None)
+    # --- text chunk schema (supports chunk_, text_chunk_, note_chunk_)
+    for pref in ("chunk_", "text_chunk_", "note_chunk_"):
+        cols = sorted([c for c in notes_df.columns if str(c).startswith(pref)])
+        if len(cols) > 0:
+            return ("text", cols, None)
 
-        raise ValueError("notes schema not recognized")
+    raise ValueError("notes schema not recognized")
+
 
     chunk_cols = sorted([c for c in notes_df.columns if str(c).startswith("chunk_")])
     if len(chunk_cols) > 0:
@@ -1153,10 +1144,31 @@ class ICUStayDataset(Dataset):
 
         # --- ICUStayDataset.__init__ fix (indentation must match)
         self.struct = _standardize_id_column(pd.read_parquet(struct_fp))
-        T_cfg = int(getattr(CFG, "structured_seq_len", 48) or 48)
-        F_cfg = int(getattr(CFG, "structured_n_feats", 76) or 76)
-        self.struct_col, (t0, f0) = detect_struct_col(self.struct, T_cfg=T_cfg, F_cfg=F_cfg)
-        print(f"[dataset:{split}] structured_col='{self.struct_col}' sample_shape=({t0},{f0}) cfg_TF=({T_cfg},{F_cfg})")
+
+        # Prefer explicit column from CFG if provided
+        wanted = str(getattr(CFG, "structured_x_col", "") or "").strip()
+        if wanted and wanted in self.struct.columns:
+            self.struct_col = wanted
+            # infer (T,F) from a sample row
+            sample_df = self.struct.dropna(subset=[self.struct_col])
+            if sample_df.empty:
+                raise ValueError(f"[struct] column '{self.struct_col}' exists but is all-NaN")
+            row0 = sample_df.iloc[0]
+            sid0 = int(row0["stay_id"])
+            arr0 = _coerce_any_2d(row0[self.struct_col], stay_id=sid0)  # uses your helper
+            t0, f0 = int(arr0.shape[0]), int(arr0.shape[1])
+        else:
+            T_cfg = int(getattr(CFG, "structured_seq_len", 48) or 48)
+            F_cfg = int(getattr(CFG, "structured_n_feats", 76) or 76)
+            self.struct_col, (t0, f0) = detect_struct_col(self.struct, T_cfg=T_cfg, F_cfg=F_cfg)
+
+        # Hard sync CFG to what we will actually use (prevents later crashes)
+        if int(getattr(CFG, "structured_seq_len", t0)) != t0 or int(getattr(CFG, "structured_n_feats", f0)) != f0:
+            print(f"[struct] CFG mismatch → syncing CFG.structured_seq_len={t0}, CFG.structured_n_feats={f0}")
+            CFG.structured_seq_len = t0
+            CFG.structured_n_feats = f0
+
+        print(f"[dataset:{split}] structured_col='{self.struct_col}' sample_shape=({t0},{f0}) cfg_TF=({CFG.structured_seq_len},{CFG.structured_n_feats})")
 
         self.notes  = _standardize_id_column(pd.read_parquet(notes_fp))
         self.images = _standardize_id_column(pd.read_parquet(images_fp))
@@ -1473,7 +1485,11 @@ def collate_fn_factory(tidx: int, img_tfms: T.Compose):
     first_print = {"done": False}
 
     def _collate(batch: List[Dict[str, Any]]):
-        F_dim = int(CFG.structured_n_feats)
+        F_dim = int(batch[0]["x_struct"].shape[1])
+        # optional safety:
+        if int(getattr(CFG, "structured_n_feats", F_dim)) != F_dim:
+            print(f"[collate][warn] CFG.structured_n_feats={CFG.structured_n_feats} != batch F_dim={F_dim} (using batch F_dim)")
+
         T_len_cfg = int(getattr(CFG, "structured_seq_len", 48))
         if T_len_cfg is not None and T_len_cfg > 0:
             T_len = T_len_cfg
@@ -1774,8 +1790,8 @@ def evaluate_epoch(
 
                 if bidx == 0:
                     expect_k = int(rc_raw.shape[2])
-                    debug_routing_tensor(rc_raw,    name=f"{split_name}.rc_raw",    expect_routes=N_ROUTES, expect_k=expect_k)
-                    debug_routing_tensor(rc_report, name=f"{split_name}.rc_report", expect_routes=N_ROUTES, expect_k=expect_k)
+                    debug_routing_tensor(rc_raw,    name="VAL.rc_raw",    expect_routes=N_ROUTES, kind="raw")
+                    debug_routing_tensor(rc_report, name="VAL.rc_report", expect_routes=N_ROUTES, kind="report")
 
             if route_debug and (rc_raw is not None) and bidx == 0:
                 quantization_check(rc_raw, name=f"{split_name}.rc_raw")
@@ -2926,11 +2942,18 @@ def main():
 
                     if bool(getattr(args, "route_debug", False)) and (epoch == start_epoch) and (step == 0):
                         debug_routing_tensor(
+                            rc_raw,
+                            name="TRAIN.rc_raw",
+                            expect_routes=N_ROUTES,
+                            kind="raw",
+                        )
+                        debug_routing_tensor(
                             rc_report,
                             name="TRAIN.rc_report",
                             expect_routes=N_ROUTES,
-                            expect_k=int(logits.size(1)),
+                            kind="report",
                         )
+
 
                 logits    = _safe_tensor(logits.float(),     "logits(fp32)")
                 prim_acts = _safe_tensor(prim_acts.float(), "prim_acts(fp32)")
@@ -3010,12 +3033,16 @@ def main():
                     )
                 )
                 if (rc_raw is not None) and (rc_report is not None):
-                    raw_mean = rc_raw.detach().float().mean(dim=(0, 2)).cpu().tolist()       # [R]
-                    rep_mean = rc_report.detach().float().mean(dim=(0, 2)).cpu().tolist()
-                    raw_str = " | ".join(f"{r}:{raw_mean[i]:.3f}" for i, r in enumerate(ROUTE_NAMES))
-                    rep_str = " | ".join(f"{r}:{rep_mean[i]:.3f}" for i, r in enumerate(ROUTE_NAMES))
-                    msg += f" | [raw softmax p(route)] {raw_str}"
-                    msg += f" | [effective p(route|pheno)] {rep_str}"
+                    raw_death = rc_raw[:, :, 1].mean(dim=0)   # [R] = E_b p(death|route)
+
+                    rep_death = rc_report[:, :, 1].mean(dim=0)  # [R] = E_b p(route|death)
+
+                    pa_mean = prim_acts.mean(dim=0)  # [R]
+
+                    msg += " | [p(death|route)] " + " | ".join(f"{r}:{raw_death[i]:.3f}" for i,r in enumerate(ROUTE_NAMES))
+                    msg += " | [p(route|death)] " + " | ".join(f"{r}:{rep_death[i]:.3f}" for i,r in enumerate(ROUTE_NAMES))
+                    msg += " | [prim_act mean] " + " | ".join(f"{r}:{pa_mean[i]:.3f}"   for i,r in enumerate(ROUTE_NAMES))
+
 
                 print(msg)
                 if max(avg_act) > 0.95:
