@@ -928,7 +928,7 @@ class EncoderConfig:
     dropout: float = 0.0
 
     # structured
-    structured_seq_len: int = 48
+    structured_seq_len: int = 256
     structured_n_feats: int = 17
     structured_layers: int = 2
     structured_heads: int = 8
