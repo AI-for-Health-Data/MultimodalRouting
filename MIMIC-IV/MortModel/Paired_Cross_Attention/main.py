@@ -3084,7 +3084,7 @@ def main():
 
         print(
             f"[epoch {epoch + 1}] VAL MACRO  "
-            f"AUROC={m['AUROC']:.4f} AUPRC={m['AUPRC']:.4f} "
+            f"AUROC={m['AUROC']:.4f} AUPRC={m['AUPRC']:.4f} Precision={m['Precision']:.4f}"
             f"F1={m['F1']:.4f} Recall={m['Recall']:.4f}"
         )
         print(
