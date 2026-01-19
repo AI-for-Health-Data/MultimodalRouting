@@ -20,8 +20,11 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 from torch import amp as torch_amp
 from sklearn.metrics import (
-    roc_auc_score, average_precision_score, f1_score, recall_score, confusion_matrix
+    roc_auc_score, average_precision_score,
+    f1_score, recall_score, precision_score,
+    confusion_matrix
 )
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -42,8 +45,8 @@ from routing_and_heads import (
 def _cfg(name: str, default):
     return getattr(CFG, name, default)
 
-TASK_MAP = {"mort": 0}
-COL_MAP  = {"mort": "mort"}
+TASK_MAP = {"mort": 0, "mortality": 0}
+COL_MAP  = {"mort": "mort", "mortality": "mort"}
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
@@ -64,6 +67,55 @@ def _chunk_long_ids(ids: list[int], attn: list[int], maxlen: int, stride: int):
         if i + maxlen >= len(ids): break
         i += step
     return out_ids, out_attn
+def prepare_notes_batch(notes_payloads):
+    global TOKENIZER, MAXLEN
+    if TOKENIZER is None:
+        raise RuntimeError("TOKENIZER not initialized; call after load_cfg().")
+
+    MAXLEN = int(_cfg("max_text_len", 512))
+    pad_id = TOKENIZER.pad_token_id or 0
+
+    if len(notes_payloads) > 0 and isinstance(notes_payloads[0], list):
+        notes_payloads = [{"mode": "text", "chunks": x} for x in notes_payloads]
+
+    def _pad_list(x, L=MAXLEN, v=pad_id):
+        x = list(x)
+        return x[:L] if len(x) >= L else x + [v] * (L - len(x))
+
+    out = []
+    for p in notes_payloads:
+        mode = str(p.get("mode", "")).lower().strip()
+        all_ids, all_attn = [], []
+
+        if mode == "text":
+            texts = [t.replace("[CLS]", "").replace("[SEP]", "").strip()
+                     for t in p.get("chunks", []) if t and str(t).strip()]
+            for t in texts:
+                enc = TOKENIZER(t, truncation=True, max_length=MAXLEN, padding=False,
+                                return_attention_mask=True, add_special_tokens=True)
+                ids_chunks, attn_chunks = _chunk_long_ids(enc["input_ids"], enc["attention_mask"], MAXLEN, CHUNK_STRIDE)
+                all_ids.extend(ids_chunks)
+                all_attn.extend(attn_chunks)
+
+        elif mode == "pretokenized":
+            for ids, attn in zip(p.get("input_ids", []), p.get("attention_mask", [])):
+                if ids and attn:
+                    all_ids.append(_pad_list(ids, MAXLEN, pad_id))
+                    all_attn.append(_pad_list(attn, MAXLEN, 0))
+
+        else:
+            raise ValueError(f"[prepare_notes_batch] Unknown mode='{mode}' keys={list(p.keys())}")
+
+        if len(all_ids) == 0:
+            ids_mat  = torch.zeros((0, MAXLEN), dtype=torch.long, device=DEVICE)
+            attn_mat = torch.zeros((0, MAXLEN), dtype=torch.long, device=DEVICE)
+        else:
+            ids_mat  = torch.tensor([_pad_list(x, MAXLEN, pad_id) for x in all_ids], dtype=torch.long, device=DEVICE)
+            attn_mat = torch.tensor([_pad_list(x, MAXLEN, 0)      for x in all_attn], dtype=torch.long, device=DEVICE)
+
+        out.append({"input_ids": ids_mat, "attention_mask": attn_mat})
+    return out
+
 
 def pretok_batch_notes(batch_notes: list[list[str]]):
     global TOKENIZER, MAXLEN
@@ -119,7 +171,9 @@ def build_image_transform(split: str) -> T.Compose:
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Mortality (binary) with 7-route capsule routing (2-class CE)")
-    ap.add_argument("--task", type=str, default=_cfg("task_name", "mort"), choices=list(TASK_MAP.keys()))
+    ap.add_argument("--task", type=str, default=_cfg("task_name", "mort"),
+                    choices=["mort", "mortality"])
+
     ap.add_argument("--require_all_modalities", action="store_true", default=True,
                     help="Only keep stays that have structured + notes + image.")
     ap.add_argument("--data_root", type=str, default=_cfg("data_root", "./data"))
@@ -139,6 +193,76 @@ def parse_args():
     ap.add_argument("--route_debug", action="store_true")
     ap.add_argument("--calib_bins", type=int, default=10)
     return ap.parse_args()
+
+
+def infer_structured_dim(struct_df: pd.DataFrame, feat_cols: List[str]) -> int:
+    if len(feat_cols) >= 1:
+        return int(len(feat_cols))
+
+    for c in struct_df.columns:
+        if c in ("stay_id", "hour", "split", "y_true"):
+            continue
+        v = struct_df[c].dropna()
+        if len(v) == 0:
+            continue
+        v0 = v.iloc[0]
+        arr2d = _to_2d_float32(v0)  
+        if arr2d.size == 0:
+            continue
+        return int(arr2d.shape[1])
+
+    raise RuntimeError("[infer_structured_dim] Could not infer structured feature dimension F from structured parquet.")
+
+
+import ast
+
+def _to_2d_float32(v) -> np.ndarray:
+    if v is None:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    if isinstance(v, str):
+        s = v.strip()
+        if len(s) == 0:
+            return np.zeros((0, 0), dtype=np.float32)
+        try:
+            if s.startswith("array(") and s.endswith(")"):
+                s = s[len("array("):-1]
+            v = ast.literal_eval(s)
+        except Exception:
+            return np.zeros((0, 0), dtype=np.float32)
+
+    try:
+        arr = np.asarray(v)
+    except Exception:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    if arr.size == 0:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    if arr.dtype == object:
+        try:
+            arr = np.array([np.asarray(x, dtype=np.float32) for x in arr], dtype=object)
+        except Exception:
+            return np.zeros((0, 0), dtype=np.float32)
+
+    try:
+        arr = arr.astype(np.float32)
+    except Exception:
+        try:
+            arr = np.vectorize(lambda x: float(x))(arr).astype(np.float32)
+        except Exception:
+            return np.zeros((0, 0), dtype=np.float32)
+
+    if arr.ndim == 0:
+        return arr.reshape(1, 1)
+    if arr.ndim == 1:
+        return arr.reshape(1, -1)
+    if arr.ndim >= 2:
+        f = arr.shape[-1]
+        t = int(np.prod(arr.shape[:-1]))
+        return arr.reshape(t, f)
+
+    return np.zeros((0, 0), dtype=np.float32)
 
 class ICUStayDataset(Dataset):
     """
@@ -161,10 +285,10 @@ class ICUStayDataset(Dataset):
 
         req_files = [
             "splits.json",
-            "labels_mort.parquet",
-            "structured_24h.parquet",
-            "notes_48h_chunks.parquet",
-            "images_24h.parquet",
+            "labels_mortality.parquet",
+            "structured_mortality.parquet",
+            "notes_wide_clean.parquet",
+            "images.parquet",
         ]
         missing = [p for p in req_files if not os.path.exists(os.path.join(root, p))]
         if missing:
@@ -179,21 +303,113 @@ class ICUStayDataset(Dataset):
             raise KeyError(f"[ICUStayDataset] split '{split}' not in splits.json keys: {list(splits.keys())}")
         split_ids: List[int] = list(splits[split])
 
-        struct_fp = os.path.join(root, "structured_24h.parquet")
-        notes_fp  = os.path.join(root, "notes_48h_chunks.parquet")
-        images_fp = os.path.join(root, "images_24h.parquet")
-        labels_fp = os.path.join(root, "labels_mort.parquet")
+        struct_fp = os.path.join(root, "structured_mortality.parquet")
+        notes_fp  = os.path.join(root, "notes_wide_clean.parquet")
+        images_fp = os.path.join(root, "images.parquet")
+        labels_fp = os.path.join(root, "labels_mortality.parquet")
 
         self.struct = pd.read_parquet(struct_fp)
         self.notes  = pd.read_parquet(notes_fp)
         self.images = pd.read_parquet(images_fp)
         self.labels = pd.read_parquet(labels_fp)
 
-        base_cols = {"stay_id", "hour"}
-        self.feat_cols: List[str] = [c for c in self.struct.columns if c not in base_cols]
-        if hasattr(CFG, "structured_n_feats"):
-            assert len(self.feat_cols) == CFG.structured_n_feats, \
-                f"CFG.structured_n_feats={CFG.structured_n_feats}, found {len(self.feat_cols)} in {struct_fp}"
+        time_candidates = [
+            "hour", "hours", "hr",
+            "chart_hour", "chart_hr",
+            "offset_hour", "offset_hours",
+            "hours_since_admit", "hrs_since_admit",
+            "time", "charttime", "t",
+            "step", "time_step", "time_idx", "time_index", "seq"
+        ]
+
+        self.time_col = None
+        for c in time_candidates:
+            if c in self.struct.columns:
+                self.time_col = c
+                break
+
+        if self.time_col is None:
+            hour_like = [c for c in self.struct.columns if "hour" in str(c).lower()]
+            time_like = [c for c in self.struct.columns if "time" in str(c).lower()]
+            if hour_like:
+                self.time_col = hour_like[0]
+            elif time_like:
+                self.time_col = time_like[0]
+
+        if self.time_col is None:
+            print(
+                f"[warn] structured parquet has no explicit time column (expected 'hour' or similar). "
+                f"Will keep row order as-is per stay. columns={list(self.struct.columns)}"
+            )
+        else:
+            print(f"[dataset:{split}] using structured time column: {self.time_col}")
+
+        label_candidates = [
+            "mort", "mortality", "death", "label", "y",
+            "hospital_expire_flag", "expire_flag", "died"
+        ]
+        self.label_col = None
+        for c in label_candidates:
+            if c in self.labels.columns:
+                self.label_col = c
+                break
+
+        if self.label_col is None:
+            cand = [c for c in self.labels.columns if c != "stay_id"]
+            if len(cand) == 1:
+                self.label_col = cand[0]
+
+        if self.label_col is None:
+            raise KeyError(
+                f"[ICUStayDataset] labels parquet must contain a mortality label column. "
+                f"Expected one of {label_candidates} (or a single non-stay_id column). "
+                f"Found columns: {list(self.labels.columns)}"
+            )
+
+        print(f"[dataset:{split}] using label column: {self.label_col}")
+
+        img_path_candidates = [
+            "image_path", "img_path", "path", "filepath", "file_path",
+            "png_path", "jpg_path", "jpeg_path", "dicom_path", "dcm_path"
+        ]
+        self.img_path_col = None
+        for c in img_path_candidates:
+            if c in self.images.columns:
+                self.img_path_col = c
+                break
+
+        if self.img_path_col is None:
+            path_like = [c for c in self.images.columns if "path" in str(c).lower()]
+            if path_like:
+                self.img_path_col = path_like[0]
+
+        if self.img_path_col is None:
+            raise KeyError(
+                f"[ICUStayDataset] images.parquet must contain an image path column. "
+                f"Expected one of {img_path_candidates} or something with 'path'. "
+                f"Found columns: {list(self.images.columns)}"
+            )
+
+        print(f"[dataset:{split}] using image path column: {self.img_path_col}")
+
+        base_cols = {"stay_id"}
+        if self.time_col is not None:
+            base_cols.add(self.time_col)
+        base_cols |= {"hour", "split", "y_true", "label", "mort", "mortality"}
+
+        cand = [c for c in self.struct.columns if c not in base_cols]
+        num_cand = [c for c in cand if pd.api.types.is_numeric_dtype(self.struct[c])]
+
+        self.feat_cols: List[str] = num_cand
+        print(f"[dataset:{split}] feat_cols={self.feat_cols} (wide numeric features)")
+
+        file_F = infer_structured_dim(self.struct, self.feat_cols)
+        cfg_F  = int(getattr(CFG, "structured_n_feats", file_F))
+
+        if file_F != cfg_F:
+            print(f"[warn] structured_n_feats mismatch: CFG={cfg_F} vs file={file_F} in {struct_fp}. "
+                  f"Overriding CFG.structured_n_feats -> {file_F}")
+        CFG.structured_n_feats = int(file_F)
 
         self.note_col: Optional[str] = None
         self.chunk_cols: List[str] = [c for c in self.notes.columns if str(c).startswith("chunk_")]
@@ -213,8 +429,10 @@ class ICUStayDataset(Dataset):
 
         img_rows = self.images.copy()
         img_ids = set(
-            img_rows.loc[img_rows["image_path"].fillna("").astype(str).str.strip().ne(""), "stay_id"]
-            .unique().tolist()
+            img_rows.loc[
+                img_rows[self.img_path_col].fillna("").astype(str).str.strip().ne(""),
+                "stay_id"
+            ].unique().tolist()
         )
 
         label_ids = set(self.labels["stay_id"].unique().tolist())
@@ -240,9 +458,42 @@ class ICUStayDataset(Dataset):
 
     def __getitem__(self, idx: int):
         stay_id = self.ids[idx]
-        df_s = self.struct[self.struct.stay_id == stay_id].sort_values("hour")
-        xs_np = df_s[self.feat_cols].astype("float32").fillna(0.0).to_numpy()
+        df_s = self.struct[self.struct.stay_id == stay_id]
+        if self.time_col is not None and self.time_col in df_s.columns:
+            df_s = df_s.sort_values(self.time_col)
+
+        if len(self.feat_cols) > 0:
+            xs_np = df_s[self.feat_cols].astype("float32").fillna(0.0).to_numpy()
+        else:
+            cand_cols = [c for c in ["x", "values", "features", "x_ehr_48h_2h_76"] if c in df_s.columns]
+            if not cand_cols:
+                bad = {"stay_id", "split", "y_true"}
+                if self.time_col is not None:
+                    bad.add(self.time_col)
+                cand_cols = [c for c in df_s.columns if c not in bad]
+            col = cand_cols[0]
+
+            if idx == 0:
+                vv = df_s[col].iloc[0]
+                print(f"[debug] structured col='{col}' type(first)={type(vv)}")
+
+
+            seq = []
+            for v in df_s[col].tolist():
+                arr2d = _to_2d_float32(v)   # [t,f] or [0,0]
+                if arr2d.size == 0:
+                    continue
+                seq.append(arr2d)
+
+            if len(seq):
+                xs_np = np.concatenate(seq, axis=0).astype(np.float32)
+            else:
+                xs_np = np.zeros((0, int(_cfg("structured_n_feats", 0))), dtype=np.float32)
+
         xs = torch.from_numpy(xs_np)  # [<=T,F]
+        T = int(_cfg("structured_seq_len", 24))
+        F = int(_cfg("structured_n_feats", xs.shape[1] if xs.ndim == 2 else CFG.structured_n_feats))
+        xs = pad_or_trim_struct(xs, T=T, F=F)
 
         notes_list: List[str] = []
         df_n = self.notes[self.notes.stay_id == stay_id]
@@ -257,20 +508,27 @@ class ICUStayDataset(Dataset):
         img_paths: List[str] = []
         df_i = self.images[self.images.stay_id == stay_id]
         if not df_i.empty:
-            img_paths = df_i.image_path.dropna().astype(str).tolist()[-1:]  # last only
-
-        lab_row = self.labels.loc[self.labels.stay_id == stay_id, ["mort"]]
+            img_paths = df_i[self.img_path_col].dropna().astype(str).tolist()[-1:]  
+        lab_row = self.labels.loc[self.labels.stay_id == stay_id, [self.label_col]]
         y = 0 if lab_row.empty else int(lab_row.values[0][0])
+
         y = torch.tensor(y, dtype=torch.long)
 
         return {"stay_id": stay_id, "x_struct": xs, "notes_list": notes_list,
                 "image_paths": img_paths, "y": y}
 
 def pad_or_trim_struct(x: torch.Tensor, T: int, F: int) -> torch.Tensor:
+    # x: [t, f]
+    if x.ndim != 2:
+        raise ValueError(f"[pad_or_trim_struct] expected 2D tensor [t,f], got {tuple(x.shape)}")
+    if x.shape[1] != F:
+        raise ValueError(f"[pad_or_trim_struct] feature dim mismatch: x has F={x.shape[1]} but CFG says F={F}")
     t = x.shape[0]
-    if t >= T: return x[-T:]
+    if t >= T:
+        return x[-T:]
     pad = torch.zeros(T - t, F, dtype=x.dtype)
     return torch.cat([pad, x], dim=0)
+
 
 def load_cxr_tensor(paths: List[str], tfms: T.Compose, return_path: bool = False):
     if not paths:
@@ -287,40 +545,33 @@ def load_cxr_tensor(paths: List[str], tfms: T.Compose, return_path: bool = False
 
 def collate_fn_factory(tidx: int, img_tfms: T.Compose):
     first_print = {"done": False}
+
     def _collate(batch: List[Dict[str, Any]]):
-        T_len, F_dim = CFG.structured_seq_len, CFG.structured_n_feats
-        xL_batch = torch.stack([pad_or_trim_struct(b["x_struct"], T_len, F_dim) for b in batch], dim=0)
-        mL_batch = (xL_batch.abs().sum(dim=2) > 0).float()
-        notes_batch: List[List[str]] = []
-        for b in batch:
-            raw = b["notes_list"] if isinstance(b["notes_list"], list) else [str(b["notes_list"])]
-            valid = [t for t in raw if str(t).strip()]
-            assert len(valid) > 0, "[collate] tri-modal strict: empty notes_list for a sample"
-            notes_batch.append(valid)
+        xL_batch = torch.stack([b["x_struct"] for b in batch], dim=0)  # [B,T,F]
+        mL_batch = (xL_batch.abs().sum(dim=2) > 0).float()             # [B,T] 
+
+        notes_payloads = [b["notes_list"] for b in batch]
+
         imgs_list, img_paths_list = [], []
         for b in batch:
             assert len(b["image_paths"]) > 0 and str(b["image_paths"][-1]).strip(), \
                 "[collate] tri-modal strict: missing image path for a sample"
             img_t, path = load_cxr_tensor(b["image_paths"], img_tfms, return_path=True)
-            imgs_list.append(img_t); img_paths_list.append(path)
-        imgs_batch = torch.stack(imgs_list, dim=0)
-        y_list = []
-        for b in batch:
-            y_scalar = b["y"].view(-1)[0].item() if torch.is_tensor(b["y"]) else b["y"]
-            y_list.append(int(round(float(y_scalar))))
-        y_batch = torch.tensor(y_list, dtype=torch.long)
+            imgs_list.append(img_t)
+            img_paths_list.append(path)
+        imgs_batch = torch.stack(imgs_list, dim=0)                     # [B,3,224,224]
+
+        y_batch = torch.stack([b["y"].view(()) for b in batch], dim=0).long()  # [B]
+
         dbg = {"stay_ids": [b["stay_id"] for b in batch], "img_paths": img_paths_list}
+
         if not first_print["done"]:
             first_print["done"] = True
-            print(
-                f"[collate] xL_batch: {tuple(xL_batch.shape)} "
-                f"| mL_batch: {tuple(mL_batch.shape)} "
-                f"| notes_batch: len={len(notes_batch)} "
-                f"(ex first notes={len(notes_batch[0]) if len(notes_batch)>0 else 0}) "
-                f"| imgs_batch: {tuple(imgs_batch.shape)} "
-                f"| y_batch: {tuple(y_batch.shape)}"
-            )
-        return xL_batch, mL_batch, notes_batch, imgs_batch, y_batch, dbg
+            print(f"[collate] xL_batch:{tuple(xL_batch.shape)} mL_batch:{tuple(mL_batch.shape)} "
+                  f"imgs_batch:{tuple(imgs_batch.shape)} y_batch:{tuple(y_batch.shape)} "
+                  f"notes_payloads:{len(notes_payloads)}")
+        return xL_batch, mL_batch, notes_payloads, imgs_batch, y_batch, dbg
+
     return _collate
 
 @torch.no_grad()
@@ -376,6 +627,7 @@ def evaluate_epoch(behrt, bbert, imgenc, fusion, projector, cap_head, loader, am
         with amp_ctx:
             zL = behrt(xL, mask=mL)
             zN = bbert(pretok_batch_notes(notes))
+
             zI = imgenc(imgs)
             z = {"L": zL, "N": zN, "I": zI}
             gates = torch.ones(7, device=DEVICE, dtype=torch.float32)
@@ -439,6 +691,7 @@ def collect_epoch_outputs(loader, behrt, bbert, imgenc, fusion, projector, cap_h
         with amp_ctx:
             zL = behrt(xL, mask=mL)
             zN = bbert(pretok_batch_notes(notes))
+
             zI = imgenc(imgs)
             out = _capsule_forward_safe(
                 {"L": zL, "N": zN, "I": zI}, fusion, projector, cap_head,
@@ -447,6 +700,7 @@ def collect_epoch_outputs(loader, behrt, bbert, imgenc, fusion, projector, cap_h
             )
             logits = out[0]
         probs = torch.softmax(logits, dim=-1)[:, 1]
+        probs = probs.float()
         y_true.append(y.detach().cpu())
         p1.append(probs.detach().cpu())
         y_pred.append(logits.argmax(dim=1).detach().cpu())
@@ -458,14 +712,26 @@ def collect_epoch_outputs(loader, behrt, bbert, imgenc, fusion, projector, cap_h
 
 def epoch_metrics(y_true, p1, y_pred):
     out = {}
-    try: out["AUROC"] = float(roc_auc_score(y_true, p1))
-    except Exception: out["AUROC"] = float("nan")
-    try: out["AUPRC"] = float(average_precision_score(y_true, p1))
-    except Exception: out["AUPRC"] = float("nan")
-    out["F1"]     = float(f1_score(y_true, y_pred))
-    out["Recall"] = float(recall_score(y_true, y_pred))
-    out["CM"]     = confusion_matrix(y_true, y_pred)
+    y_true = np.asarray(y_true).astype(int)
+    y_pred = np.asarray(y_pred).astype(int)
+    p1     = np.asarray(p1).astype(float)
+
+    try:
+        out["AUROC"] = float(roc_auc_score(y_true, p1))
+    except Exception:
+        out["AUROC"] = float("nan")
+
+    try:
+        out["AUPRC"] = float(average_precision_score(y_true, p1))
+    except Exception:
+        out["AUPRC"] = float("nan")
+
+    out["F1"]        = float(f1_score(y_true, y_pred, pos_label=1))
+    out["Recall"]    = float(recall_score(y_true, y_pred, pos_label=1))
+    out["Precision"] = float(precision_score(y_true, y_pred, pos_label=1, zero_division=0))
+    out["CM"]        = confusion_matrix(y_true, y_pred)
     return out
+
 
 def expected_calibration_error(p, y, n_bins=10):
     p = np.asarray(p); y = np.asarray(y).astype(int)
@@ -513,7 +779,7 @@ def _set_all_seeds():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False  # added for determinism
+    torch.backends.cudnn.benchmark = False  
 
 def main():
     args = parse_args()
@@ -544,13 +810,34 @@ def main():
     test_ds  = ICUStayDataset(args.data_root, split="test")
 
     from torch.utils.data import WeightedRandomSampler
-    train_label_df = train_ds.labels.merge(pd.DataFrame({"stay_id": train_ds.ids}), on="stay_id")
-    pos = int(train_label_df["mort"].sum())
-    neg = len(train_label_df) - pos
+
+    label_col = train_ds.label_col
+
+    lab = train_ds.labels[["stay_id", label_col]].copy()
+    lab["stay_id"] = lab["stay_id"].astype(int)
+
+    y_series = (
+        lab.set_index("stay_id")[label_col]
+           .reindex(pd.Index(train_ds.ids, dtype=int))
+    )
+
+    if y_series.isna().any():
+        missing = y_series[y_series.isna()].index[:10].tolist()
+        raise RuntimeError(
+            f"[sampler] Missing labels for {int(y_series.isna().sum())} stay_ids. "
+            f"Examples: {missing}. Check labels_mortality.parquet stay_id coverage."
+        )
+
+    yvals = y_series.astype(int).values
+
+    pos = int(yvals.sum())
+    neg = int(len(yvals) - pos)
     pos_ratio = (neg / max(1, pos))
-    y_by_id = {int(r.stay_id): int(r.mort) for _, r in train_label_df.iterrows()}
-    weights = [pos_ratio if y_by_id[sid] == 1 else 1.0 for sid in train_ds.ids]
+
+    weights = [pos_ratio if int(y_series.loc[int(sid)]) == 1 else 1.0 for sid in train_ds.ids]
     sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
+    print(f"[sampler] label_col='{label_col}' pos={pos} neg={neg} pos_weight={pos_ratio:.3f}")
 
     ce = nn.CrossEntropyLoss(
         reduction="mean",
@@ -630,7 +917,6 @@ def main():
 
     printed_once = False
 
-    # Anti-collapse knobs (read once)
     route_dropout_p = float(_cfg("route_dropout_p", 0.10))
     routing_warmup_epochs = int(_cfg("routing_warmup_epochs", 1))
     route_entropy_lambda = float(_cfg("route_entropy_lambda", 1e-4))
@@ -656,8 +942,9 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             with amp_ctx:
                 zL = behrt(xL, mask=mL)
-                notes_tok = pretok_batch_notes(notes)
+                notes_tok = prepare_notes_batch([{"mode":"text", "chunks": x} for x in notes])
                 zN = bbert(notes_tok)
+
                 zI = imgenc(imgs)
                 z = {"L": zL, "N": zN, "I": zI}
 
@@ -671,10 +958,8 @@ def main():
                             print(f"[emb-norms] i={i} ||zL||={zL[i].norm().item():.3f} "
                                   f"||zN||={zN[i].norm().item():.3f} ||zI||={zI[i].norm().item():.3f}")
 
-                # ---- Route regularization (TRAIN only) ----
                 B = zL.size(0)
                 route_mask = torch.ones(B, 7, device=DEVICE, dtype=torch.float32)
-                # drop exactly ONE interaction route with prob p
                 if route_dropout_p > 0.0 and (torch.rand(()) < route_dropout_p):
                     drop_idx = int(torch.randint(low=3, high=7, size=(1,)))
                     route_mask[:, drop_idx] = 0.0
@@ -701,11 +986,10 @@ def main():
 
                 loss = ce(logits, y)
 
-                # ---- Tiny entropy bonus (warm-up only) ----
                 if route_entropy_lambda > 0.0 and ((epoch - start_epoch) < route_entropy_warm):
                     if (routing_coef is not None) and entropy_use_rc:
                         p = torch.clamp(routing_coef, 1e-6, 1.0)       # [B,7,2]
-                        H = -(p * p.log()).sum(dim=1).mean()            # sum over routes, mean over B & classes
+                        H = -(p * p.log()).sum(dim=1).mean()           
                     else:
                         pa = prim_acts                                   # [B,7]
                         pa = pa / (pa.sum(dim=1, keepdim=True) + 1e-6)
@@ -765,7 +1049,11 @@ def main():
 
         y_true, p1, y_pred, _ = collect_epoch_outputs(val_loader, behrt, bbert, imgenc, fusion, projector, cap_head, amp_ctx)
         m = epoch_metrics(y_true, p1, y_pred)
-        print(f"[epoch {epoch+1}] VAL AUROC={m['AUROC']:.4f} AUPRC={m['AUPRC']:.4f} F1={m['F1']:.4f} Recall={m['Recall']:.4f}")
+        print(
+            f"[epoch {epoch+1}] VAL "
+            f"AUROC={m['AUROC']:.4f} AUPRC={m['AUPRC']:.4f} "
+            f"F1={m['F1']:.4f} Recall={m['Recall']:.4f} Precision={m['Precision']:.4f}"
+        )
         print(f"[epoch {epoch+1}] VAL Confusion Matrix:\n{m['CM']}")
         ece, centers, bconf, bacc, bcnt = expected_calibration_error(p1, y_true, n_bins=args.calib_bins)
         print(f"[epoch {epoch+1}] VAL ECE({args.calib_bins} bins) = {ece:.4f}")
@@ -807,7 +1095,11 @@ def main():
 
     y_true_t, p1_t, y_pred_t, _ = collect_epoch_outputs(test_loader, behrt, bbert, imgenc, fusion, projector, cap_head, amp_ctx)
     mt = epoch_metrics(y_true_t, p1_t, y_pred_t)
-    print(f"[TEST] AUROC={mt['AUROC']:.4f} AUPRC={mt['AUPRC']:.4f} F1={mt['F1']:.4f} Recall={mt['Recall']:.4f}")
+    print(
+        f"[TEST] "
+        f"AUROC={mt['AUROC']:.4f} AUPRC={mt['AUPRC']:.4f} "
+        f"F1={mt['F1']:.4f} Recall={mt['Recall']:.4f} Precision={mt['Precision']:.4f}"
+    )
     print(f"[TEST] Confusion Matrix:\n{mt['CM']}")
     ece_t, centers_t, bconf_t, bacc_t, bcnt_t = expected_calibration_error(p1_t, y_true_t, n_bins=args.calib_bins)
     print(f"[TEST] ECE({args.calib_bins} bins) = {ece_t:.4f}")
