@@ -147,7 +147,7 @@ class Config:
     capsule_layer_norm: bool = False
     capsule_dim_pose_to_vote: int = 0
 
-    loss_type: str = "bce"
+    loss_type: str = "ce"
 
     # Dropout / warmup
     route_dropout_p: float = 0.0
