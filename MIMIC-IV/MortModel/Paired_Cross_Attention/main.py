@@ -19,6 +19,7 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 from torch import amp as torch_amp
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import WeightedRandomSampler
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -1674,6 +1675,33 @@ def _coerce_route_embs(route_embs_in: Dict[str, Any],
                 route_mask[:, j] = 0.0
     return out, route_mask
 
+def death_logit_from_logits2(logits2: torch.Tensor) -> torch.Tensor:
+    """
+    logits2: [B,2] (alive, death)
+    returns: [B,1] logit for death suitable for BCEWithLogitsLoss
+    Using (death - alive) makes it consistent with softmax odds.
+    """
+    assert logits2.ndim == 2 and logits2.size(1) == 2, f"expected [B,2], got {tuple(logits2.shape)}"
+    return (logits2[:, 1] - logits2[:, 0]).unsqueeze(1)
+
+def prob_death_from_death_logit(death_logit: torch.Tensor) -> torch.Tensor:
+    return torch.sigmoid(death_logit)
+
+def sigmoid_death_from_logits2_np(logits_2: np.ndarray) -> np.ndarray:
+    logits_2 = np.asarray(logits_2, dtype=np.float32)
+    dlogit = (logits_2[:, 1] - logits_2[:, 0]).reshape(-1, 1)
+    return 1.0 / (1.0 + np.exp(-dlogit))
+
+def death_logit_from_logits2_np(logits2: np.ndarray) -> np.ndarray:
+    x = np.asarray(logits2, dtype=np.float32)
+    return (x[:, 1] - x[:, 0]).reshape(-1, 1)
+
+def apply_temperature_to_death_logit_np(dlogit: np.ndarray, T: float) -> np.ndarray:
+    return np.asarray(dlogit, dtype=np.float32) / float(T)
+
+def sigmoid_np(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    return 1.0 / (1.0 + np.exp(-x))
 
 def _clamp_norm(x: torch.Tensor, max_norm: float = 20.0) -> torch.Tensor:
     if x.ndim < 2:
@@ -1878,11 +1906,18 @@ def evaluate_epoch(
                 )
                 if route_debug and bidx == 0:
                     route_cosine_report(route_embs)
-            loss = loss_fn(logits, y)   
+            y_f = y.view(-1, 1).float()
+            death_logit = death_logit_from_logits2(logits)  # [B,1]
+            dev = death_logit.device   # or logits.device (anything already on GPU)
+
+            y = y.to(dev, non_blocking=True)
+            y_f = y_f.to(dev, non_blocking=True)
+
+            loss = loss_fn(death_logit, y_f)
 
         total_loss += float(loss.item()) * y.size(0)
-        p_death = torch.softmax(logits, dim=1)[:, 1]
-        pred = (p_death >= 0.5).long()
+        p_death = prob_death_from_death_logit(death_logit).view(-1)  # [B]
+        pred = (torch.sigmoid(death_logit) >= 0.5).long()
         total_correct += (pred == y).sum().item()
         total += y.numel()
         num_samples += y.size(0)
@@ -1982,29 +2017,30 @@ def collect_epoch_logits(
     return y_true, logits, ids
 
 
-def fit_temperature_scalar_from_val(
-    val_logits: np.ndarray,
+def fit_temperature_scalar_bce_from_val(
+    val_logits2: np.ndarray,
     val_y_true: np.ndarray,
     max_iter: int = 300,
     lr: float = 0.05,
 ):
     import torch.nn.functional as F
-    # logits: [N,2]
-    val_logits_t = torch.tensor(val_logits, dtype=torch.float32, device=DEVICE)
 
-    # y can come as [N] or [N,1]; convert to [N] long
-    y = np.asarray(val_y_true)
-    y = y.reshape(-1)
-    val_y_t = torch.tensor(y, dtype=torch.long, device=DEVICE)
+    logits2 = torch.tensor(val_logits2, dtype=torch.float32, device=DEVICE)  # [N,2]
+    y = np.asarray(val_y_true).reshape(-1).astype(np.float32)
+    y_t = torch.tensor(y, dtype=torch.float32, device=DEVICE).view(-1, 1)    # [N,1]
+
+    dlogit = (logits2[:, 1] - logits2[:, 0]).unsqueeze(1)                    # [N,1]
+
     logT = torch.zeros((), device=DEVICE, requires_grad=True)
     opt = torch.optim.Adam([logT], lr=lr)
+
     best_T = 1.0
     best_loss = float("inf")
 
     for _ in range(max_iter):
         opt.zero_grad(set_to_none=True)
         T = torch.exp(logT) + 1e-6
-        loss = F.cross_entropy(val_logits_t / T, val_y_t)
+        loss = F.binary_cross_entropy_with_logits(dlogit / T, y_t)
         loss.backward()
         opt.step()
 
@@ -2012,6 +2048,7 @@ def fit_temperature_scalar_from_val(
         if l < best_loss:
             best_loss = l
             best_T = float(torch.exp(logT).detach().cpu().item())
+
     return float(np.clip(best_T, 0.05, 50.0))
 
 
@@ -2024,15 +2061,6 @@ def sigmoid_np(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     return 1.0 / (1.0 + np.exp(-x))
 
-def softmax_death_np(logits_2: np.ndarray) -> np.ndarray:
-    """
-    logits_2: [N,2] -> returns death prob [N,1] using softmax over dim=1
-    """
-    x = np.asarray(logits_2, dtype=np.float32)
-    x = x - x.max(axis=1, keepdims=True)  # stability
-    ex = np.exp(x)
-    p2 = ex / (ex.sum(axis=1, keepdims=True) + 1e-12)  # [N,2]
-    return p2[:, 1:2]  # [N,1] death prob
 
 @torch.no_grad()
 def collect_epoch_outputs(
@@ -2077,9 +2105,8 @@ def collect_epoch_outputs(
             logits = _safe_tensor(out[0].float(), "collect.logits(fp32)")
 
         # logits: [B,2] (alive, death)
-        probs2 = torch.softmax(logits, dim=1)        # [B,2]
-        p_death = probs2[:, 1].unsqueeze(1)          # [B,1]
-
+        death_logit = death_logit_from_logits2(logits)      # [B,1]
+        p_death = torch.sigmoid(death_logit)                # [B,1]
         y_true.append(y.detach().cpu().view(-1, 1).float())  # [B,1]
         p1.append(p_death.detach().cpu())                    # [B,1]
 
@@ -2365,11 +2392,13 @@ def generate_split_heatmaps_and_tables(
     behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
     amp_ctx_enc,
     amp_ctx_caps,
+    loss_fn,  # ✅ add this
     label_names: List[str],
     ckpt_dir: str,
-    T_cal: Optional[float] = None,          
+    T_cal: Optional[float] = None,
     thr_val: Optional[np.ndarray] = None,
 ):
+
     """
     Creates & saves (TRAIN/TEST only):
       1) Primary activations heatmap (1xN_ROUTES)  [raw + norm saved/printed]
@@ -2385,10 +2414,10 @@ def generate_split_heatmaps_and_tables(
 
     out_dir = os.path.join(ckpt_dir, "heatmaps", split_name.lower())
     os.makedirs(out_dir, exist_ok=True)
-    dummy_ce = nn.CrossEntropyLoss()
+    dummy_bce = nn.BCEWithLogitsLoss()
     loss, acc, act_dict, rc_mat, pa_vec = evaluate_epoch(
         behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
-        loader, amp_ctx_enc, amp_ctx_caps, dummy_ce,
+        loader, amp_ctx_enc, amp_ctx_caps, loss_fn,
         route_debug=False,
         label_names=label_names,
         epoch_idx=None,
@@ -2411,11 +2440,11 @@ def generate_split_heatmaps_and_tables(
     y_true_bin = np.asarray(y_true_log).reshape(-1, 1).astype(np.float32)  # [N,1]
     prev = y_true_bin.mean(axis=0)                                         # [1]
 
-    # death prob from CE logits [N,2]
+    dlogit = death_logit_from_logits2_np(logits)  # [N,1]
     if T_cal is not None:
-        p = softmax_death_np(apply_temperature(logits, float(T_cal)))       # [N,1]
-    else:
-        p = softmax_death_np(logits)                                        # [N,1]
+        dlogit = dlogit / float(T_cal)
+    p = sigmoid_np(dlogit)                       # [N,1]
+
 
     if thr_val is not None:
         thr_val = np.asarray(thr_val, dtype=np.float32).reshape(-1)         # [1]
@@ -2604,12 +2633,14 @@ def main():
     pos_counts = train_label_df[train_ds.label_cols].sum(axis=0).values
     neg_counts = N_train - pos_counts
     pos_weight = neg_counts / (pos_counts + 1e-6)
-    # after you compute pos_counts/neg_counts
-    w0 = 1.0
-    w1 = float(neg_counts[0] / (pos_counts[0] + 1e-6))
-    w1 = min(w1, float(_cfg("pos_weight_max", 20.0)))
-    ce = nn.CrossEntropyLoss(weight=torch.tensor([w0, w1], device=DEVICE, dtype=torch.float32))
-    print(f"[loss] Weighted CrossEntropyLoss w=[{w0:.3f},{w1:.3f}]")
+    # ---- BCE (on death_logit) ----
+    # pos_weight for BCE should be (N_neg / N_pos)
+    pos = float(pos_counts[0])
+    neg = float(neg_counts[0])
+    pos_w = neg / (pos + 1e-6)
+    pos_w = min(pos_w, float(_cfg("pos_weight_max", 20.0)))  # keep your clamp
+    bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_w], device=DEVICE, dtype=torch.float32))
+    print(f"[loss] BCEWithLogitsLoss pos_weight={pos_w:.3f}")
 
 
     # Prevent extreme imbalance from exploding gradients
@@ -2617,12 +2648,8 @@ def main():
     pos_weight = np.clip(pos_weight, 1.0, max_pw)
     print(f"[loss] pos_weight: min={pos_weight.min():.3f} max={pos_weight.max():.3f} (clamped to {max_pw})")
 
-    pos_weight_tensor = torch.tensor(pos_weight, dtype=torch.float32, device=DEVICE)
-
     val_ds   = ICUStayDataset(args.data_root, split="val")
     test_ds  = ICUStayDataset(args.data_root, split="test")
-    #ce = nn.CrossEntropyLoss()
-    #print("[loss] CrossEntropyLoss (binary softmax)")
 
     collate_train = collate_fn_factory(tidx=TASK_MAP[args.task], img_tfms=build_image_transform("train"))
     collate_eval  = collate_fn_factory(tidx=TASK_MAP[args.task], img_tfms=build_image_transform("val"))
@@ -2783,6 +2810,17 @@ def main():
     print(f"[optim] enc_tensors={len(enc_params)} head_tensors={len(head_params)} total={len(params)}")
     print(f"[warmup] encoder_warmup_epochs={encoder_warmup_epochs}")
 
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode="max",  # maximize AUROC
+        factor=float(_cfg("lr_plateau_factor", 0.5)),
+        patience=int(_cfg("lr_plateau_patience", 2)),
+        threshold=float(_cfg("lr_plateau_min_delta", 1e-4)),
+        threshold_mode="rel",
+        cooldown=0,
+        min_lr=float(_cfg("min_lr", 1e-6)),
+    )
+
     # Checkpoint setup
     start_epoch = 0
     best_val_acc = -1.0
@@ -2833,15 +2871,30 @@ def main():
             print(f"[debug] Early stop flag set → breaking before epoch {epoch + 1}.")
             break
 
-        enc_lr = 0.0 if (epoch - start_epoch) < encoder_warmup_epochs else args.lr
-        optimizer.param_groups[0]["lr"] = enc_lr
-        optimizer.param_groups[1]["lr"] = args.lr
+        if (epoch - start_epoch) < encoder_warmup_epochs:
+            # warmup: freeze encoder lr, keep head lr at base
+            optimizer.param_groups[0]["lr"] = 0.0
+            optimizer.param_groups[1]["lr"] = args.lr
+        else:
+            # post-warmup: DO NOT reset lrs here — scheduler will manage them
+            pass
+
+        if (epoch - start_epoch) < encoder_warmup_epochs:
+            optimizer.param_groups[0]["lr"] = 0.0
+            optimizer.param_groups[1]["lr"] = args.lr
+        else:
+            # don't override scheduler
+            pass
+
+        enc_lr  = float(optimizer.param_groups[0]["lr"])
+        head_lr = float(optimizer.param_groups[1]["lr"])
+
         enc_train = (enc_lr > 0.0)
         for p in enc_params:
             p.requires_grad = enc_train
 
         if epoch in {start_epoch, start_epoch + encoder_warmup_epochs}:
-            print(f"[warmup] epoch={epoch+1} enc_lr={enc_lr} head_lr={args.lr} enc_train={enc_train}")
+            print(f"[warmup] epoch={epoch+1} enc_lr={enc_lr:.2e} head_lr={head_lr:.2e} enc_train={enc_train}")
 
         if enc_train:
             behrt.train()
@@ -2964,7 +3017,10 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
                     continue
 
-                loss = ce(logits, y)
+                y_f = y.view(-1, 1).float()
+
+                death_logit = death_logit_from_logits2(logits)     # [B,1]
+                loss = bce(death_logit, y_f)
                 cur_epoch = float(epoch + 1) 
 
                 if route_entropy_lambda > 0.0 and (route_entropy_warmup_epochs <= 0 or cur_epoch <= route_entropy_warmup_epochs):
@@ -3011,7 +3067,7 @@ def main():
             safe_zero_grad(optimizer)
             total_loss += float(loss.item()) * y.size(0)
 
-            p_death = torch.softmax(logits, dim=1)[:, 1]  
+            p_death = prob_death_from_death_logit(death_logit).view(-1)  # [B]
             pred = (p_death >= 0.5).long()
             total_correct += (pred == y).sum().item()
             total += y.numel()
@@ -3065,7 +3121,7 @@ def main():
         # VAL metrics (BCE + 0.5 threshold / F1-based thresholds)
         val_loss, val_acc, val_act, val_rc_mat, val_pa = evaluate_epoch(
             behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
-            val_loader, amp_ctx_enc, amp_ctx_caps, ce,
+            val_loader, amp_ctx_enc, amp_ctx_caps, bce,
             act_temperature=1.0,
             detach_priors=False,
             route_debug=bool(getattr(args, "route_debug", False)),
@@ -3143,9 +3199,13 @@ def main():
             )
         
         val_macro_auroc = float(m["AUROC"])   # macro AUROC
+        scheduler.step(val_macro_auroc)
+
+        # optional: log current lr
+        cur_lrs = [pg["lr"] for pg in optimizer.param_groups]
+        print(f"[lr] after plateau-step: {cur_lrs}")
 
         # Epoch-level early stopping on VAL macro AUROC 
-        val_macro_auroc = float(m["AUROC"])  
         if val_macro_auroc > best_val_auroc + min_delta:
             best_val_auroc = val_macro_auroc
             epochs_no_improve = 0
@@ -3218,7 +3278,7 @@ def main():
 
     test_loss, test_acc, test_act, test_rc_mat, test_pa = evaluate_epoch(
         behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
-        test_loader, amp_ctx_enc, amp_ctx_caps, ce,
+        test_loader, amp_ctx_enc, amp_ctx_caps, bce,
         act_temperature=1.0,
         detach_priors=False,
         route_debug=False,
@@ -3274,13 +3334,15 @@ def main():
     )
 
     # Fit temperature on VAL only 
-    T_star = fit_temperature_scalar_from_val(logits_v, y_true_v_log, max_iter=300, lr=0.05)
-    print(f"[calibration] Fitted temperature on VAL only: T={T_star:.4f}")
+    T_star = fit_temperature_scalar_bce_from_val(logits_v, y_true_v_log, max_iter=300, lr=0.05)
+    print(f"[calibration] Fitted temperature on VAL only (BCE): T={T_star:.4f}")
 
     # Convert to [N,1] for threshold utilities
     y_true_v = np.asarray(y_true_v_log).reshape(-1, 1).astype(np.float32)   # [N,1]
 
-    p_v = softmax_death_np(apply_temperature(logits_v, T_star))             # [N,1]
+    dlogit_v = death_logit_from_logits2_np(logits_v)               # [N,1]
+    p_v      = sigmoid_np(apply_temperature_to_death_logit_np(dlogit_v, T_star))
+
     prev_val = compute_split_prevalence(y_true_v, split_name="VAL", label_names=["death"])
     thr_val, f1_val_thr = grid_search_thresholds(y_true_v, p_v, n_steps=101)
     save_split_thresholds(thr_val, ckpt_dir, split_name="VAL")
@@ -3292,8 +3354,12 @@ def main():
     # Uncalibrated + calibrated probabilities on TEST
     y_true_t = np.asarray(y_true_t_log).reshape(-1, 1).astype(np.float32)  # [N,1]
 
-    p_test_uncal = softmax_death_np(logits_t)                               # [N,1]
-    p_test_cal   = softmax_death_np(apply_temperature(logits_t, T_star))    # [N,1]
+    dlogit_t = death_logit_from_logits2_np(logits_t)          # [N,1]
+    p_test_uncal = sigmoid_np(dlogit_t)
+
+    dlogit_t_cal = dlogit_t / float(T_star)
+    p_test_cal   = sigmoid_np(dlogit_t_cal)
+
 
     y_pred_unc_05 = (p_test_uncal >= 0.5).astype(int)
     m_unc_05 = epoch_metrics(y_true_t, p_test_uncal, y_pred_unc_05)
@@ -3332,10 +3398,11 @@ def main():
         mult=mult, route_adapter=route_adapter, projector=projector, cap_head=cap_head,
         amp_ctx_enc=amp_ctx_enc,
         amp_ctx_caps=amp_ctx_caps,
+        loss_fn=bce, 
         label_names=label_names,
         ckpt_dir=ckpt_dir,
-        T_cal=T_star,         
-        thr_val=thr_val,      
+        T_cal=T_star,
+        thr_val=thr_val,
     )
 
     generate_split_heatmaps_and_tables(
@@ -3345,11 +3412,13 @@ def main():
         mult=mult, route_adapter=route_adapter, projector=projector, cap_head=cap_head,
         amp_ctx_enc=amp_ctx_enc,
         amp_ctx_caps=amp_ctx_caps,
+        loss_fn=bce,  
         label_names=label_names,
         ckpt_dir=ckpt_dir,
-        T_cal=T_star,        
-        thr_val=thr_val,      
+        T_cal=T_star,
+        thr_val=thr_val,
     )
+
 
 if __name__ == "__main__":
     main()
