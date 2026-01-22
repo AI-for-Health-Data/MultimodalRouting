@@ -275,19 +275,28 @@ def debug_routing_tensor(rc: torch.Tensor, name="rc", expect_routes=10, kind="ra
             print("[debug] example rc[0, :, class0]= ", rc[0, :, 0].detach().float().cpu().tolist(),
                   " sum=", float(rc[0, :, 0].sum().detach().cpu()))
 
-def assert_routing_over_routes(rc: torch.Tensor, routes_dim: int = 1, atol: float = 1e-3, name: str = "routing_coef"):
+def assert_routing_over_routes(
+    rc: torch.Tensor,
+    routes_dim: int = 1,          # <-- add
+    atol: float = 1e-3,
+    name: str = "routing_coef",
+):
+    """
+    Assert rc sums to 1 over routes_dim.
+    Works for rc shaped [B,R,K] with routes_dim=1 (most common).
+    """
     if rc.ndim != 3:
-        raise AssertionError(f"{name}: expected [B,R,K], got {tuple(rc.shape)}")
-    s = rc.sum(dim=routes_dim)  # [B,K]
-    ones = torch.ones_like(s)
+        raise AssertionError(f"{name}: expected 3D tensor, got {tuple(rc.shape)}")
 
+    s = rc.sum(dim=routes_dim)
+    ones = torch.ones_like(s)
     if not torch.allclose(s, ones, atol=atol, rtol=0.0):
         with torch.no_grad():
             max_err = (s - 1.0).abs().max().item()
             mean_err = (s - 1.0).abs().mean().item()
             raise AssertionError(
-                f"{name}: NOT normalized over routes dim={routes_dim}. "
-                f"sum(dim={routes_dim}) -> min={s.min().item():.6f} max={s.max().item():.6f} "
+                f"{name}: NOT normalized over routes_dim={routes_dim}. "
+                f"sum -> min={s.min().item():.6f} max={s.max().item():.6f} "
                 f"abs_err mean={mean_err:.3e} max={max_err:.3e}"
             )
 
@@ -1809,9 +1818,7 @@ def evaluate_epoch(
                 rc_raw = normalize_rc_shape_to_brk(rc_raw, expect_routes=N_ROUTES, name=f"{split_name}.rc_raw")
 
                 assert_probs_over_dim(rc_raw, dim=2, atol=1e-2, name=f"{split_name}.rc_raw_over_classes")
-                # rc_raw should be normalized over classes (dim=2), not routes
-                assert_probs_over_dim(rc_raw, dim=2, atol=1e-2, name=f"{split_name}.rc_raw_over_classes")
-
+        
                 rc_report = route_given_pheno(rc_raw, prim_acts, route_mask=route_mask)
 
                 assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name=f"{split_name}.rc_report")
@@ -2055,11 +2062,6 @@ def fit_temperature_scalar_bce_from_val(
 def apply_temperature(logits: np.ndarray, T: float) -> np.ndarray:
     logits = np.asarray(logits, dtype=np.float32)
     return logits / float(T)
-
-
-def sigmoid_np(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x, dtype=np.float32)
-    return 1.0 / (1.0 + np.exp(-x))
 
 
 @torch.no_grad()
@@ -2542,6 +2544,29 @@ def generate_split_heatmaps_and_tables(
         "prevalence_per_label": prev.astype(np.float32),
     }
 
+import torch.nn.functional as F
+
+class BinaryFocalLoss(nn.Module):
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, reduction: str = "mean"):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
+        self.reduction = str(reduction)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # logits: [B,1], targets: [B,1] float in {0,1}
+        p = torch.sigmoid(logits)
+        ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        p_t = p * targets + (1.0 - p) * (1.0 - targets)
+        alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
+        loss = alpha_t * ((1.0 - p_t) ** self.gamma) * ce
+
+        if self.reduction == "mean":
+            return loss.mean()
+        if self.reduction == "sum":
+            return loss.sum()
+        return loss
+
 def main():
     import env_config as E
 
@@ -2633,20 +2658,42 @@ def main():
     pos_counts = train_label_df[train_ds.label_cols].sum(axis=0).values
     neg_counts = N_train - pos_counts
     pos_weight = neg_counts / (pos_counts + 1e-6)
-    # ---- BCE (on death_logit) ----
-    # pos_weight for BCE should be (N_neg / N_pos)
+    # Make a mapping stay_id -> label (0/1) for TRAIN ids
+    sid_to_y = dict(
+        zip(
+            train_label_df["stay_id"].astype(int).tolist(),
+            train_label_df[train_ds.label_cols[0]].astype(float).fillna(0.0).gt(0.0).astype(int).tolist()
+        )
+    )
+
+    # Per-sample weights (bigger weight for positive class)
+    # Common choice: w_pos = N_neg / N_pos, w_neg = 1
     pos = float(pos_counts[0])
     neg = float(neg_counts[0])
-    pos_w = neg / (pos + 1e-6)
-    pos_w = min(pos_w, float(_cfg("pos_weight_max", 20.0)))  # keep your clamp
-    bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_w], device=DEVICE, dtype=torch.float32))
-    print(f"[loss] BCEWithLogitsLoss pos_weight={pos_w:.3f}")
+    w_pos = (neg / (pos + 1e-6))
+    w_neg = 1.0
+
+    sample_weights = []
+    for sid in train_ds.ids:
+        ysid = int(sid_to_y.get(int(sid), 0))
+        sample_weights.append(w_pos if ysid == 1 else w_neg)
+
+    sample_weights = torch.tensor(sample_weights, dtype=torch.double)
+    train_sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),   # one "epoch" ~ same size
+        replacement=True
+    )
+    print(f"[sampler] WeightedRandomSampler enabled: w_pos={w_pos:.3f} w_neg={w_neg:.3f}")
 
 
     # Prevent extreme imbalance from exploding gradients
     max_pw = float(_cfg("pos_weight_max", 20.0))
     pos_weight = np.clip(pos_weight, 1.0, max_pw)
     print(f"[loss] pos_weight: min={pos_weight.min():.3f} max={pos_weight.max():.3f} (clamped to {max_pw})")
+    pos_weight_t = torch.tensor(pos_weight, dtype=torch.float32, device=DEVICE).view(1)
+    bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight_t)
+    loss_fn_train = bce
 
     val_ds   = ICUStayDataset(args.data_root, split="val")
     test_ds  = ICUStayDataset(args.data_root, split="test")
@@ -2660,14 +2707,20 @@ def main():
     g_eval.manual_seed(int(CFG.seed) + 456)
 
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=pin,
-        collate_fn=collate_train, drop_last=False,
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=False,                  # MUST be False with sampler
+        sampler=train_sampler,          # <-- add this
+        num_workers=args.num_workers,
+        pin_memory=pin,
+        collate_fn=collate_train,
+        drop_last=False,
         worker_init_fn=seed_worker,
         generator=g_train,
         persistent_workers=(args.num_workers > 0),
         prefetch_factor=4 if args.num_workers > 0 else None,
     )
+
 
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
@@ -2991,6 +3044,11 @@ def main():
                     assert_probs_over_dim(rc_raw, dim=2, atol=1e-2, name="TRAIN.rc_raw_over_classes")
 
                     rc_report = route_given_pheno(rc_raw, prim_acts, route_mask=route_mask)
+
+                    rc_report = normalize_rc_shape_to_brk(
+                        rc_report, expect_routes=N_ROUTES, name="TRAIN.rc_report"
+                    )
+
                     assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name="TRAIN.rc_report")
 
                     if bool(getattr(args, "route_debug", False)) and (epoch == start_epoch) and (step == 0):
@@ -3020,7 +3078,8 @@ def main():
                 y_f = y.view(-1, 1).float()
 
                 death_logit = death_logit_from_logits2(logits)     # [B,1]
-                loss = bce(death_logit, y_f)
+                loss = loss_fn_train(death_logit, y_f)
+
                 cur_epoch = float(epoch + 1) 
 
                 if route_entropy_lambda > 0.0 and (route_entropy_warmup_epochs <= 0 or cur_epoch <= route_entropy_warmup_epochs):
@@ -3372,6 +3431,17 @@ def main():
     y_pred_cal_valthr = (p_test_cal >= thr_val[np.newaxis, :]).astype(int)
     m_cal_valthr = epoch_metrics(y_true_t, p_test_cal, y_pred_cal_valthr)
     print_metrics_block("TEST calibrated thr=VAL", m_cal_valthr, cm=True)
+    print("\n" + "="*80)
+    print("[FINAL TEST REPORT] (Temperature from VAL + Threshold from VAL)")
+    print(f"  Temperature T* (VAL): {T_star:.4f}")
+    print(f"  Threshold (VAL): {thr_val[0]:.4f}")
+    print(f"  TEST AUROC: {m_cal_valthr['AUROC']:.4f}")
+    print(f"  TEST AUPRC: {m_cal_valthr['AUPRC']:.4f}")
+    print(f"  TEST F1:    {m_cal_valthr['F1']:.4f}")
+    print(f"  TEST Prec:  {m_cal_valthr['Precision']:.4f}")
+    print(f"  TEST Rec:   {m_cal_valthr['Recall']:.4f}")
+    print("="*80 + "\n")
+
 
     y_pred_unc_valthr = (p_test_uncal >= thr_val[np.newaxis, :]).astype(int)
     m_unc_valthr = epoch_metrics(y_true_t, p_test_uncal, y_pred_unc_valthr)
@@ -3398,7 +3468,7 @@ def main():
         mult=mult, route_adapter=route_adapter, projector=projector, cap_head=cap_head,
         amp_ctx_enc=amp_ctx_enc,
         amp_ctx_caps=amp_ctx_caps,
-        loss_fn=bce, 
+        loss_fn=bce,  
         label_names=label_names,
         ckpt_dir=ckpt_dir,
         T_cal=T_star,
