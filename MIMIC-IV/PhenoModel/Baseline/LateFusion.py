@@ -21,7 +21,7 @@ from transformers import AutoTokenizer
 from env_config import CFG, DEVICE, load_cfg, ensure_dir, apply_cli_overrides, get_pheno_name
 
 from encoders import EncoderConfig, build_encoders
-from encoders import encode_unimodal_pooled  # returns {"L": zL, "N": zN, "I": zI}
+from encoders import encode_unimodal_pooled  
 from main import (
     ICUStayDataset,
     collate_fn_factory,
@@ -89,8 +89,7 @@ def eval_epoch_late_fusion(
 ):
     behrt.eval()
     imgenc.eval()
-    if getattr(bbert, "bert", None) is not None:
-        bbert.bert.eval()
+    bbert.eval()
     head.eval()
 
     total_loss = 0.0
@@ -136,13 +135,13 @@ def eval_epoch_late_fusion(
         num_samples += y.size(0)
 
         all_y.append(y.detach().cpu())
-        all_p.append(probs.detach().cpu())
+        all_p.append(probs.detach().float().cpu())
 
     avg_loss = total_loss / max(1, num_samples)
     avg_acc = total_correct / max(1, total)
 
     y_true = torch.cat(all_y, dim=0).numpy()
-    p = torch.cat(all_p, dim=0).numpy()
+    p = torch.cat(all_p, dim=0).float().numpy()
     return avg_loss, avg_acc, y_true, p
 
 
@@ -163,8 +162,9 @@ def main():
     print("[forced] DEVICE =", DEVICE)
     print("[env_config] CFG:", json.dumps(asdict(CFG), indent=2))
 
-    global TOKENIZER
-    TOKENIZER = AutoTokenizer.from_pretrained(CFG.text_model_name, local_files_only=True)
+    import main as M
+    M.TOKENIZER = AutoTokenizer.from_pretrained(CFG.text_model_name, local_files_only=True)
+    TOKENIZER = M.TOKENIZER
 
     use_cuda = (str(DEVICE).startswith("cuda") and torch.cuda.is_available())
     precision = str(args.precision).lower()
@@ -212,11 +212,9 @@ def main():
     print("  train∩test:", len(inter_tt))
     print("  val∩test:", len(inter_vt))
 
-    # Peek a few samples through __getitem__ (this checks your internal joins)
     print("\n[DATA CHECK] sampling 3 items from train_ds")
     for i in [0, 1, 2]:
         sample = train_ds[i]
-        # ICUStayDataset likely returns something like (xL, mL, notes, imgs, y, dbg) OR a dict
         if isinstance(sample, dict):
             keys = list(sample.keys())
             print(f"  sample[{i}] dict keys:", keys)
@@ -285,6 +283,17 @@ def main():
     if isinstance(dbg, dict):
         print("[BATCH CHECK] dbg keys:", list(dbg.keys()))
 
+    with torch.no_grad():
+        pooled0 = encode_unimodal_pooled(
+            behrt=behrt, bbert=bbert, imgenc=imgenc,
+            xL=xL.to(DEVICE), notes_batch=notes, imgs=imgs.to(DEVICE), mL=mL.to(DEVICE),
+        )
+        dL = int(pooled0["L"].shape[-1])
+        dN = int(pooled0["N"].shape[-1])
+        dI = int(pooled0["I"].shape[-1])
+        print("[DIM CHECK] dL,dN,dI =", dL, dN, dI)
+
+
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=pin,
@@ -316,18 +325,15 @@ def main():
     )
     behrt, bbert, imgenc = build_encoders(enc_cfg, device=DEVICE)
 
-    if not getattr(CFG, "finetune_text", False) and getattr(bbert, "bert", None) is not None and not args.finetune_text:
-        for p in bbert.bert.parameters():
+    finetune_text = (getattr(CFG, "finetune_text", False) or args.finetune_text)
+
+    if not finetune_text:
+        for p in bbert.parameters():
             p.requires_grad = False
-        bbert.bert.eval()
+        bbert.eval()
         print("[encoders] Bio_ClinicalBERT frozen (feature extractor mode)")
     else:
         print("[encoders] Bio_ClinicalBERT finetuning enabled")
-
-    dL = int(behrt.out_dim)
-    dN = int(bbert.out_dim)
-    # your ImageEncoder likely has proj.out_features as embedding dim
-    dI = int(imgenc.proj.out_features) if hasattr(imgenc, "proj") else int(getattr(imgenc, "out_dim", dL))
 
     head = LateFusionHead(dL=dL, dN=dN, dI=dI, num_labels=num_labels,
                           hidden=int(getattr(CFG, "latefusion_hidden", 256)),
@@ -335,8 +341,10 @@ def main():
 
     encoder_warmup_epochs = int(getattr(args, "encoder_warmup_epochs", 2))
     enc_params = [p for p in behrt.parameters() if p.requires_grad] + [p for p in imgenc.parameters() if p.requires_grad]
-    if getattr(CFG, "finetune_text", False) or args.finetune_text:
+    finetune_text = (getattr(CFG, "finetune_text", False) or args.finetune_text)
+    if finetune_text:
         enc_params += [p for p in bbert.parameters() if p.requires_grad]
+
 
     head_params = [p for p in head.parameters() if p.requires_grad]
     params = enc_params + head_params
@@ -364,11 +372,14 @@ def main():
         behrt.train()
         imgenc.train()
         head.train()
-        if getattr(bbert, "bert", None) is not None:
-            if getattr(CFG, "finetune_text", False) or args.finetune_text:
-                bbert.bert.train()
-            else:
-                bbert.bert.eval()
+
+        finetune_text = (getattr(CFG, "finetune_text", False) or args.finetune_text)
+
+        if finetune_text:
+            bbert.train()
+        else:
+            bbert.eval()   
+
 
         total_loss = 0.0
         total = 0
