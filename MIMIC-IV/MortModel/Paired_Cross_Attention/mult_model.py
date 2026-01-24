@@ -50,10 +50,12 @@ class MULTModel(nn.Module):
         self.proj_pair_ln = nn.Linear(2 * self.d_l, self.d_l, bias=True)
         self.proj_pair_li = nn.Linear(2 * self.d_l, self.d_l, bias=True)
         self.proj_pair_ni = nn.Linear(2 * self.d_l, self.d_l, bias=True)
+
         self.final_lni = nn.Linear(3 * self.d_l, self.d_l, bias=True)
 
     def get_network(self, self_type: str = 'l', layers: int = -1):
         n_layers = self.layers if layers == -1 else layers
+
         q = self_type[0]
         if q == 'l':
             embed_dim, attn_dropout = self.d_l, self.attn_dropout
@@ -77,11 +79,6 @@ class MULTModel(nn.Module):
 
 
     def _masked_mean_tbd(self, h_tbd, m_bt):
-        """
-        h_tbd: [T,B,D]
-        m_bt:  [B,T] float (1=keep, 0=pad)
-        returns [B,D]
-        """
         if m_bt is None:
             return h_tbd.mean(dim=0)  # mean over T -> [B,D]
         m = m_bt.float()
@@ -100,6 +97,7 @@ class MULTModel(nn.Module):
         h_btd = h_tbd.permute(1, 0, 2)   # [B,T,D]
         out = h_btd[torch.arange(h_btd.size(0), device=h_btd.device), idx]  # [B,D]
 
+        # if length==0 -> zero it out
         if (lengths == 0).any():
             out = out.clone()
             out[lengths == 0] = 0.0
@@ -114,11 +112,6 @@ class MULTModel(nn.Module):
         return m.to(device=device).float()
 
     def forward(self, x_l, x_n, x_i, mL=None, mN=None, mI=None):
-        """
-        x_*: [B,T,D]  (sequence embeddings)
-        m*:  [B,T] float/bool where 1=keep, 0=pad (optional)
-        returns dict of 10 route embeddings (each [B,d_*] and LNI [B,d_l])
-        """
         assert x_l.dim() == 3 and x_n.dim() == 3 and x_i.dim() == 3
         B, TL, _ = x_l.shape
         BN, TN, _ = x_n.shape
@@ -135,7 +128,6 @@ class MULTModel(nn.Module):
         xn = x_n.transpose(1, 2)
         xi = x_i.transpose(1, 2)
 
-        # conv proj -> [B,d,T]
         pl = xl if self.orig_d_l == self.d_l else self.proj_l(xl)
         pn = xn if self.orig_d_n == self.d_n else self.proj_n(xn)
         pi = xi if self.orig_d_i == self.d_i else self.proj_i(xi)
@@ -190,7 +182,6 @@ class MULTModel(nn.Module):
             "LNI": zLNI,
         }
 
-        # dtype normalization (prevents your mismatch error)
         target_dtype = next(self.parameters()).dtype
         for k, v in out.items():
             if torch.is_tensor(v) and v.dtype != target_dtype:
