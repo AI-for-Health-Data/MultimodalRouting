@@ -35,7 +35,6 @@ class MULTModel(nn.Module):
         self.trans_n = self.get_network(self_type='n_only', layers=self.self_layers)
         self.trans_i = self.get_network(self_type='i_only', layers=self.self_layers)
 
-        # Always build directional bimodal routes (method constructs all ordered pairs)
         self.trans_l_with_n = self.get_network(self_type='ln')
         self.trans_l_with_i = self.get_network(self_type='li')
 
@@ -45,35 +44,16 @@ class MULTModel(nn.Module):
         self.trans_i_with_l = self.get_network(self_type='il')
         self.trans_i_with_n = self.get_network(self_type='in')
 
-        # ---------------------------------------------------------------------
-        # UPDATED (to match paragraph):
-        # Build trimodal LNI via hierarchical composition of directional pairs:
-        #   e_LN = Proj_LN([e_{L<-N}; e_{N<-L}])  -> R^{B x d_l}
-        #   e_LI = Proj_LI([e_{L<-I}; e_{I<-L}])  -> R^{B x d_l}
-        #   e_NI = Proj_NI([e_{N<-I}; e_{I<-N}])  -> R^{B x d_l}
-        #   e_LNI = Proj_T([e_LN; e_LI; e_NI])    -> R^{B x d_l}
-        #
-        # Directional dims differ (d_l, d_n, d_i). We minimally align N/I -> d_l.
-        # ---------------------------------------------------------------------
-
-        # Align N / I embeddings into d_l for pairing (no change to existing returned routes)
         self.proj_n_to_l = nn.Identity() if self.d_n == self.d_l else nn.Linear(self.d_n, self.d_l, bias=True)
         self.proj_i_to_l = nn.Identity() if self.d_i == self.d_l else nn.Linear(self.d_i, self.d_l, bias=True)
 
-        # Pair projections (2*d_l -> d_l)
         self.proj_pair_ln = nn.Linear(2 * self.d_l, self.d_l, bias=True)
         self.proj_pair_li = nn.Linear(2 * self.d_l, self.d_l, bias=True)
         self.proj_pair_ni = nn.Linear(2 * self.d_l, self.d_l, bias=True)
-
-        # Trimodal projection (3*d_l -> d_l)
         self.final_lni = nn.Linear(3 * self.d_l, self.d_l, bias=True)
 
     def get_network(self, self_type: str = 'l', layers: int = -1):
-        # 1) Respect caller-provided layers; otherwise use self.layers
         n_layers = self.layers if layers == -1 else layers
-
-        # 2) Query modality decides embed_dim / dropout (first char: l/n/i)
-        # Works for: l, n, i, ln, nl, li, il, ni, in, lni, ... and also l_only/n_only/i_only
         q = self_type[0]
         if q == 'l':
             embed_dim, attn_dropout = self.d_l, self.attn_dropout
@@ -87,7 +67,7 @@ class MULTModel(nn.Module):
         return TransformerEncoder(
             embed_dim=embed_dim,
             num_heads=self.num_heads,
-            layers=n_layers,              # <-- IMPORTANT: pass the resolved n_layers
+            layers=n_layers,             
             attn_dropout=attn_dropout,
             relu_dropout=self.relu_dropout,
             res_dropout=self.res_dropout,
@@ -120,7 +100,6 @@ class MULTModel(nn.Module):
         h_btd = h_tbd.permute(1, 0, 2)   # [B,T,D]
         out = h_btd[torch.arange(h_btd.size(0), device=h_btd.device), idx]  # [B,D]
 
-        # if length==0 -> zero it out
         if (lengths == 0).any():
             out = out.clone()
             out[lengths == 0] = 0.0
@@ -134,78 +113,76 @@ class MULTModel(nn.Module):
             m = m.unsqueeze(0).expand(B, -1)
         return m.to(device=device).float()
 
-    def forward_from_encoders(
-        self,
-        L_seq, N_seq, I_seq,              # [B, TL, DL], [B, TN, DN], [B, TI, DI]
-        mL=None, mN=None, mI=None,         # [B, TL], [B, TN], [B, TI] float (1=keep,0=pad)
-        L_pool=None, N_pool=None, I_pool=None,  # [B, *] pooled from encoders (preferred)
-    ):
-        assert L_seq.dim() == 3 and N_seq.dim() == 3 and I_seq.dim() == 3
-        B, TL, DL = L_seq.shape
-        BN, TN, DN = N_seq.shape
-        BI, TI, DI = I_seq.shape
+    def forward(self, x_l, x_n, x_i, mL=None, mN=None, mI=None):
+        """
+        x_*: [B,T,D]  (sequence embeddings)
+        m*:  [B,T] float/bool where 1=keep, 0=pad (optional)
+        returns dict of 10 route embeddings (each [B,d_*] and LNI [B,d_l])
+        """
+        assert x_l.dim() == 3 and x_n.dim() == 3 and x_i.dim() == 3
+        B, TL, _ = x_l.shape
+        BN, TN, _ = x_n.shape
+        BI, TI, _ = x_i.shape
         assert B == BN == BI
 
-        device = L_seq.device
+        device = x_l.device
         mL = self._ensure_float_mask(mL, B, TL, device)
         mN = self._ensure_float_mask(mN, B, TN, device)
         mI = self._ensure_float_mask(mI, B, TI, device)
 
         # [B,T,D] -> [B,D,T]
-        x_l = F.dropout(L_seq.transpose(1, 2), p=self.embed_dropout, training=self.training)
-        x_n = N_seq.transpose(1, 2)
-        x_i = I_seq.transpose(1, 2)
+        xl = F.dropout(x_l.transpose(1, 2), p=self.embed_dropout, training=self.training)
+        xn = x_n.transpose(1, 2)
+        xi = x_i.transpose(1, 2)
 
-        # conv proj
-        proj_x_l = x_l if self.orig_d_l == self.d_l else self.proj_l(x_l)
-        proj_x_n = x_n if self.orig_d_n == self.d_n else self.proj_n(x_n)
-        proj_x_i = x_i if self.orig_d_i == self.d_i else self.proj_i(x_i)
+        # conv proj -> [B,d,T]
+        pl = xl if self.orig_d_l == self.d_l else self.proj_l(xl)
+        pn = xn if self.orig_d_n == self.d_n else self.proj_n(xn)
+        pi = xi if self.orig_d_i == self.d_i else self.proj_i(xi)
 
-        # [B,D,T] -> [T,B,D]
-        proj_x_l = proj_x_l.permute(2, 0, 1)  # [TL,B,d_l]
-        proj_x_n = proj_x_n.permute(2, 0, 1)  # [TN,B,d_n]
-        proj_x_i = proj_x_i.permute(2, 0, 1)  # [TI,B,d_i]
+        # [B,d,T] -> [T,B,d]
+        pl = pl.permute(2, 0, 1)
+        pn = pn.permute(2, 0, 1)
+        pi = pi.permute(2, 0, 1)
 
-        # Cross (directional) with masks
-        h_l_with_ns = self.trans_l_with_n(proj_x_l, proj_x_n, proj_x_n, q_mask=mL, kv_mask=mN)
-        h_l_with_is = self.trans_l_with_i(proj_x_l, proj_x_i, proj_x_i, q_mask=mL, kv_mask=mI)
+        hL = self.trans_l(pl, q_mask=mL, kv_mask=mL)
+        hN = self.trans_n(pn, q_mask=mN, kv_mask=mN)
+        hI = self.trans_i(pi, q_mask=mI, kv_mask=mI)
 
-        h_n_with_ls = self.trans_n_with_l(proj_x_n, proj_x_l, proj_x_l, q_mask=mN, kv_mask=mL)
-        h_n_with_is = self.trans_n_with_i(proj_x_n, proj_x_i, proj_x_i, q_mask=mN, kv_mask=mI)
+        zL = self._masked_last_tbd(hL, mL)   # [B,d_l]
+        zN = self._masked_last_tbd(hN, mN)   # [B,d_n]
+        zI = self._masked_last_tbd(hI, mI)   # [B,d_i]
 
-        h_i_with_ls = self.trans_i_with_l(proj_x_i, proj_x_l, proj_x_l, q_mask=mI, kv_mask=mL)
-        h_i_with_ns = self.trans_i_with_n(proj_x_i, proj_x_n, proj_x_n, q_mask=mI, kv_mask=mN)
+        hLN = self.trans_l_with_n(pl, pn, pn, q_mask=mL, kv_mask=mN)  # L<-N  [TL,B,d_l]
+        hLI = self.trans_l_with_i(pl, pi, pi, q_mask=mL, kv_mask=mI)  # L<-I
 
-        # Pool cross outputs WITH QUERY mask (never use [-1] when padded)
-        zLN = self._masked_last_tbd(h_l_with_ns, mL)
-        zLI = self._masked_last_tbd(h_l_with_is, mL)
+        hNL = self.trans_n_with_l(pn, pl, pl, q_mask=mN, kv_mask=mL)  # N<-L  [TN,B,d_n]
+        hNI = self.trans_n_with_i(pn, pi, pi, q_mask=mN, kv_mask=mI)  # N<-I
 
-        zNL = self._masked_last_tbd(h_n_with_ls, mN)
-        zNI = self._masked_last_tbd(h_n_with_is, mN)
+        hIL = self.trans_i_with_l(pi, pl, pl, q_mask=mI, kv_mask=mL)  # I<-L  [TI,B,d_i]
+        hIN = self.trans_i_with_n(pi, pn, pn, q_mask=mI, kv_mask=mN)  # I<-N
 
-        zIL = self._masked_last_tbd(h_i_with_ls, mI)
-        zIN = self._masked_last_tbd(h_i_with_ns, mI)
+        zLN = self._masked_last_tbd(hLN, mL)  # [B,d_l]
+        zLI = self._masked_last_tbd(hLI, mL)  # [B,d_l]
 
+        zNL = self._masked_last_tbd(hNL, mN)  # [B,d_n]
+        zNI = self._masked_last_tbd(hNI, mN)  # [B,d_n]
 
-        # --- UPDATED Tri: build from (LN, LI, NI) pair embeddings ---
+        zIL = self._masked_last_tbd(hIL, mI)  # [B,d_i]
+        zIN = self._masked_last_tbd(hIN, mI)  # [B,d_i]
+
         zNL_l = self.proj_n_to_l(zNL)  # [B,d_l]
         zNI_l = self.proj_n_to_l(zNI)  # [B,d_l]
         zIL_l = self.proj_i_to_l(zIL)  # [B,d_l]
         zIN_l = self.proj_i_to_l(zIN)  # [B,d_l]
 
-        eLN = self.proj_pair_ln(torch.cat([zLN, zNL_l], dim=1))  # [B,d_l]
-        eLI = self.proj_pair_li(torch.cat([zLI, zIL_l], dim=1))  # [B,d_l]
-        eNI = self.proj_pair_ni(torch.cat([zNI_l, zIN_l], dim=1))# [B,d_l]
+        eLN = self.proj_pair_ln(torch.cat([zLN,  zNL_l], dim=1))  # [B,d_l]
+        eLI = self.proj_pair_li(torch.cat([zLI,  zIL_l], dim=1))  # [B,d_l]
+        eNI = self.proj_pair_ni(torch.cat([zNI_l, zIN_l], dim=1))  # [B,d_l]
 
-        zLNI = torch.cat([eLN, eLI, eNI], dim=1)                 # [B,3*d_l]
-        zLNI = self.final_lni(zLNI)                              # [B,d_l]
+        zLNI = self.final_lni(torch.cat([eLN, eLI, eNI], dim=1))   # [B,d_l]
 
-        # Unimodal routes come from encoders (preferred). Fallback if None.
-        zL = L_pool if L_pool is not None else self._masked_mean_tbd(proj_x_l, mL)  # proj_x_l is [T,B,D]
-        zN = N_pool if N_pool is not None else self._masked_mean_tbd(proj_x_n, mN)
-        zI = I_pool if I_pool is not None else self._masked_mean_tbd(proj_x_i, mI)
-
-        return {
+        out = {
             "L": zL, "N": zN, "I": zI,
             "LN": zLN, "LI": zLI,
             "NL": zNL, "NI": zNI,
@@ -213,77 +190,10 @@ class MULTModel(nn.Module):
             "LNI": zLNI,
         }
 
-    def forward(self, x_l, x_n, x_i):
-        """
-        Inputs MUST be [B, T, D]
-        """
-        x_l = F.dropout(x_l.transpose(1, 2), p=self.embed_dropout, training=self.training)  # [B,D,T]
-        x_n = x_n.transpose(1, 2)
-        x_i = x_i.transpose(1, 2)
+        # dtype normalization (prevents your mismatch error)
+        target_dtype = next(self.parameters()).dtype
+        for k, v in out.items():
+            if torch.is_tensor(v) and v.dtype != target_dtype:
+                out[k] = v.to(dtype=target_dtype)
 
-        proj_x_l = x_l if self.orig_d_l == self.d_l else self.proj_l(x_l)
-        proj_x_n = x_n if self.orig_d_n == self.d_n else self.proj_n(x_n)
-        proj_x_i = x_i if self.orig_d_i == self.d_i else self.proj_i(x_i)
-
-        proj_x_l = proj_x_l.permute(2, 0, 1)
-        proj_x_n = proj_x_n.permute(2, 0, 1)
-        proj_x_i = proj_x_i.permute(2, 0, 1)
-
-        # Self
-        h_l_only = self.trans_l(proj_x_l)
-        h_n_only = self.trans_n(proj_x_n)
-        h_i_only = self.trans_i(proj_x_i)
-
-        # Cross (directional)
-        h_l_with_ns = self.trans_l_with_n(proj_x_l, proj_x_n, proj_x_n)
-        h_l_with_is = self.trans_l_with_i(proj_x_l, proj_x_i, proj_x_i)
-
-        h_n_with_ls = self.trans_n_with_l(proj_x_n, proj_x_l, proj_x_l)
-        h_n_with_is = self.trans_n_with_i(proj_x_n, proj_x_i, proj_x_i)
-
-        h_i_with_ls = self.trans_i_with_l(proj_x_i, proj_x_l, proj_x_l)
-        h_i_with_ns = self.trans_i_with_n(proj_x_i, proj_x_n, proj_x_n)
-
-        # last timestep pooled (as in your original forward)
-        h_l_last = h_l_only[-1]      # [B, d_l]
-        h_n_last = h_n_only[-1]      # [B, d_n]
-        h_i_last = h_i_only[-1]      # [B, d_i]
-
-        h_ln_last = h_l_with_ns[-1]  # [B, d_l]  e_{L<-N}
-        h_li_last = h_l_with_is[-1]  # [B, d_l]  e_{L<-I}
-
-        h_nl_last = h_n_with_ls[-1]  # [B, d_n]  e_{N<-L}
-        h_ni_last = h_n_with_is[-1]  # [B, d_n]  e_{N<-I}
-
-        h_il_last = h_i_with_ls[-1]  # [B, d_i]  e_{I<-L}
-        h_in_last = h_i_with_ns[-1]  # [B, d_i]  e_{I<-N}
-
-        # --- UPDATED Tri: build from (LN, LI, NI) pair embeddings ---
-        h_nl_l = self.proj_n_to_l(h_nl_last)  # [B,d_l]
-        h_ni_l = self.proj_n_to_l(h_ni_last)  # [B,d_l]
-        h_il_l = self.proj_i_to_l(h_il_last)  # [B,d_l]
-        h_in_l = self.proj_i_to_l(h_in_last)  # [B,d_l]
-
-        eLN = self.proj_pair_ln(torch.cat([h_ln_last, h_nl_l], dim=1))  # [B,d_l]
-        eLI = self.proj_pair_li(torch.cat([h_li_last, h_il_l], dim=1))  # [B,d_l]
-        eNI = self.proj_pair_ni(torch.cat([h_ni_l,  h_in_l], dim=1))     # [B,d_l]
-
-        h_lni_last = torch.cat([eLN, eLI, eNI], dim=1)                   # [B,3*d_l]
-        h_lni_last = self.final_lni(h_lni_last)                          # [B,d_l]
-
-        return {
-            "L":   h_l_last,
-            "N":   h_n_last,
-            "I":   h_i_last,
-
-            "LN":  h_ln_last,
-            "LI":  h_li_last,
-
-            "NL":  h_nl_last,
-            "NI":  h_ni_last,
-
-            "IL":  h_il_last,
-            "IN":  h_in_last,
-
-            "LNI": h_lni_last,
-        }
+        return out
