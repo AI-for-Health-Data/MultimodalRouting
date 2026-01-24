@@ -112,13 +112,8 @@ def _normalize_routing_coef(
 def make_route_inputs_mult(z, multmodel: MULTModel):
     Ls, Ns, Is = z["L"]["seq"], z["N"]["seq"], z["I"]["seq"]
     Lm, Nm, Im = z["L"]["mask"], z["N"]["mask"], z["I"]["mask"]
-    Lp, Np, Ip = z["L"]["pool"], z["N"]["pool"], z["I"]["pool"]
 
-    routes = multmodel.forward_from_encoders(
-        L_seq=Ls, N_seq=Ns, I_seq=Is,
-        mL=Lm, mN=Nm, mI=Im,
-        L_pool=Lp, N_pool=Np, I_pool=Ip,
-    )
+    routes = multmodel(Ls, Ns, Is, mL=Lm, mN=Nm, mI=Im)
 
     expected = set(ROUTES)
     got = set(routes.keys())
@@ -128,7 +123,6 @@ def make_route_inputs_mult(z, multmodel: MULTModel):
         raise RuntimeError(f"[make_route_inputs_mult] Route key mismatch. missing={missing}, extra={extra}")
 
     return routes
-
 
 class RoutePrimaryProjector(nn.Module):
     def __init__(self, d_in: int, pc_dim: int):
@@ -396,19 +390,22 @@ def forward_capsule_from_route_dict(
     return logits, prim_acts, route_embs, routing_coef
 
 def forward_capsule_from_multmodel(
-    multmodel: nn.Module,                                  # MULTModel
-    x_l: torch.Tensor, x_n: torch.Tensor, x_i: torch.Tensor,# each [B,T,D]
+    multmodel: nn.Module,
+    x_l: torch.Tensor, x_n: torch.Tensor, x_i: torch.Tensor,
     projector: RoutePrimaryProjector,
     capsule_head: CapsuleMortalityHead,
     *,
-    route_adapter: Optional[RouteDimAdapter] = None,        # if dims differ, pass adapter
-    acts_override: Optional[torch.Tensor] = None,           # [B,len(ROUTES),1]
-    route_mask: Optional[torch.Tensor] = None,              # [B,len(ROUTES)]
+    mL: Optional[torch.Tensor] = None,
+    mN: Optional[torch.Tensor] = None,
+    mI: Optional[torch.Tensor] = None,
+    route_adapter: Optional[RouteDimAdapter] = None,
+    acts_override: Optional[torch.Tensor] = None,
+    route_mask: Optional[torch.Tensor] = None,
     act_temperature: float = 1.0,
     detach_priors: bool = False,
     return_routing: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor]]:
-    route_embs_in = multmodel(x_l, x_n, x_i)  # keys must match ROUTES, tensors usually [B,d_*]
+):
+    route_embs_in = multmodel(x_l, x_n, x_i, mL=mL, mN=mN, mI=mI)
 
     expected = set(ROUTES)
     got = set(route_embs_in.keys())
@@ -417,11 +414,9 @@ def forward_capsule_from_multmodel(
         extra = got - expected
         raise RuntimeError(f"[mult->caps] Route key mismatch. missing={missing}, extra={extra}")
 
-    # Optional: adapt dims to projector's d_in
     if route_adapter is not None:
         route_embs_in = route_adapter(route_embs_in)
 
-    # Now reuse the canonical bridge
     return forward_capsule_from_route_dict(
         route_embs_in=route_embs_in,
         projector=projector,
