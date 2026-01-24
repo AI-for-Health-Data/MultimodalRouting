@@ -54,6 +54,35 @@ def grads_are_finite(param_list):
         if not torch.isfinite(p.grad).all():
             return False
     return True
+class EMA:
+    def __init__(self, model_list, decay=0.999):
+        self.decay = float(decay)
+        self.shadow = []
+        for m in model_list:
+            self.shadow.append({k: v.detach().clone() for k, v in m.state_dict().items()})
+
+        self.model_list = model_list
+
+    @torch.no_grad()
+    def update(self):
+        for m, sh in zip(self.model_list, self.shadow):
+            msd = m.state_dict()
+            for k in msd.keys():
+                sh[k].mul_(self.decay).add_(msd[k].detach(), alpha=(1.0 - self.decay))
+
+    @torch.no_grad()
+    def apply_to(self):
+        self.backup = []
+        for m in self.model_list:
+            self.backup.append({k: v.detach().clone() for k, v in m.state_dict().items()})
+        for m, sh in zip(self.model_list, self.shadow):
+            m.load_state_dict(sh, strict=True)
+
+    @torch.no_grad()
+    def restore(self):
+        for m, bk in zip(self.model_list, self.backup):
+            m.load_state_dict(bk, strict=True)
+        self.backup = None
 
 def safe_zero_grad(optimizer):
     optimizer.zero_grad(set_to_none=True)
@@ -1182,6 +1211,19 @@ class ICUStayDataset(Dataset):
 
         self.notes  = _standardize_id_column(pd.read_parquet(notes_fp))
         self.images = _standardize_id_column(pd.read_parquet(images_fp))
+
+        # --- detect an image time column so we can pick LAST CXR within ICU stay
+        time_candidates = ["charttime", "studytime", "StudyDateTime", "cxr_time", "time", "datetime"]
+        self.image_time_col = next((c for c in time_candidates if c in self.images.columns), None)
+
+        if self.image_time_col is None:
+            print("[warn] No image time column found in images.parquet -> cannot guarantee last CXR; will fallback to last valid path in file order.")
+        else:
+            # Coerce to datetime
+            self.images[self.image_time_col] = pd.to_datetime(self.images[self.image_time_col], errors="coerce")
+            n_bad = int(self.images[self.image_time_col].isna().sum())
+            print(f"[dataset:{split}] image_time_col='{self.image_time_col}' bad_datetimes={n_bad}/{len(self.images)}")
+
         self.images = _standardize_image_path_column(self.images)
         self.labels = _standardize_id_column(pd.read_parquet(labels_fp))
         
@@ -1282,16 +1324,24 @@ class ICUStayDataset(Dataset):
         # after self.images is loaded & standardized
         img_map = {}
         for sid, g in self.images.groupby("stay_id", sort=False):
+            g = g.copy()
+
+            # If we have a time column, sort so the LAST row is the latest CXR
+            if self.image_time_col is not None and self.image_time_col in g.columns:
+                g = g.sort_values(self.image_time_col, kind="mergesort")  # stable
+
             raw_paths = g["cxr_path"].dropna().astype(str).tolist()
             raw_paths = [p for p in raw_paths if p.strip()]
             if not raw_paths:
                 continue
+
             cand = [resolve_image_path(p, self.root) for p in raw_paths]
             cand = [p for p in cand if is_probably_image_file(p) and os.path.exists(p)]
             if cand:
-                img_map[int(sid)] = cand
+                img_map[int(sid)] = cand  # ordered; last is latest if sorted
 
         self.img_map = img_map
+
         img_ids = set(img_map.keys()) & ids_set
         print(f"[dataset:{split}] img_ids={len(img_ids)} (precomputed)")
 
@@ -1421,9 +1471,8 @@ class ICUStayDataset(Dataset):
 
         # --- image: use precomputed map (fast)
         cand = self.img_map.get(stay_id, [])
-        if not cand:
-            raise RuntimeError(f"[ICUStayDataset] stay_id={stay_id} has no valid image in img_map")
-        img_paths = [cand[-1]]  # pick last
+        img_paths = [cand[-1]]
+
 
         # --- label: O(1)
         row_y = self.labels.loc[stay_id]
@@ -1620,6 +1669,81 @@ def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
 
     print("[sample-inspect] ---------------------------\n")
 
+from typing import Any, Dict, List, Optional, Tuple
+import torch
+
+
+def _extract_route_tensor(v: Any, rname: str) -> torch.Tensor:
+    """Accept either a Tensor or a dict with key 'pool' -> Tensor."""
+    if torch.is_tensor(v):
+        return v
+    if isinstance(v, dict) and ("pool" in v) and torch.is_tensor(v["pool"]):
+        return v["pool"]
+    raise TypeError(f"[routes] route '{rname}' must be a Tensor or dict with Tensor at key 'pool'. Got: {type(v)}")
+
+
+def _coerce_route_embs_strict(
+    route_embs_in: Dict[str, Any],
+    route_mask: Optional[torch.Tensor],
+    routes: List[str],
+) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+    """
+    STRICT mode:
+      - raises if any required route is missing
+      - ensures every route is [B,D] and consistent across routes
+      - ensures route_mask exists and is [B,R] float on same device
+    """
+    # 1) Ensure all required routes exist
+    missing = [r for r in routes if r not in route_embs_in]
+    if missing:
+        raise RuntimeError(f"[routes] Missing routes from make_route_inputs_mult: {missing}")
+
+    # 2) Extract tensors and validate shapes
+    out: Dict[str, torch.Tensor] = {}
+    first: Optional[torch.Tensor] = None
+
+    for r in routes:
+        t = _extract_route_tensor(route_embs_in[r], r)
+
+        if t.ndim != 2:
+            raise ValueError(f"[routes] route '{r}' must be 2D [B,D], got shape={tuple(t.shape)}")
+        if first is None:
+            first = t
+        else:
+            if t.shape[0] != first.shape[0]:
+                raise ValueError(f"[routes] batch mismatch: '{r}' has B={t.shape[0]} but first route has B={first.shape[0]}")
+            if t.shape[1] != first.shape[1]:
+                raise ValueError(f"[routes] dim mismatch: '{r}' has D={t.shape[1]} but first route has D={first.shape[1]}")
+            if t.device != first.device:
+                raise ValueError(f"[routes] device mismatch: '{r}' on {t.device}, first route on {first.device}")
+            if t.dtype != first.dtype:
+                raise ValueError(f"[routes] dtype mismatch: '{r}' dtype={t.dtype}, first route dtype={first.dtype}")
+
+        out[r] = t
+
+    assert first is not None
+    B, _D = first.shape
+    R = len(routes)
+    dev = first.device
+    dt = first.dtype
+
+    # 3) Coerce/validate route_mask
+    if route_mask is None:
+        route_mask = torch.ones(B, R, device=dev, dtype=dt)
+    else:
+        if not torch.is_tensor(route_mask):
+            raise TypeError(f"[routes] route_mask must be a Tensor or None, got {type(route_mask)}")
+        if route_mask.ndim != 2 or route_mask.shape[0] != B or route_mask.shape[1] != R:
+            raise ValueError(f"[routes] route_mask must be [B,R]=[{B},{R}], got {tuple(route_mask.shape)}")
+        # make sure it's same device/dtype (float)
+        if route_mask.device != dev:
+            route_mask = route_mask.to(dev)
+        if route_mask.dtype != dt:
+            route_mask = route_mask.to(dt)
+
+    return out, route_mask
+
+
 def capsule_forward_from_encoded(
     *,
     mult,
@@ -1635,17 +1759,31 @@ def capsule_forward_from_encoded(
     return_routing: bool = True,
 ):
     z = {"L": outL, "N": outN, "I": outI}
+
+    # 1) Build route embeddings via MULT
     route_embs_in = make_route_inputs_mult(z, mult)
-    route_embs_in, route_mask = _coerce_route_embs(route_embs_in, route_mask, ROUTE_NAMES)
+
+    # 2) Strictly coerce + validate required routes; FAIL HARD if missing
+    route_embs_in, route_mask = _coerce_route_embs_strict(route_embs_in, route_mask, ROUTE_NAMES)
+
+    # 3) Optional adapter to align dims
     if route_adapter is not None:
         route_embs_in = route_adapter(route_embs_in)
-    d_in = int(getattr(projector, "d_in", 256))
-    for r in ROUTE_NAMES:
-        v = route_embs_in[r]
-        assert torch.is_tensor(v), f"{r} is not tensor after adapter: {type(v)}"
-        assert v.ndim == 2, f"{r} must be [B,D], got {tuple(v.shape)}"
-        assert v.shape[1] == d_in, f"{r} dim mismatch: got {v.shape[1]} expect {d_in}"
 
+    # 4) Enforce expected dimension after adapter (if projector declares d_in)
+    d_in = getattr(projector, "d_in", None)
+    if d_in is not None:
+        d_in = int(d_in)
+        for r in ROUTE_NAMES:
+            v = route_embs_in[r]
+            if not torch.is_tensor(v):
+                raise TypeError(f"[routes] after adapter, '{r}' is not Tensor, got {type(v)}")
+            if v.ndim != 2:
+                raise ValueError(f"[routes] after adapter, '{r}' must be [B,D], got {tuple(v.shape)}")
+            if v.shape[1] != d_in:
+                raise ValueError(f"[routes] after adapter, '{r}' dim mismatch: got {v.shape[1]} expect {d_in}")
+
+    # 5) Forward capsule head
     return forward_capsule_from_route_dict(
         route_embs_in=route_embs_in,
         projector=projector,
@@ -1655,6 +1793,7 @@ def capsule_forward_from_encoded(
         detach_priors=detach_priors,
         return_routing=return_routing,
     )
+
 def _coerce_route_embs(route_embs_in: Dict[str, Any],
                        route_mask: Optional[torch.Tensor],
                        routes: List[str]) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Tensor]]:
@@ -1923,8 +2062,9 @@ def evaluate_epoch(
             loss = loss_fn(death_logit, y_f)
 
         total_loss += float(loss.item()) * y.size(0)
-        p_death = prob_death_from_death_logit(death_logit).view(-1)  # [B]
-        pred = (torch.sigmoid(death_logit) >= 0.5).long()
+        p_death = prob_death_from_death_logit(death_logit).view(-1)
+        pred = (p_death >= 0.5).long()
+
         total_correct += (pred == y).sum().item()
         total += y.numel()
         num_samples += y.size(0)
@@ -2691,9 +2831,17 @@ def main():
     max_pw = float(_cfg("pos_weight_max", 20.0))
     pos_weight = np.clip(pos_weight, 1.0, max_pw)
     print(f"[loss] pos_weight: min={pos_weight.min():.3f} max={pos_weight.max():.3f} (clamped to {max_pw})")
-    pos_weight_t = torch.tensor(pos_weight, dtype=torch.float32, device=DEVICE).view(1)
-    bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight_t)
-    loss_fn_train = bce
+    
+    train_prev = float(pos_counts[0] / max(1.0, float(N_train)))   # P(y=1)
+    focal_alpha = float(getattr(CFG, "focal_alpha", 1.0 - train_prev))
+    focal_alpha = float(np.clip(focal_alpha, 0.05, 0.95))
+    focal_gamma = float(getattr(CFG, "focal_gamma", 2.0))
+    loss_fn_train = BinaryFocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction="mean").to(DEVICE)
+    print(f"[loss] TRAIN focal: alpha={focal_alpha:.3f} gamma={focal_gamma:.2f} (train_prev={train_prev:.4f})")
+
+    # 2) Eval with BCE (for clean calibration / temperature scaling)
+    bce_eval = nn.BCEWithLogitsLoss()  # no pos_weight here; probabilities stay interpretable
+    print("[loss] EVAL  = BCEWithLogitsLoss() (no pos_weight)")
 
     val_ds   = ICUStayDataset(args.data_root, split="val")
     test_ds  = ICUStayDataset(args.data_root, split="test")
@@ -2758,7 +2906,7 @@ def main():
         structured_heads=_cfg("structured_heads", 8),
         text_model_name=_cfg("text_model_name", "emilyalsentzer/Bio_ClinicalBERT"),
         bert_chunk_bs=_cfg("bert_chunk_bs", 8),
-        note_agg=str(_cfg("note_agg", "mean")).lower(),  
+        note_agg="attention",
         vision_backbone=_cfg("image_model_name", "resnet34"),
         vision_pretrained=True,
     )
@@ -3031,11 +3179,10 @@ def main():
                     detach_priors=detach_priors_flag,
                     return_routing=True,
                 )
-
-
                 logits, prim_acts, route_embs = out[0], out[1], out[2]
 
                 rc_raw = out[3] if len(out) > 3 else None
+
                 rc_report = None
                 if rc_raw is not None:
                     rc_raw = normalize_rc_shape_to_brk(rc_raw, expect_routes=N_ROUTES, name="TRAIN.rc_raw")
@@ -3078,6 +3225,14 @@ def main():
                 y_f = y.view(-1, 1).float()
 
                 death_logit = death_logit_from_logits2(logits)     # [B,1]
+                if (epoch == start_epoch) and (step == 0):
+                    print("[sanity] logits[0] =", logits[0].detach().float().cpu().tolist())
+                    print("[sanity] death_logit[0] =", float(death_logit[0].detach().cpu()))
+                    print("[sanity] prim_acts.mean =", prim_acts.detach().float().mean().item())
+                    if rc_raw is not None:
+                        print("[sanity] rc_raw sum over classes (mean) =", float(rc_raw.sum(dim=2).mean().detach().cpu()))
+
+
                 loss = loss_fn_train(death_logit, y_f)
 
                 cur_epoch = float(epoch + 1) 
@@ -3180,7 +3335,7 @@ def main():
         # VAL metrics (BCE + 0.5 threshold / F1-based thresholds)
         val_loss, val_acc, val_act, val_rc_mat, val_pa = evaluate_epoch(
             behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
-            val_loader, amp_ctx_enc, amp_ctx_caps, bce,
+            val_loader, amp_ctx_enc, amp_ctx_caps, loss_fn=bce_eval,
             act_temperature=1.0,
             detach_priors=False,
             route_debug=bool(getattr(args, "route_debug", False)),
@@ -3337,11 +3492,14 @@ def main():
 
     test_loss, test_acc, test_act, test_rc_mat, test_pa = evaluate_epoch(
         behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
-        test_loader, amp_ctx_enc, amp_ctx_caps, bce,
+        test_loader,
+        amp_ctx_enc,
+        amp_ctx_caps,
+        loss_fn=bce_eval,
         act_temperature=1.0,
         detach_priors=False,
         route_debug=False,
-        label_names = class_names,
+        label_names=["alive", "death"],
         split_name="TEST",
     )
 
@@ -3468,7 +3626,7 @@ def main():
         mult=mult, route_adapter=route_adapter, projector=projector, cap_head=cap_head,
         amp_ctx_enc=amp_ctx_enc,
         amp_ctx_caps=amp_ctx_caps,
-        loss_fn=bce,  
+        loss_fn=bce_eval,
         label_names=label_names,
         ckpt_dir=ckpt_dir,
         T_cal=T_star,
@@ -3482,7 +3640,7 @@ def main():
         mult=mult, route_adapter=route_adapter, projector=projector, cap_head=cap_head,
         amp_ctx_enc=amp_ctx_enc,
         amp_ctx_caps=amp_ctx_caps,
-        loss_fn=bce,  
+        loss_fn=bce_eval, 
         label_names=label_names,
         ckpt_dir=ckpt_dir,
         T_cal=T_star,
