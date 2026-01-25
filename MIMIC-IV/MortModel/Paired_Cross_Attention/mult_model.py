@@ -44,13 +44,16 @@ class MULTModel(nn.Module):
         self.trans_i_with_l = self.get_network(self_type='il')
         self.trans_i_with_n = self.get_network(self_type='in')
 
+        # Align N / I embeddings into d_l for pairing
         self.proj_n_to_l = nn.Identity() if self.d_n == self.d_l else nn.Linear(self.d_n, self.d_l, bias=True)
         self.proj_i_to_l = nn.Identity() if self.d_i == self.d_l else nn.Linear(self.d_i, self.d_l, bias=True)
 
+        # Pair projections (2*d_l -> d_l)
         self.proj_pair_ln = nn.Linear(2 * self.d_l, self.d_l, bias=True)
         self.proj_pair_li = nn.Linear(2 * self.d_l, self.d_l, bias=True)
         self.proj_pair_ni = nn.Linear(2 * self.d_l, self.d_l, bias=True)
 
+        # Trimodal projection (3*d_l -> d_l)
         self.final_lni = nn.Linear(3 * self.d_l, self.d_l, bias=True)
 
     def get_network(self, self_type: str = 'l', layers: int = -1):
@@ -69,7 +72,7 @@ class MULTModel(nn.Module):
         return TransformerEncoder(
             embed_dim=embed_dim,
             num_heads=self.num_heads,
-            layers=n_layers,             
+            layers=n_layers,              
             attn_dropout=attn_dropout,
             relu_dropout=self.relu_dropout,
             res_dropout=self.res_dropout,
@@ -97,7 +100,6 @@ class MULTModel(nn.Module):
         h_btd = h_tbd.permute(1, 0, 2)   # [B,T,D]
         out = h_btd[torch.arange(h_btd.size(0), device=h_btd.device), idx]  # [B,D]
 
-        # if length==0 -> zero it out
         if (lengths == 0).any():
             out = out.clone()
             out[lengths == 0] = 0.0
@@ -125,9 +127,10 @@ class MULTModel(nn.Module):
 
         # [B,T,D] -> [B,D,T]
         xl = F.dropout(x_l.transpose(1, 2), p=self.embed_dropout, training=self.training)
-        xn = x_n.transpose(1, 2)
-        xi = x_i.transpose(1, 2)
+        xn = F.dropout(x_n.transpose(1, 2), p=self.embed_dropout, training=self.training)
+        xi = F.dropout(x_i.transpose(1, 2), p=self.embed_dropout, training=self.training)
 
+        # conv proj -> [B,d,T]
         pl = xl if self.orig_d_l == self.d_l else self.proj_l(xl)
         pn = xn if self.orig_d_n == self.d_n else self.proj_n(xn)
         pi = xi if self.orig_d_i == self.d_i else self.proj_i(xi)
@@ -141,9 +144,9 @@ class MULTModel(nn.Module):
         hN = self.trans_n(pn, q_mask=mN, kv_mask=mN)
         hI = self.trans_i(pi, q_mask=mI, kv_mask=mI)
 
-        zL = self._masked_last_tbd(hL, mL)   # [B,d_l]
-        zN = self._masked_last_tbd(hN, mN)   # [B,d_n]
-        zI = self._masked_last_tbd(hI, mI)   # [B,d_i]
+        zL = self._masked_mean_tbd(hL, mL)
+        zN = self._masked_mean_tbd(hN, mN)
+        zI = self._masked_mean_tbd(hI, mI)
 
         hLN = self.trans_l_with_n(pl, pn, pn, q_mask=mL, kv_mask=mN)  # L<-N  [TL,B,d_l]
         hLI = self.trans_l_with_i(pl, pi, pi, q_mask=mL, kv_mask=mI)  # L<-I
@@ -154,14 +157,14 @@ class MULTModel(nn.Module):
         hIL = self.trans_i_with_l(pi, pl, pl, q_mask=mI, kv_mask=mL)  # I<-L  [TI,B,d_i]
         hIN = self.trans_i_with_n(pi, pn, pn, q_mask=mI, kv_mask=mN)  # I<-N
 
-        zLN = self._masked_last_tbd(hLN, mL)  # [B,d_l]
-        zLI = self._masked_last_tbd(hLI, mL)  # [B,d_l]
+        zLN = self._masked_mean_tbd(hLN, mL)  # mean over TL
+        zLI = self._masked_mean_tbd(hLI, mL)
 
-        zNL = self._masked_last_tbd(hNL, mN)  # [B,d_n]
-        zNI = self._masked_last_tbd(hNI, mN)  # [B,d_n]
+        zNL = self._masked_mean_tbd(hNL, mN)  # mean over TN
+        zNI = self._masked_mean_tbd(hNI, mN)
 
-        zIL = self._masked_last_tbd(hIL, mI)  # [B,d_i]
-        zIN = self._masked_last_tbd(hIN, mI)  # [B,d_i]
+        zIL = self._masked_mean_tbd(hIL, mI)  # mean over TI
+        zIN = self._masked_mean_tbd(hIN, mI)
 
         zNL_l = self.proj_n_to_l(zNL)  # [B,d_l]
         zNI_l = self.proj_n_to_l(zNI)  # [B,d_l]
