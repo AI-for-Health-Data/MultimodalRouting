@@ -151,7 +151,7 @@ def print_route_matrix_detailed(
         if rc_is_report:
             effective = rc_mean                     
         else:
-            effective = (rc_report_cpu * pa_cpu.unsqueeze(-1)).mean(dim=0)
+            effective = (rc_raw.detach().float().cpu() * prim_acts.detach().float().cpu().unsqueeze(-1)).mean(dim=0).numpy()
 
         rc_avg  = rc_mean.mean(axis=1)              # [R]
         eff_avg = effective.mean(axis=1)            # [R]
@@ -175,6 +175,14 @@ def print_route_matrix_detailed(
                 print(f"    {r:4s} HEALTHY (effective weight = {eff_avg[i]:.3f})")
 
         print(f"{'=' * 120}\n")
+
+def split_effective_counts(ds, name):
+    df = ds.labels.loc[ds.ids, ["stay_id"] + ds.label_cols].copy()
+    y = df[ds.label_cols[0]].astype(float).fillna(0.0).gt(0.0).astype(int).values
+    n = len(y)
+    pos = int(y.sum())
+    neg = n - pos
+    print(f"[{name}] effective tri-modal N={n}  alive={neg}  death={pos}  prev={pos/max(n,1):.4f}")
 
 def encode_all_modalities(
     behrt, bbert, imgenc,
@@ -1756,11 +1764,13 @@ def sigmoid_np(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x))
 
 def _clamp_norm(x: torch.Tensor, max_norm: float = 20.0) -> torch.Tensor:
-    if x.ndim < 2:
-        return x
-    n = x.norm(dim=1, keepdim=True) + 1e-6
-    scale = torch.clamp(max_norm / n, max=1.0)
-    return x * scale
+    if x.ndim == 2:          # [B,D]
+        n = x.norm(dim=1, keepdim=True) + 1e-6
+        return x * torch.clamp(max_norm / n, max=1.0)
+    if x.ndim == 3:          # [B,T,D]
+        n = x.norm(dim=2, keepdim=True) + 1e-6
+        return x * torch.clamp(max_norm / n, max=1.0)
+    return x
 
 def _safe_tensor(x: torch.Tensor, name: str = "") -> torch.Tensor:
     if not torch.isfinite(x).all():
@@ -1808,6 +1818,11 @@ def evaluate_epoch(
     bbert.eval()
     if getattr(bbert, "bert", None) is not None:
         bbert.bert.eval()
+    mult.eval()
+    if route_adapter is not None: route_adapter.eval()
+    projector.eval()
+    cap_head.eval()
+
 
     total_loss, total_correct, total = 0.0, 0, 0
     act_sum = torch.zeros(N_ROUTES, dtype=torch.float32)  # N_ROUTES=10
@@ -1874,8 +1889,7 @@ def evaluate_epoch(
                 assert_routing_over_routes(
                     rc_report, routes_dim=1, atol=1e-3, name="VAL.rc_report_over_routes"
                 )
-
-                if bool(getattr(CFG, "route_debug", False)) and (val_epoch == start_epoch) and (val_step == 0):
+                if bool(getattr(CFG, "route_debug", False)) and (epoch_idx is not None) and (bidx == 0):
 
                     debug_routing_tensor(
                         rc_raw,
@@ -2732,6 +2746,10 @@ def main():
             train_label_df[train_ds.label_cols[0]].astype(float).fillna(0.0).gt(0.0).astype(int).tolist()
         )
     )
+    print("[sampler-check] pos in train_ds.ids =",
+          sum(sid_to_y.get(int(s), 0) for s in train_ds.ids),
+          " / ", len(train_ds.ids))
+
     pos = float(pos_counts[0])
     neg = float(neg_counts[0])
     w_pos = (neg / (pos + 1e-6))
@@ -2754,18 +2772,30 @@ def main():
     pos_weight = np.clip(pos_weight, 1.0, max_pw)
     print(f"[loss] pos_weight: min={pos_weight.min():.3f} max={pos_weight.max():.3f} (clamped to {max_pw})")
     
-    train_prev = float(pos_counts[0] / max(1.0, float(N_train)))   # P(y=1)
-    focal_alpha = float(getattr(CFG, "focal_alpha", 1.0 - train_prev))
-    focal_alpha = float(np.clip(focal_alpha, 0.05, 0.95))
-    focal_gamma = float(getattr(CFG, "focal_gamma", 2.0))
-    loss_fn_train = BinaryFocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction="mean").to(DEVICE)
-    print(f"[loss] TRAIN focal: alpha={focal_alpha:.3f} gamma={focal_gamma:.2f} (train_prev={train_prev:.4f})")
+    train_prev = float(pos_counts[0] / max(1.0, float(N_train)))
+    default_alpha = 0.75 if train_prev < 0.20 else 0.50
+    focal_alpha = float(np.clip(getattr(CFG, "focal_alpha", default_alpha), 0.10, 0.90))
+    focal_gamma = float(getattr(CFG, "focal_gamma", 1.5))
+
+    use_pos_weight_bce = bool(getattr(CFG, "use_pos_weight_bce", True))
+    pw = torch.tensor([float(pos_weight[0])], device=DEVICE, dtype=torch.float32)
+
+    if use_pos_weight_bce:
+        loss_fn_train = nn.BCEWithLogitsLoss(pos_weight=pw).to(DEVICE)
+        print(f"[loss] TRAIN = BCE(pos_weight) pos_weight={float(pw.item()):.3f}")
+    else:
+        loss_fn_train = BinaryFocalLoss(alpha=focal_alpha, gamma=focal_gamma).to(DEVICE)
+        print(f"[loss] TRAIN = Focal alpha={focal_alpha:.3f} gamma={focal_gamma:.2f}")
 
     bce_eval = nn.BCEWithLogitsLoss()  
     print("[loss] EVAL  = BCEWithLogitsLoss() (no pos_weight)")
 
     val_ds   = ICUStayDataset(args.data_root, split="val")
     test_ds  = ICUStayDataset(args.data_root, split="test")
+    split_effective_counts(train_ds, "TRAIN")
+    split_effective_counts(val_ds,   "VAL")
+    split_effective_counts(test_ds,  "TEST")
+
     collate_train = collate_fn_factory(img_tfms=build_image_transform("train"))
     collate_eval  = collate_fn_factory(img_tfms=build_image_transform("val"))
     pin = use_cuda
@@ -2777,17 +2807,18 @@ def main():
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=False,                 
-        sampler=train_sampler,         
+        shuffle=False,              # must be False when sampler is set
+        sampler=train_sampler,      # <-- use it
         num_workers=args.num_workers,
         pin_memory=pin,
         collate_fn=collate_train,
-        drop_last=False,
+        drop_last=True,
         worker_init_fn=seed_worker,
         generator=g_train,
         persistent_workers=(args.num_workers > 0),
         prefetch_factor=4 if args.num_workers > 0 else None,
     )
+
 
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
@@ -2838,9 +2869,11 @@ def main():
     print(f"... | IMG out_dim={imgenc.proj.out_features}")
 
     if not CFG.finetune_text and getattr(bbert, "bert", None) is not None:
-        for p in bbert.bert.parameters():
+        for p in bbert.parameters():
             p.requires_grad = False
-        bbert.bert.eval()
+        bbert.eval()
+        if getattr(bbert, "bert", None) is not None:
+            bbert.bert.eval()
         print("[encoders] Bio_ClinicalBERT frozen (feature extractor mode)")
 
     d_l = int(getattr(CFG, "mult_d_l", CFG.d))
@@ -2926,6 +2959,11 @@ def main():
             {"params": head_params, "lr": args.lr, "weight_decay": args.weight_decay, "name": "head"},
         ]
     )
+    use_ema = bool(getattr(CFG, "use_ema", True))
+    ema_decay = float(getattr(CFG, "ema_decay", 0.999))
+    ema = EMA([behrt, bbert, imgenc, mult, route_adapter, projector, cap_head], decay=ema_decay) if use_ema else None
+    print(f"[ema] enabled={use_ema} decay={ema_decay}")
+
     print(f"[optim] enc_tensors={len(enc_params)} head_tensors={len(head_params)} total={len(params)}")
     print(f"[warmup] encoder_warmup_epochs={encoder_warmup_epochs}")
 
@@ -3131,14 +3169,13 @@ def main():
                 if route_entropy_lambda > 0.0 and (route_entropy_warmup_epochs <= 0 or cur_epoch >= route_entropy_warmup_epochs):
                     pa = torch.relu(prim_acts)
                     pa = pa / (pa.sum(dim=1, keepdim=True) + 1e-6)
-                    pa = torch.clamp(pa, 1e-6, 1.0)
                     H = -(pa * pa.log()).sum(dim=1).mean()
 
                     ent_bonus = route_entropy_lambda * H  
 
                 if route_uniform_lambda > 0.0 and (route_uniform_warmup_epochs <= 0 or cur_epoch >= route_uniform_warmup_epochs):
                     pa_dist = prim_acts / (prim_acts.sum(dim=1, keepdim=True) + 1e-6)
-                    p_mean = pa_dist.mean(dim=0)
+                    p_mean = pa.mean(dim=0)
                     target = torch.full_like(p_mean, 1.0 / p_mean.numel())
                     uniform_pen = route_uniform_lambda * ((p_mean - target) ** 2).sum()
 
@@ -3178,6 +3215,9 @@ def main():
                     safe_zero_grad(optimizer)
                     continue
                 optimizer.step()
+            if ema is not None:
+                ema.update()
+
             safe_zero_grad(optimizer)
             total_loss += float(loss.item()) * y.size(0)
             p_death = prob_death_from_death_logit(death_logit).view(-1)  # [B]
@@ -3221,18 +3261,24 @@ def main():
             f"[epoch {epoch + 1}] TRAIN loss={train_loss:.4f} acc={train_acc:.4f} "
             f"avg_prim_act={', '.join(f'{a:.3f}' for a in train_avg_act)}"
         )
-        # VAL metrics (BCE + 0.5 threshold / F1-based thresholds)
-        val_loss, val_acc, val_act, val_rc_mat, val_pa = evaluate_epoch(
-            behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
-            val_loader, amp_ctx_enc, amp_ctx_caps, loss_fn=bce_eval,
-            act_temperature=1.0,
-            detach_priors=False,
-            route_debug=bool(getattr(args, "route_debug", False)),
-            label_names=CLASS_NAMES,
-            epoch_idx=epoch + 1,
-            split_name="VAL",
-            routing_out_dir=os.path.join(ckpt_dir, "routing"),
-        )
+
+        if ema is not None:
+            ema.apply_to()
+        try:
+            val_loss, val_acc, val_act, val_rc_mat, val_pa = evaluate_epoch(
+                behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
+                val_loader, amp_ctx_enc, amp_ctx_caps, loss_fn=bce_eval,
+                act_temperature=1.0,
+                detach_priors=False,
+                route_debug=bool(getattr(args, "route_debug", False)),
+                label_names=CLASS_NAMES,
+                epoch_idx=epoch + 1,
+                split_name="VAL",
+                routing_out_dir=os.path.join(ckpt_dir, "routing"),
+            )
+        finally:
+            if ema is not None:
+                ema.restore()
 
         routes = ROUTE_NAMES
         ROUTING_CLASS_NAMES = ["alive", "death"]  
@@ -3298,6 +3344,12 @@ def main():
             )
         
         val_macro_auroc = float(m["AUROC"])   # macro AUROC
+        val_f1 = float(m["F1"])  # macro F1 (here single-label anyway)
+
+        # Track best F1 checkpoint too
+        if epoch == start_epoch:
+            best_ckpt_f1 = -1.0
+
         scheduler.step(val_macro_auroc)
         cur_lrs = [pg["lr"] for pg in optimizer.param_groups]
         print(f"[lr] after plateau-step: {cur_lrs}")
@@ -3347,15 +3399,23 @@ def main():
             "projector": projector.state_dict(),
             "cap_head": cap_head.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "val_acc": float(val_acc),  
-            "val_auroc": float(val_score),    
+            "val_acc": float(val_acc),
+            "val_auroc": float(m["AUROC"]),
             "best_thr": torch.from_numpy(best_thr.astype(np.float32)),
         }
         save_checkpoint(os.path.join(ckpt_dir, "last.pt"), ckpt)
-        
+        is_best_f1 = val_f1 > best_ckpt_f1
+        if is_best_f1:
+            best_ckpt_f1 = val_f1
+            save_checkpoint(os.path.join(ckpt_dir, "best_f1.pt"), ckpt)
+            print(f"[epoch {epoch + 1}] Saved BEST_F1 checkpoint (VAL F1={val_f1:.4f})")
+
+
+        if is_best_f1:
+            save_checkpoint(os.path.join(ckpt_dir, "best_f1.pt"), ckpt)
+
         if is_best:
             save_checkpoint(os.path.join(ckpt_dir, "best.pt"), ckpt)
-            print(f"[epoch {epoch + 1}] Saved BEST checkpoint (VAL AUROC={val_score:.4f} | acc@0.5(debug)={float(val_acc):.4f})")
 
     # TEST evaluation using BEST checkpoint
     print("[main] Evaluating BEST checkpoint on TEST...")
@@ -3503,7 +3563,7 @@ def main():
         amp_ctx_enc=amp_ctx_enc,
         amp_ctx_caps=amp_ctx_caps,
         loss_fn=bce_eval,
-        label_names=label_names,
+        label_names=["death"], 
         ckpt_dir=ckpt_dir,
         T_cal=T_star,
         thr_val=thr_val,
