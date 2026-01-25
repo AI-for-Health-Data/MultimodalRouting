@@ -1,15 +1,13 @@
 
 from __future__ import annotations
-import os as _os
-_os.environ.setdefault("HF_HOME", _os.path.expanduser("~/.cache/huggingface"))
-_os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-_os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-_os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-
 import os
+os.environ.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 import json
 import argparse
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional
 from contextlib import nullcontext
 from dataclasses import asdict
 import random
@@ -22,7 +20,6 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 from torch import amp as torch_amp
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -41,13 +38,11 @@ from routing_and_heads import (
     RoutePrimaryProjector,
     RouteDimAdapter,
     CapsuleMortalityHead,
-    forward_capsule_from_multmodel,
     make_route_inputs_mult,
     forward_capsule_from_route_dict,
     route_given_pheno,
 )
 from env_config import ROUTE_NAMES, N_ROUTES
-
 
 def grads_are_finite(param_list):
     for p in param_list:
@@ -70,6 +65,56 @@ def seed_worker(worker_id: int):
         from transformers import AutoTokenizer
         TOKENIZER = AutoTokenizer.from_pretrained(CFG.text_model_name, local_files_only=True)
         MAXLEN = int(getattr(CFG, "max_text_len", 512))
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import WeightedRandomSampler
+
+def make_sample_weights_from_multilabel(label_df: pd.DataFrame, label_cols: List[str]) -> np.ndarray:
+    y = label_df[label_cols].values.astype(np.float32)  # [N,K]
+    prev = y.mean(axis=0)
+    inv = 1.0 / np.clip(prev, 1e-4, 1.0)
+
+    w = np.ones(len(y), dtype=np.float32)
+    pos = (y > 0.5)
+    for i in range(len(y)):
+        idx = np.where(pos[i])[0]
+        if len(idx) > 0:
+            w[i] = float(inv[idx].mean())
+    w = w / (w.mean() + 1e-8)
+    return w
+
+class AsymmetricFocalLoss(torch.nn.Module):
+    """
+    Multi-label Asymmetric Focal Loss (good for imbalance).
+    gamma_pos: focus on hard positives
+    gamma_neg: focus on hard negatives (usually larger)
+    clip: optional probability clip for negatives to reduce easy-neg dominance
+    """
+    def __init__(self, gamma_pos=0.0, gamma_neg=2.0, clip=0.05, eps=1e-8):
+        super().__init__()
+        self.gp = gamma_pos
+        self.gn = gamma_neg
+        self.clip = clip
+        self.eps = eps
+
+    def forward(self, logits, targets):
+        # targets: float {0,1}, logits: raw
+        prob = torch.sigmoid(logits)
+        pt = prob * targets + (1 - prob) * (1 - targets)
+
+        # optional clip for negative probs (reduce easy negatives)
+        if self.clip is not None and self.clip > 0:
+            prob = torch.clamp(prob + self.clip * (1 - targets), max=1.0)
+
+        # focal weights
+        w = torch.pow(1 - pt, self.gp * targets + self.gn * (1 - targets))
+
+        # standard BCE (stable)
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+
+        loss = (w * bce).mean()
+        return loss
 
 def _standardize_id_column(df: pd.DataFrame, name="stay_id") -> pd.DataFrame:
     candidates = [name, "icustay_id", "stay", "sample_id"]
@@ -1447,15 +1492,16 @@ def _safe_tensor(x: torch.Tensor, name: str = "") -> torch.Tensor:
         x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
     return x
 
-def _sanitize_encoder_out(out: Dict[str, torch.Tensor], name: str) -> Dict[str, torch.Tensor]:
+def _sanitize_encoder_out(out, name):
     out2 = dict(out)
     if "seq" in out2 and out2["seq"] is not None:
-        out2["seq"] = _safe_tensor(_clamp_norm(out2["seq"].float(), 20.0), f"{name}.seq").float()
+        out2["seq"] = torch.nan_to_num(out2["seq"], nan=0.0, posinf=0.0, neginf=0.0)
     if "pool" in out2 and out2["pool"] is not None:
-        out2["pool"] = _safe_tensor(_clamp_norm(out2["pool"].float(), 20.0), f"{name}.pool").float()
+        out2["pool"] = torch.nan_to_num(out2["pool"], nan=0.0, posinf=0.0, neginf=0.0)
     if "mask" in out2 and out2["mask"] is not None:
         out2["mask"] = out2["mask"].float()
     return out2
+
 
 def _has_nonfinite(*tensors: torch.Tensor) -> bool:
     for t in tensors:
@@ -1475,27 +1521,90 @@ def coerce_rc_to_report(
 ):
     assert rc_raw.ndim == 3, f"{split_name}.rc_raw must be [B,R,K], got {tuple(rc_raw.shape)}"
 
-    s_over_routes = rc_raw.float().sum(dim=1)  # [B,K]
-    s_over_k      = rc_raw.float().sum(dim=2)  # [B,R]
+    # ---- sanitize inputs FIRST (critical) ----
+    rc_raw_f = torch.nan_to_num(rc_raw.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+    pa_f     = torch.nan_to_num(prim_acts.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+    rm_f     = torch.nan_to_num(route_mask.detach().float(), nan=0.0, posinf=0.0, neginf=0.0) if route_mask is not None else None
 
-    err_routes = (s_over_routes - 1.0).abs().max().item()
-    err_k      = (s_over_k      - 1.0).abs().max().item()
+    # Recompute sums using sanitized rc
+    s_over_routes = rc_raw_f.sum(dim=1)  # [B,K]
+    s_over_k      = rc_raw_f.sum(dim=2)  # [B,R]
+
+    # If sums are non-finite for any reason, force conversion path (and later repair)
+    err_routes = torch.nan_to_num((s_over_routes - 1.0).abs().max(), nan=1e9).item()
+    err_k      = torch.nan_to_num((s_over_k      - 1.0).abs().max(), nan=1e9).item()
 
     ok_routes = err_routes < atol
     ok_k      = err_k      < atol
 
-
+    # ---- case 1: already p(route|phenotype) ----
     if ok_routes:
-        return rc_raw, "rc_raw is already p(route|phenotype) (sum over routes == 1)"
+        rc_rep = rc_raw_f
+        # enforce mask + normalize (still safe)
+        if rm_f is not None:
+            rc_rep = rc_rep * rm_f.unsqueeze(-1)
+        denom = rc_rep.sum(dim=1, keepdim=True)
+        bad = (~torch.isfinite(denom)) | (denom < 1e-8)
+        if bad.any():
+            if rm_f is not None:
+                avail = rm_f.unsqueeze(-1)
+                avail_sum = avail.sum(dim=1, keepdim=True).clamp(min=1.0)
+                uniform = avail / avail_sum
+                rc_rep = torch.where(bad, uniform.expand_as(rc_rep), rc_rep)
+            else:
+                B, R, K = rc_rep.shape
+                rc_rep = torch.where(bad, torch.full_like(rc_rep, 1.0 / float(R)), rc_rep)
+        rc_rep = rc_rep / rc_rep.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        return rc_rep, "rc_raw is already p(route|phenotype) (nan-safe normalize)"
 
+    # ---- case 2: looks like p(phenotype|route) -> convert ----
     if ok_k:
-        rc_report = route_given_pheno(rc_raw, prim_acts, route_mask=route_mask)
-        return rc_report, "converted rc_raw from p(phenotype|route) -> p(route|phenotype)"
+        rc_report = route_given_pheno(rc_raw_f, pa_f, route_mask=rm_f)  # [B,R,K] expected
+        rc_report = torch.nan_to_num(rc_report.float(), nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0)
 
-    rc = torch.clamp(rc_raw, 1e-8, 1.0)
+        eps = 1e-8
+        if rm_f is not None:
+            rc_report = rc_report * rm_f.unsqueeze(-1)
+            avail = rm_f.unsqueeze(-1)  # [B,R,1]
+            avail_sum = avail.sum(dim=1, keepdim=True).clamp(min=1.0)
+            uniform = avail / avail_sum
+        else:
+            uniform = None
+
+        denom = rc_report.sum(dim=1, keepdim=True)  # [B,1,K]
+        bad = (~torch.isfinite(denom)) | (denom < eps)
+
+        if bad.any():
+            if uniform is not None:
+                rc_report = torch.where(bad, uniform.expand_as(rc_report), rc_report)
+            else:
+                B, R, K = rc_report.shape
+                rc_report = torch.where(bad, torch.full_like(rc_report, 1.0 / float(R)), rc_report)
+
+        rc_report = rc_report / rc_report.sum(dim=1, keepdim=True).clamp(min=eps)
+        return rc_report, "converted p(pheno|route)->p(route|pheno) (nan-safe + repair)"
+
+    # ---- fallback: force a valid distribution over routes ----
+    rc = torch.nan_to_num(rc_raw_f, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0)
+    if rm_f is not None:
+        rc = rc * rm_f.unsqueeze(-1)
+        avail = rm_f.unsqueeze(-1)
+        avail_sum = avail.sum(dim=1, keepdim=True).clamp(min=1.0)
+        uniform = avail / avail_sum
+    else:
+        uniform = None
+
+    denom = rc.sum(dim=1, keepdim=True)
+    bad = (~torch.isfinite(denom)) | (denom < 1e-8)
+    if bad.any():
+        if uniform is not None:
+            rc = torch.where(bad, uniform.expand_as(rc), rc)
+        else:
+            B, R, K = rc.shape
+            rc = torch.where(bad, torch.full_like(rc, 1.0 / float(R)), rc)
+
     rc = rc / rc.sum(dim=1, keepdim=True).clamp(min=1e-8)
-    return rc, "WARNING: rc_raw not normalized over routes or K; renormalized over routes as fallback"
-
+    return rc, "WARNING: rc_raw not normalized; forced nan-safe normalize over routes"
 
 @torch.no_grad()
 def evaluate_epoch(
@@ -1588,10 +1697,13 @@ def evaluate_epoch(
                 rc_report, info = coerce_rc_to_report(rc_raw, prim_acts, route_mask, split_name=split_name)
                 assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name=f"{split_name}.rc_report")
                 routing_coef = rc_report
+                if bidx == 0:  # or (epoch==start_epoch and step==0) in TRAIN
+                    sR = routing_coef.sum(dim=1)  # should be ~1 over routes
+                    print(f"[debug] {split_name}.rc_report sum_over_routes(dim=1):",
+                          float(sR.mean()), float(sR.min()), float(sR.max()))
 
                 if bidx == 0:
                     print(f"[debug] {split_name}.rc_report info:", info)
-
 
                 if bidx == 0:
                     debug_routing_tensor(
@@ -2039,35 +2151,6 @@ def reliability_plot(bin_centers, bin_conf, bin_acc, out_path):
     plt.savefig(out_path, dpi=150)
     plt.close()
 
-def find_best_thresholds(y_true, p, n_steps: int = 50):
-    from sklearn.metrics import f1_score
-
-    y_true = np.asarray(y_true)
-    p      = np.asarray(p)
-
-    N, K = p.shape
-    thresholds = np.linspace(0.01, 0.99, n_steps)
-    best_t = np.full(K, 0.5, dtype=float)
-
-    for k in range(K):
-        yk = y_true[:, k]
-        pk = p[:, k]
-
-        if len(np.unique(yk)) < 2:
-            continue
-
-        best_f1 = 0.0
-        best_thr = 0.5
-        for t in thresholds:
-            yhat = (pk >= t).astype(int)
-            f1 = f1_score(yk, yhat)
-            if f1 > best_f1:
-                best_f1 = f1
-                best_thr = t
-        best_t[k] = best_thr
-
-    return best_t
-
 
 def compute_split_prevalence(
     y_true: np.ndarray,
@@ -2083,43 +2166,89 @@ def compute_split_prevalence(
         print(f"  {name}: {p:.4f}")
     return prev
 
-
-def grid_search_thresholds(
-    y_true: np.ndarray,
-    p: np.ndarray,
-    n_steps: int = 101,
+def routing_sanity_report(
+    rc_mat: np.ndarray,          # [R,K] = mean p(route|pheno)
+    prevalence: np.ndarray,      # [K]
+    auroc_per: np.ndarray,       # [K]
+    auprc_per: np.ndarray,       # [K]
+    routes: List[str],
+    label_names: List[str],
+    top_n: int = 12,
 ):
+    rc_mat = np.asarray(rc_mat, dtype=np.float32)
+    prevalence = np.asarray(prevalence, dtype=np.float32)
+    auroc_per = np.asarray(auroc_per, dtype=np.float32)
+    auprc_per = np.asarray(auprc_per, dtype=np.float32)
+
+    # entropy per phenotype (over routes)
+    eps = 1e-8
+    p = np.clip(rc_mat, eps, 1.0)
+    ent = -(p * np.log(p)).sum(axis=0)  # [K]
+
+    dom_idx = np.argmax(rc_mat, axis=0)  # [K]
+    dom_val = rc_mat[dom_idx, np.arange(rc_mat.shape[1])]
+    # margin between top1 and top2
+    sorted_vals = np.sort(rc_mat, axis=0)
+    top1 = sorted_vals[-1, :]
+    top2 = sorted_vals[-2, :] if rc_mat.shape[0] >= 2 else np.zeros_like(top1)
+    margin = top1 - top2
+
+    order = np.argsort(prevalence)  # rare -> common
+
+    print("\n" + "="*120)
+    print("[SANITY] Rare labels first: prevalence | AUROC | AUPRC | dom_route(dom_val) | top1-top2 margin | entropy")
+    print("-"*120)
+    for i in order[:min(top_n, len(order))]:
+        name = label_names[i] if i < len(label_names) else f"label_{i}"
+        rname = routes[int(dom_idx[i])] if int(dom_idx[i]) < len(routes) else f"route_{int(dom_idx[i])}"
+        print(
+            f"{name:45s} "
+            f"prev={prevalence[i]:.4f} "
+            f"AUROC={auroc_per[i]:.4f} "
+            f"AUPRC={auprc_per[i]:.4f} "
+            f"dom={rname}:{dom_val[i]:.3f} "
+            f"margin={margin[i]:.3f} "
+            f"H={ent[i]:.3f}"
+        )
+    print("="*120 + "\n")
+
+
+def find_best_thresholds_fbeta(y_true, p, beta: float = 2.0, n_steps: int = 101):
+    """
+    Per-label threshold search maximizing F_beta.
+    beta>1 emphasizes recall.
+    """
+    from sklearn.metrics import fbeta_score
+
     y_true = np.asarray(y_true)
     p      = np.asarray(p)
-    N, K = p.shape
 
+    N, K = p.shape
     thresholds = np.linspace(0.0, 1.0, n_steps)
     best_thr = np.full(K, 0.5, dtype=float)
-    best_f1 = np.zeros(K, dtype=float)
-
-    from sklearn.metrics import f1_score
+    best_fb  = np.full(K, np.nan, dtype=float)
 
     for k in range(K):
         yk = y_true[:, k]
         pk = p[:, k]
 
+        # skip labels with only one class
         if len(np.unique(yk)) < 2:
             continue
 
-        best = 0.0
+        best_val = -1.0
         best_t = 0.5
         for t in thresholds:
             yhat = (pk >= t).astype(int)
-            f1 = f1_score(yk, yhat)
-            if f1 > best:
-                best = f1
+            fb = fbeta_score(yk, yhat, beta=beta, zero_division=0)
+            if fb > best_val:
+                best_val = fb
                 best_t = t
 
         best_thr[k] = best_t
-        best_f1[k] = best
+        best_fb[k]  = best_val
 
-    return best_thr, best_f1
-
+    return best_thr.astype(np.float32), best_fb.astype(np.float32)
 
 def save_split_thresholds(
     thr: np.ndarray,
@@ -2148,10 +2277,10 @@ def generate_split_heatmaps_and_tables(
     routes = ROUTE_NAMES
     out_dir = os.path.join(ckpt_dir, "heatmaps", split_name.lower())
     os.makedirs(out_dir, exist_ok=True)
-    dummy_bce = nn.BCEWithLogitsLoss(reduction="mean")
+    loss_fn = nn.BCEWithLogitsLoss(reduction="mean")
     loss, acc, act_dict, rc_mat, eff_mat, pa_vec = evaluate_epoch(
         behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
-        loader, amp_ctx_enc, amp_ctx_caps, dummy_bce,
+        loader, amp_ctx_enc, amp_ctx_caps, loss_fn,
         route_debug=False,
         label_names=label_names,
         epoch_idx=None,
@@ -2356,12 +2485,19 @@ def main():
         split_name="TRAIN",
         label_names=[get_pheno_name(i) for i in range(train_ds.num_labels)]
     )
+
     pos_counts = train_label_df[train_ds.label_cols].sum(axis=0).values
     neg_counts = N_train - pos_counts
+
+    # standard BCE pos_weight = neg/pos
     pos_weight = neg_counts / (pos_counts + 1e-6)
-    max_pw = float(_cfg("pos_weight_max", 20.0))
-    pos_weight = np.clip(pos_weight, 1.0, max_pw)
-    print(f"[loss] pos_weight: min={pos_weight.min():.3f} max={pos_weight.max():.3f} (clamped to {max_pw})")
+
+    # clamp only extremes; allow <1 for common labels
+    max_pw = float(_cfg("pos_weight_max", 5.0))
+    min_pw = float(_cfg("pos_weight_min", 0.1))  # add CFG option if you want
+    pos_weight = np.clip(pos_weight, min_pw, max_pw)
+
+    print(f"[loss] pos_weight: min={pos_weight.min():.3f} max={pos_weight.max():.3f} (clamped to [{min_pw},{max_pw}])")
 
     pos_weight_tensor = torch.tensor(pos_weight, dtype=torch.float32, device=DEVICE)
     val_ds   = ICUStayDataset(args.data_root, split="val")
@@ -2370,8 +2506,9 @@ def main():
     raw_label_cols = train_ds.label_cols
     label_names = [get_pheno_name(i) for i in range(num_phenos)]
     best_thr = np.full(num_phenos, 0.5, dtype=np.float32)
-    bce = nn.BCEWithLogitsLoss(reduction="mean", pos_weight=pos_weight_tensor)
-    print("[loss] BCEWithLogitsLoss with per-label pos_weight")
+    # (keep pos_weight computation if you want to log it, but do NOT use it)
+    bce = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor, reduction="mean")
+    print("[loss] Using BCEWithLogitsLoss with pos_weight")
 
     collate_train = collate_fn_factory(tidx=TASK_MAP[args.task], img_tfms=build_image_transform("train"))
     collate_eval  = collate_fn_factory(tidx=TASK_MAP[args.task], img_tfms=build_image_transform("val"))
@@ -2383,10 +2520,27 @@ def main():
     g_eval = torch.Generator()
     g_eval.manual_seed(int(CFG.seed) + 456)
 
+    use_sampler = bool(_cfg("use_weighted_sampler", False))
+    if use_sampler:
+        # align weights with train_ds.ids order
+        df_w = train_label_df.set_index("stay_id").loc[train_ds.ids]
+        w = make_sample_weights_from_multilabel(df_w.reset_index(), train_ds.label_cols)
+        sampler = WeightedRandomSampler(torch.tensor(w), num_samples=len(w), replacement=True)
+        print(f"[sampler] WeightedRandomSampler enabled: mean_w={w.mean():.3f} max_w={w.max():.3f}")
+        shuffle_flag = False
+    else:
+        sampler = None
+        shuffle_flag = True
+
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=pin,
-        collate_fn=collate_train, drop_last=False,
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=shuffle_flag,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=pin,
+        collate_fn=collate_train,
+        drop_last=False,
         worker_init_fn=seed_worker,
         generator=g_train,
         persistent_workers=(args.num_workers > 0),
@@ -2544,12 +2698,12 @@ def main():
     route_uniform_lambda        = float(_cfg("route_uniform_lambda", 0.0))
     route_uniform_warmup_epochs = int(_cfg("route_uniform_warmup_epochs", 0))
     routing_warmup_epochs        = max(0, int(routing_warmup_epochs))
-    route_entropy_warmup_epochs  = max(0.0, float(route_entropy_warmup_epochs))
+    route_entropy_warmup_epochs = max(0, int(route_entropy_warmup_epochs))
     route_uniform_warmup_epochs = max(0, route_uniform_warmup_epochs)
     max_train_patients = int(os.environ.get("MIMICIV_MAX_TRAIN_PATIENTS", "-1"))
     seen_patients = 0
     stop_training = False
-    best_val_auroc    = -float("inf")
+    best_val_auprc = -float("inf")
     best_ckpt_auroc   = -float("inf")
     epochs_no_improve = 0
     patience_epochs = int(_cfg("patience_epochs", 5))     
@@ -2683,16 +2837,21 @@ def main():
                 cur_epoch = float(epoch + 1)
 
                 if routing_coef is not None:
-                    rc = routing_coef.float().clamp(1e-6, 1.0)  
+                    rc = routing_coef.float().clamp(1e-6, 1.0)  # [B,R,K]
+                    B, R, K = rc.shape
 
                     if route_entropy_lambda > 0.0 and (route_entropy_warmup_epochs <= 0 or cur_epoch > route_entropy_warmup_epochs):
-                        H = -(rc * rc.log()).sum(dim=1).mean()
+                        rc_bmean = rc.mean(dim=0)                       # [R,K]
+                        Hk = -(rc_bmean * rc_bmean.log()).sum(dim=0)    # [K]
+                        H = Hk.mean()                                   # scalar
                         loss = loss - route_entropy_lambda * H
 
                     if route_uniform_lambda > 0.0 and (route_uniform_warmup_epochs <= 0 or cur_epoch > route_uniform_warmup_epochs):
-                        rc_mean_r = rc.mean(dim=(0, 2))          # [R]
-                        target = torch.full_like(rc_mean_r, 1.0 / rc_mean_r.numel())
-                        uniform_loss = ((rc_mean_r - target) ** 2).sum()
+                        rc_bmean = rc.mean(dim=0)  # [R,K]
+                        target = torch.full((R,), 1.0 / R, device=rc.device, dtype=rc.dtype)  # [R]
+                        # sum over routes deviation, then mean across K
+                        uniform_loss_k = ((rc_bmean.transpose(0, 1) - target) ** 2).sum(dim=1)  # [K]
+                        uniform_loss = uniform_loss_k.mean()
                         loss = loss + route_uniform_lambda * uniform_loss
 
             grad_clip = float(_cfg("grad_clip_norm", 1.0))
@@ -2705,10 +2864,13 @@ def main():
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
+
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=grad_clip)
+
                 if not grads_are_finite(trainable_params):
                     print(f"[skip] non-finite grads (AMP) at epoch={epoch+1} step={step+1} -> skip")
                     safe_zero_grad(optimizer)
+                    scaler.update()   # <-- IMPORTANT: resets "unscale called" state
                     continue
 
                 scaler.step(optimizer)
@@ -2721,6 +2883,7 @@ def main():
                     safe_zero_grad(optimizer)
                     continue
                 optimizer.step()
+
             safe_zero_grad(optimizer)
             total_loss += float(loss.item()) * y.size(0)
 
@@ -2832,12 +2995,23 @@ def main():
             amp_ctx_enc, amp_ctx_caps,
             act_temperature=1.0,
             detach_priors=False,
-
         )
-        best_thr = find_best_thresholds(y_true, p1, n_steps=50)
+
+        beta_thr = float(_cfg("threshold_beta", 2.0))
+        best_thr, best_fbeta = find_best_thresholds_fbeta(y_true, p1, beta=beta_thr, n_steps=101)
+
         y_pred = (p1 >= best_thr[np.newaxis, :]).astype(float)
         m = epoch_metrics(y_true, p1, y_pred)
+        print("[debug] AUROC_macro:", m["AUROC"])
+        print("[debug] AUROC_micro:", m["AUROC_micro"])
+        print("[debug] AUROC_per_label (first 10):", m["AUROC_per_label"][:10])
+        print("[debug] mean(p)=", float(p1.mean()), "std(p)=", float(p1.std()),
+              "min(p)=", float(p1.min()), "max(p)=", float(p1.max()))
+
+
+        print(f"[thr] updated thresholds by max F{beta_thr:g} on VAL (mean best Fbeta={np.nanmean(best_fbeta):.4f})")
         print("[debug] mean predicted positive rate:", float(y_pred.mean()))
+
 
         print(
             f"[epoch {epoch + 1}] VAL MACRO  "
@@ -2860,6 +3034,21 @@ def main():
 
         au_per  = m["AUROC_per_label"]
         ap_per  = m["AUPRC_per_label"]
+        # prevalence on VAL
+        prev_val = y_true.mean(axis=0)  # [K]
+
+        # routing sanity (only if routing matrix exists)
+        if val_rc_mat is not None:
+            routing_sanity_report(
+                rc_mat=val_rc_mat,            # [R,K]
+                prevalence=prev_val,          # [K]
+                auroc_per=au_per,             # [K]
+                auprc_per=ap_per,             # [K]
+                routes=ROUTE_NAMES[:N_ROUTES],
+                label_names=label_names,
+                top_n=12,
+            )
+
         f1_per  = m["F1_per_label"]
         rec_per = m["Recall_per_label"]
         for k, name in enumerate(label_names):
@@ -2871,26 +3060,31 @@ def main():
                 f"Recall={rec_per[k]:.4f}"
             )
         
-        val_macro_auroc = float(m["AUROC"])  
-        if val_macro_auroc > best_val_auroc + min_delta:
-            best_val_auroc = val_macro_auroc
+        val_macro_auprc = float(m["AUPRC"])
+
+        if val_macro_auprc > best_val_auprc + min_delta:
+            best_val_auprc = val_macro_auprc
             epochs_no_improve = 0
-            print(f"[early-stop] AUROC improved to {best_val_auroc:.4f} (epoch {epoch + 1})")
+            print(f"[early-stop] AUPRC improved to {best_val_auprc:.4f} (epoch {epoch + 1})")
         else:
             if (epoch + 1) >= min_epochs:
                 epochs_no_improve += 1
                 print(
                     f"[early-stop] No improvement for {epochs_no_improve}/{patience_epochs} "
-                    f"epochs (best={best_val_auroc:.4f}, current={val_macro_auroc:.4f})"
+                    f"epochs (best={best_val_auprc:.4f}, current={val_macro_auprc:.4f})"
                 )
                 if epochs_no_improve >= patience_epochs:
-                    print(f"[early-stop] Stop: no improvement for {patience_epochs} epochs after min_epochs={min_epochs}.")
+                    print(
+                        f"[early-stop] Stop: no improvement for {patience_epochs} epochs "
+                        f"after min_epochs={min_epochs}."
+                    )
                     break
             else:
                 print(
                     f"[early-stop] No improvement but epoch {epoch + 1} < min_epochs={min_epochs} "
                     f"→ not counting patience yet."
                 )
+
 
         ece, centers, bconf, bacc, bcnt = expected_calibration_error(
             p1.reshape(-1), y_true.reshape(-1), n_bins=args.calib_bins
@@ -2899,11 +3093,10 @@ def main():
         rel_path = os.path.join(ckpt_dir, f"reliability_val_epoch{epoch + 1:03d}.png")
         reliability_plot(centers, bconf, bacc, out_path=rel_path)
         print(f"[epoch {epoch + 1}] Saved reliability diagram → {rel_path}")
-        val_score = float(m["AUROC"])  
+        val_score = float(m["AUPRC"])  # macro AUPRC
         is_best = val_score > best_ckpt_auroc
         if is_best:
             best_ckpt_auroc = val_score
-
         ckpt = {
             "epoch": epoch + 1,
             "behrt": behrt.state_dict(),
@@ -2914,15 +3107,17 @@ def main():
             "projector": projector.state_dict(),
             "cap_head": cap_head.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "val_acc": float(val_acc),  
-            "val_auroc": float(val_score),    
+            "val_acc": float(val_acc),
+            "val_auprc": float(m["AUPRC"]),
+            "val_auroc": float(m["AUROC"]),
             "best_thr": torch.from_numpy(best_thr.astype(np.float32)),
         }
         save_checkpoint(os.path.join(ckpt_dir, "last.pt"), ckpt)
         
         if is_best:
             save_checkpoint(os.path.join(ckpt_dir, "best.pt"), ckpt)
-            print(f"[epoch {epoch + 1}] Saved BEST checkpoint (VAL AUROC={val_score:.4f} | val_acc@0.5={float(val_acc):.4f})")
+            print(f"[epoch {epoch + 1}] Saved BEST checkpoint (VAL AUPRC={val_score:.4f} | val_acc@0.5={float(val_acc):.4f})")
+
 
     print("[main] Evaluating BEST checkpoint on TEST...")
     best_path = os.path.join(ckpt_dir, "best.pt")
@@ -2990,7 +3185,11 @@ def main():
     print(f"[calibration] Fitted temperature on VAL only: T={T_star:.4f}")
     p_v = sigmoid_np(apply_temperature(logits_v, T_star))  # use calibrated probs for threshold search
     prev_val = compute_split_prevalence(y_true_v_log, split_name="VAL", label_names=label_names)
-    thr_val, f1_val_thr = grid_search_thresholds(y_true_v_log, p_v, n_steps=101)
+    beta_thr = float(_cfg("threshold_beta", 2.0))
+    thr_val, fbeta_val = find_best_thresholds_fbeta(y_true_v_log, p_v, beta=beta_thr, n_steps=101)
+    save_split_thresholds(thr_val, ckpt_dir, split_name="VAL")
+    print(f"[thr] Saved VAL thresholds maximizing F{beta_thr:g} (mean best Fbeta={np.nanmean(fbeta_val):.4f})")
+
     save_split_thresholds(thr_val, ckpt_dir, split_name="VAL")  
     y_true_t_log, logits_t, _ = collect_epoch_logits(
         test_loader, behrt, bbert, imgenc, mult, route_adapter, projector, cap_head, amp_ctx_enc, amp_ctx_caps
