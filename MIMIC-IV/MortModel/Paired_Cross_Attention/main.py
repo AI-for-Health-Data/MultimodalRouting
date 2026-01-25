@@ -16,10 +16,10 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import WeightedRandomSampler
 import torchvision.transforms as T
 from torch import amp as torch_amp
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import WeightedRandomSampler
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -44,7 +44,8 @@ from routing_and_heads import (
     route_given_pheno,
 )
 
-ROUTE_NAMES = ["L","N","I","LN","NL","LI","IL","NI","IN","LNI"]
+
+ROUTE_NAMES = ROUTES  
 N_ROUTES = len(ROUTE_NAMES)
 
 def grads_are_finite(param_list):
@@ -98,13 +99,6 @@ def seed_worker(worker_id: int):
     ws = (int(CFG.seed) + int(worker_id)) % (2**32)
     np.random.seed(ws); random.seed(ws); torch.manual_seed(ws)
 
-    global TOKENIZER, MAXLEN
-    if TOKENIZER is None:
-        from transformers import AutoTokenizer
-        TOKENIZER = AutoTokenizer.from_pretrained(CFG.text_model_name)
-        MAXLEN = int(getattr(CFG, "max_text_len", 512))
-
-
 def _standardize_id_column(df: pd.DataFrame, name="stay_id") -> pd.DataFrame:
     candidates = [name, "icustay_id", "stay", "sample_id"]
     found = next((c for c in candidates if c in df.columns), None)
@@ -155,10 +149,9 @@ def print_route_matrix_detailed(
 
         print(f"\n3. ROUTE IMPORTANCE (avg over labels):")
         if rc_is_report:
-            effective = rc_mean                     # already p(route | phenotype)
+            effective = rc_mean                     
         else:
-            # effective = E_b[ rc_raw[b,r,k] * prim_acts[b,r] ]
-            effective = (rc_raw.detach().float().cpu() * pa.unsqueeze(-1)).mean(dim=0).numpy()
+            effective = (rc_report_cpu * pa_cpu.unsqueeze(-1)).mean(dim=0)
 
         rc_avg  = rc_mean.mean(axis=1)              # [R]
         eff_avg = effective.mean(axis=1)            # [R]
@@ -224,7 +217,6 @@ def encode_all_modalities(
             pad_chunks = (chunk_mask < 0.5)
 
             if pad_chunks.any():
-                # clone ONLY if we will write into them
                 notes_ids  = notes_ids.clone()
                 notes_attn = notes_attn.clone()
                 cls_id = int(getattr(TOKENIZER, "cls_token_id", 101))
@@ -237,18 +229,15 @@ def encode_all_modalities(
             notes_batch = {
                 "input_ids": notes_ids,
                 "attention_mask": notes_attn,
-                "chunk_mask": chunk_mask,   # <-- critical: pass collate mask through
+                "chunk_mask": chunk_mask,   
             }
         else:
-            # No chunk_mask provided → encoder will fall back to attention-derived chunk mask
             notes_batch = {
                 "input_ids": notes_ids,
                 "attention_mask": notes_attn,
             }
 
         N_seq, N_mask, N_pool = bbert.encode_seq_and_pool(notes_batch)
-
-
         I_seq, I_mask, I_pool = imgenc.encode_seq_and_pool(imgs)
         _peek_tensor("enc.N_pool", N_pool)
         _peek_tensor("enc.N_seq",  N_seq)
@@ -258,14 +247,10 @@ def encode_all_modalities(
     outL = {"seq": L_seq, "mask": L_mask.float(), "pool": L_pool}
     outN = {"seq": N_seq, "mask": N_mask.float(), "pool": N_pool}
     outI = {"seq": I_seq, "mask": I_mask.float(), "pool": I_pool}
-
     return _sanitize_encoder_out(outL, "L"), _sanitize_encoder_out(outN, "N"), _sanitize_encoder_out(outI, "I")
 
 
 def normalize_rc_shape_to_brk(rc: torch.Tensor, expect_routes: int, name: str = "rc") -> torch.Tensor:
-    """
-    Ensure rc is [B,R,K]. If rc is [B,K,R], transpose it.
-    """
     if rc is None:
         return rc
     if rc.ndim != 3:
@@ -279,10 +264,6 @@ def normalize_rc_shape_to_brk(rc: torch.Tensor, expect_routes: int, name: str = 
     raise ValueError(f"{name}: cannot find routes axis with size={expect_routes}, shape={tuple(rc.shape)}")
 
 def debug_routing_tensor(rc: torch.Tensor, name="rc", expect_routes=10, kind="raw"):
-    """
-    kind="raw"    -> rc is p(class|route), should sum over classes (dim=2) to 1
-    kind="report" -> rc is p(route|class), should sum over routes (dim=1) to 1
-    """
     with torch.no_grad():
         print(f"\n[debug] {name}.shape={tuple(rc.shape)} dtype={rc.dtype} device={rc.device}")
         assert rc.ndim == 3, f"{name}: expected [B,R,K]"
@@ -306,14 +287,10 @@ def debug_routing_tensor(rc: torch.Tensor, name="rc", expect_routes=10, kind="ra
 
 def assert_routing_over_routes(
     rc: torch.Tensor,
-    routes_dim: int = 1,          # <-- add
+    routes_dim: int = 1,         
     atol: float = 1e-3,
     name: str = "routing_coef",
 ):
-    """
-    Assert rc sums to 1 over routes_dim.
-    Works for rc shaped [B,R,K] with routes_dim=1 (most common).
-    """
     if rc.ndim != 3:
         raise AssertionError(f"{name}: expected 3D tensor, got {tuple(rc.shape)}")
 
@@ -634,9 +611,6 @@ def save_vector_heatmap_with_numbers(
 def _cfg(name: str, default):
     return getattr(CFG, name, default)
 
-
-TASK_MAP = {"mortality": 0}
-
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 
@@ -661,6 +635,12 @@ def _chunk_long_ids(ids: List[int], attn: List[int], maxlen: int, stride: int):
     return out_ids, out_attn
 
 def prepare_notes_batch(notes_batch: List[Dict[str, Any]]):
+    global TOKENIZER, MAXLEN
+    if TOKENIZER is None:
+        from transformers import AutoTokenizer
+        TOKENIZER = AutoTokenizer.from_pretrained(CFG.text_model_name)
+        MAXLEN = int(getattr(CFG, "max_text_len", 512))
+
     out = []
     pad_id = int(getattr(TOKENIZER, "pad_token_id", 0) or 0)
     L = int(_cfg("max_text_len", 512))
@@ -815,6 +795,7 @@ def parse_args():
     ap.add_argument("--route_debug", action="store_true")
     ap.add_argument("--calib_bins", type=int, default=10)
     return ap.parse_args()
+
 def coerce_packed_ehr(x, stay_id: int, T: int = 48, F: int = 76) -> np.ndarray:
     import ast, json
 
@@ -968,7 +949,6 @@ def _detect_notes_schema(notes_df: pd.DataFrame):
     if len(attn_cols) == 0:
         attn_cols = sorted([c for c in notes_df.columns if str(c).startswith("attn_mask_")])
 
-    # --- pretokenized schema
     if len(input_id_cols) > 0 and len(attn_cols) > 0:
         id_sufs = {c.split("input_ids_")[-1] for c in input_id_cols}
         if any(str(c).startswith("attention_mask_") for c in attn_cols):
@@ -993,23 +973,10 @@ def _detect_notes_schema(notes_df: pd.DataFrame):
 
         return ("pretokenized", aligned_ids, aligned_attn)
 
-    # --- text chunk schema (supports chunk_, text_chunk_, note_chunk_)
     for pref in ("chunk_", "text_chunk_", "note_chunk_"):
         cols = sorted([c for c in notes_df.columns if str(c).startswith(pref)])
         if len(cols) > 0:
             return ("text", cols, None)
-
-    raise ValueError("notes schema not recognized")
-
-
-    chunk_cols = sorted([c for c in notes_df.columns if str(c).startswith("chunk_")])
-    if len(chunk_cols) > 0:
-        return ("text", chunk_cols, None)
-
-    text_chunk_cols = sorted([c for c in notes_df.columns if str(c).startswith("text_chunk_")])
-    if len(text_chunk_cols) > 0:
-        return ("text", text_chunk_cols, None)
-
     raise ValueError("notes schema not recognized")
 
 
@@ -1054,8 +1021,39 @@ def _cell_to_list(x):
             return []
     return []
 
+def coerce_rc_semantics(rc_raw: torch.Tensor, atol: float = 1e-2, name: str = "rc_raw"):
+    assert rc_raw.ndim == 3, f"{name} must be [B,R,K], got {tuple(rc_raw.shape)}"
+    with torch.no_grad():
+        s_routes  = rc_raw.sum(dim=1)  # [B,K]
+        s_classes = rc_raw.sum(dim=2)  # [B,R]
+        err_routes  = (s_routes  - 1.0).abs().mean().item()
+        err_classes = (s_classes - 1.0).abs().mean().item()
+        route_norm_ok  = torch.isfinite(s_routes).all()  and (err_routes  <= atol)
+        class_norm_ok  = torch.isfinite(s_classes).all() and (err_classes <= atol)
+
+        if route_norm_ok and not class_norm_ok:
+            rc_r_given_c = rc_raw
+            rc_c_given_r = rc_raw / (rc_raw.sum(dim=2, keepdim=True) + 1e-6)
+            mode = "route_given_class"
+        elif class_norm_ok and not route_norm_ok:
+            rc_c_given_r = rc_raw
+            rc_r_given_c = rc_raw / (rc_raw.sum(dim=1, keepdim=True) + 1e-6)
+            mode = "class_given_route"
+        elif route_norm_ok and class_norm_ok:
+            rc_r_given_c = rc_raw
+            rc_c_given_r = rc_raw / (rc_raw.sum(dim=2, keepdim=True) + 1e-6)
+            mode = "both_ok_assume_route_given_class"
+        else:
+            raise AssertionError(
+                f"{name}: not normalized over routes or classes.\n"
+                f"  sum_over_routes(dim=1): mean_abs_err={err_routes:.3e} (want ~0)\n"
+                f"  sum_over_classes(dim=2): mean_abs_err={err_classes:.3e} (want ~0)\n"
+                f"  routes_sum range: [{s_routes.min().item():.4f}, {s_routes.max().item():.4f}]\n"
+                f"  classes_sum range: [{s_classes.min().item():.4f}, {s_classes.max().item():.4f}]"
+            )
+    return rc_r_given_c, rc_c_given_r, mode
+
 def _coerce_any_2d(x, stay_id: int) -> np.ndarray:
-    """Parse a parquet cell into a numeric 2D array if possible (no shape enforcement)."""
     import ast, json
 
     def _as_py(v):
@@ -1089,7 +1087,6 @@ def _coerce_any_2d(x, stay_id: int) -> np.ndarray:
     if arr.ndim == 2:
         return np.nan_to_num(arr.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
 
-    # handle list-of-rows in object arrays
     if arr.ndim == 1 and arr.dtype == object and arr.size > 0 and isinstance(arr[0], (list, tuple, np.ndarray)):
         rows = [np.asarray(r, dtype=np.float32) for r in arr.tolist()]
         out = np.stack(rows, axis=0)
@@ -1098,17 +1095,11 @@ def _coerce_any_2d(x, stay_id: int) -> np.ndarray:
     raise ValueError(f"[struct] stay_id={stay_id} got non-2D content: ndim={arr.ndim} shape={arr.shape}")
 
 def detect_struct_col(struct_df: pd.DataFrame, T_cfg: int, F_cfg: int) -> Tuple[str, Tuple[int,int]]:
-    """
-    Find a column in structured parquet that matches (T_cfg,F_cfg) if possible.
-    Falls back to the first parsable 2D column.
-    """
-    # prioritize likely candidates
     cand = [c for c in struct_df.columns if str(c).startswith("x_") or "ehr" in str(c).lower()]
     cand = [c for c in cand if c != "stay_id"]
     if not cand:
         raise ValueError(f"[struct] no candidate structured columns found. Columns={list(struct_df.columns)[:50]}")
 
-    # sample one row to infer shapes
     sample_df = struct_df.dropna(subset=cand, how="all")
     if sample_df.empty:
         raise ValueError("[struct] all candidate structured columns are empty")
@@ -1127,17 +1118,14 @@ def detect_struct_col(struct_df: pd.DataFrame, T_cfg: int, F_cfg: int) -> Tuple[
     if not shapes:
         raise ValueError("[struct] could not parse any candidate structured columns into 2D arrays")
 
-    # perfect match first
     for c, (t,f) in shapes.items():
         if int(t) == int(T_cfg) and int(f) == int(F_cfg):
             return c, (t,f)
 
-    # feature-dim match next (common when you pad/trim time)
     for c, (t,f) in shapes.items():
         if int(f) == int(F_cfg):
             return c, (t,f)
 
-    # otherwise just take the first parsable one
     c0 = next(iter(shapes.keys()))
     return c0, shapes[c0]
 
@@ -1174,21 +1162,15 @@ class ICUStayDataset(Dataset):
             )
         split_ids: List[int] = [int(x) for x in splits[split]]
         ids_set = set(split_ids)
-
         struct_fp = os.path.join(root, "structured_mortality.parquet")
         notes_fp  = os.path.join(root, "notes_wide_clean.parquet")
-
         images_fp = os.path.join(root, "images.parquet")
         labels_fp = os.path.join(root, "labels_mortality.parquet")
 
-        # --- ICUStayDataset.__init__ fix (indentation must match)
         self.struct = _standardize_id_column(pd.read_parquet(struct_fp))
-
-        # Prefer explicit column from CFG if provided
         wanted = str(getattr(CFG, "structured_x_col", "") or "").strip()
         if wanted and wanted in self.struct.columns:
             self.struct_col = wanted
-            # infer (T,F) from a sample row
             sample_df = self.struct.dropna(subset=[self.struct_col])
             if sample_df.empty:
                 raise ValueError(f"[struct] column '{self.struct_col}' exists but is all-NaN")
@@ -1200,8 +1182,6 @@ class ICUStayDataset(Dataset):
             T_cfg = int(getattr(CFG, "structured_seq_len", 48) or 48)
             F_cfg = int(getattr(CFG, "structured_n_feats", 76) or 76)
             self.struct_col, (t0, f0) = detect_struct_col(self.struct, T_cfg=T_cfg, F_cfg=F_cfg)
-
-        # Hard sync CFG to what we will actually use (prevents later crashes)
         if int(getattr(CFG, "structured_seq_len", t0)) != t0 or int(getattr(CFG, "structured_n_feats", f0)) != f0:
             print(f"[struct] CFG mismatch → syncing CFG.structured_seq_len={t0}, CFG.structured_n_feats={f0}")
             CFG.structured_seq_len = t0
@@ -1211,29 +1191,21 @@ class ICUStayDataset(Dataset):
 
         self.notes  = _standardize_id_column(pd.read_parquet(notes_fp))
         self.images = _standardize_id_column(pd.read_parquet(images_fp))
-
-        # --- detect an image time column so we can pick LAST CXR within ICU stay
         time_candidates = ["charttime", "studytime", "StudyDateTime", "cxr_time", "time", "datetime"]
         self.image_time_col = next((c for c in time_candidates if c in self.images.columns), None)
 
         if self.image_time_col is None:
             print("[warn] No image time column found in images.parquet -> cannot guarantee last CXR; will fallback to last valid path in file order.")
         else:
-            # Coerce to datetime
             self.images[self.image_time_col] = pd.to_datetime(self.images[self.image_time_col], errors="coerce")
             n_bad = int(self.images[self.image_time_col].isna().sum())
             print(f"[dataset:{split}] image_time_col='{self.image_time_col}' bad_datetimes={n_bad}/{len(self.images)}")
 
         self.images = _standardize_image_path_column(self.images)
         self.labels = _standardize_id_column(pd.read_parquet(labels_fp))
-        
-        # ✅ ADD set_index HERE (after loading)
         self.struct = self.struct.drop_duplicates("stay_id").set_index("stay_id", drop=False)
         self.notes  = self.notes.drop_duplicates("stay_id").set_index("stay_id", drop=False)
         self.labels = self.labels.drop_duplicates("stay_id").set_index("stay_id", drop=False)
-        # images can be multi-row; keep self.img_map for that
-
-        
         sample = self.images["cxr_path"].dropna().astype(str)
         sample = sample[sample.str.strip().ne("")]
 
@@ -1321,14 +1293,13 @@ class ICUStayDataset(Dataset):
         )
 
         split_img_candidates = split_img_candidates & ids_set  # limit to split ids
-        # after self.images is loaded & standardized
         img_map = {}
         for sid, g in self.images.groupby("stay_id", sort=False):
             g = g.copy()
 
             # If we have a time column, sort so the LAST row is the latest CXR
             if self.image_time_col is not None and self.image_time_col in g.columns:
-                g = g.sort_values(self.image_time_col, kind="mergesort")  # stable
+                g = g.sort_values(self.image_time_col, kind="mergesort") 
 
             raw_paths = g["cxr_path"].dropna().astype(str).tolist()
             raw_paths = [p for p in raw_paths if p.strip()]
@@ -1416,8 +1387,6 @@ class ICUStayDataset(Dataset):
 
     def __getitem__(self, idx: int):
         stay_id = int(self.ids[idx])
-
-        # --- structured: O(1)
         row_s = self.struct.loc[stay_id]
         if isinstance(row_s, pd.DataFrame):
             row_s = row_s.iloc[0]
@@ -1427,8 +1396,6 @@ class ICUStayDataset(Dataset):
         F = int(getattr(CFG, "structured_n_feats", 76) or 76)
         xs_np = coerce_packed_ehr(x, stay_id=stay_id, T=T, F=F)
         xs = torch.from_numpy(xs_np)  # [T,F]
-
-        # --- notes: O(1)
         row_n = self.notes.loc[stay_id]
         if isinstance(row_n, pd.DataFrame):
             row_n = row_n.iloc[0]
@@ -1469,12 +1436,9 @@ class ICUStayDataset(Dataset):
                 attn_chunks = attn_chunks[:M]
             notes_payload = {"mode": "pretokenized", "input_ids": ids_chunks, "attention_mask": attn_chunks}
 
-        # --- image: use precomputed map (fast)
         cand = self.img_map.get(stay_id, [])
         img_paths = [cand[-1]]
 
-
-        # --- label: O(1)
         row_y = self.labels.loc[stay_id]
         if isinstance(row_y, pd.DataFrame):
             row_y = row_y.iloc[0]
@@ -1491,15 +1455,12 @@ class ICUStayDataset(Dataset):
             "y": y,
         }
 
-
-
 def pad_or_trim_struct(x: torch.Tensor, T: int, F: int) -> torch.Tensor:
     t = x.shape[0]
     if t >= T:
         return x[-T:]
     pad = torch.zeros(T - t, F, dtype=x.dtype)
     return torch.cat([pad, x], dim=0)
-
 
 def load_cxr_tensor(paths: List[str], tfms: T.Compose, return_path: bool = False):
     if not paths:
@@ -1510,9 +1471,7 @@ def load_cxr_tensor(paths: List[str], tfms: T.Compose, return_path: bool = False
         print(f"[warn] image path missing/does not exist: {p_full} -> returning zero tensor")
         tensor = torch.zeros(3, 224, 224)
         return (tensor, p_full) if return_path else tensor
-
     ext = os.path.splitext(p_full.lower())[1]
-
     try:
         if ext == ".dcm":
             try:
@@ -1540,7 +1499,7 @@ def load_cxr_tensor(paths: List[str], tfms: T.Compose, return_path: bool = False
     return (tensor, p_full) if return_path else tensor
 
 
-def collate_fn_factory(tidx: int, img_tfms: T.Compose):
+def collate_fn_factory(img_tfms: T.Compose):
     first_print = {"done": False}
 
     def _collate(batch: List[Dict[str, Any]]):
@@ -1655,7 +1614,6 @@ def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
             else:
                 note_preview = "<batched: valid_chunks=0>"
         else:
-            # old path (list-of-dicts)
             try:
                 note_obj = notes[i]
                 mode = note_obj.get("mode", "text")
@@ -1671,10 +1629,7 @@ def pretty_print_small_batch(xL, mL, notes, dbg, k: int = 3) -> None:
 
 from typing import Any, Dict, List, Optional, Tuple
 import torch
-
-
 def _extract_route_tensor(v: Any, rname: str) -> torch.Tensor:
-    """Accept either a Tensor or a dict with key 'pool' -> Tensor."""
     if torch.is_tensor(v):
         return v
     if isinstance(v, dict) and ("pool" in v) and torch.is_tensor(v["pool"]):
@@ -1687,18 +1642,9 @@ def _coerce_route_embs_strict(
     route_mask: Optional[torch.Tensor],
     routes: List[str],
 ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-    """
-    STRICT mode:
-      - raises if any required route is missing
-      - ensures every route is [B,D] and consistent across routes
-      - ensures route_mask exists and is [B,R] float on same device
-    """
-    # 1) Ensure all required routes exist
     missing = [r for r in routes if r not in route_embs_in]
     if missing:
         raise RuntimeError(f"[routes] Missing routes from make_route_inputs_mult: {missing}")
-
-    # 2) Extract tensors and validate shapes
     out: Dict[str, torch.Tensor] = {}
     first: Optional[torch.Tensor] = None
 
@@ -1726,8 +1672,6 @@ def _coerce_route_embs_strict(
     R = len(routes)
     dev = first.device
     dt = first.dtype
-
-    # 3) Coerce/validate route_mask
     if route_mask is None:
         route_mask = torch.ones(B, R, device=dev, dtype=dt)
     else:
@@ -1735,14 +1679,10 @@ def _coerce_route_embs_strict(
             raise TypeError(f"[routes] route_mask must be a Tensor or None, got {type(route_mask)}")
         if route_mask.ndim != 2 or route_mask.shape[0] != B or route_mask.shape[1] != R:
             raise ValueError(f"[routes] route_mask must be [B,R]=[{B},{R}], got {tuple(route_mask.shape)}")
-        # make sure it's same device/dtype (float)
         if route_mask.device != dev:
             route_mask = route_mask.to(dev)
-        if route_mask.dtype != dt:
-            route_mask = route_mask.to(dt)
-
+        route_mask = route_mask.to(device=DEVICE, dtype=torch.float32)
     return out, route_mask
-
 
 def capsule_forward_from_encoded(
     *,
@@ -1760,17 +1700,11 @@ def capsule_forward_from_encoded(
 ):
     z = {"L": outL, "N": outN, "I": outI}
 
-    # 1) Build route embeddings via MULT
     route_embs_in = make_route_inputs_mult(z, mult)
-
-    # 2) Strictly coerce + validate required routes; FAIL HARD if missing
     route_embs_in, route_mask = _coerce_route_embs_strict(route_embs_in, route_mask, ROUTE_NAMES)
-
-    # 3) Optional adapter to align dims
     if route_adapter is not None:
         route_embs_in = route_adapter(route_embs_in)
 
-    # 4) Enforce expected dimension after adapter (if projector declares d_in)
     d_in = getattr(projector, "d_in", None)
     if d_in is not None:
         d_in = int(d_in)
@@ -1783,7 +1717,6 @@ def capsule_forward_from_encoded(
             if v.shape[1] != d_in:
                 raise ValueError(f"[routes] after adapter, '{r}' dim mismatch: got {v.shape[1]} expect {d_in}")
 
-    # 5) Forward capsule head
     return forward_capsule_from_route_dict(
         route_embs_in=route_embs_in,
         projector=projector,
@@ -1793,35 +1726,6 @@ def capsule_forward_from_encoded(
         detach_priors=detach_priors,
         return_routing=return_routing,
     )
-
-def _coerce_route_embs(route_embs_in: Dict[str, Any],
-                       route_mask: Optional[torch.Tensor],
-                       routes: List[str]) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Tensor]]:
-    out: Dict[str, torch.Tensor] = {}
-    for r, v in route_embs_in.items():
-        if torch.is_tensor(v):
-            out[r] = v
-        elif isinstance(v, dict) and ("pool" in v) and torch.is_tensor(v["pool"]):
-            out[r] = v["pool"]
-        else:
-            raise TypeError(f"route_embs[{r}] is not a Tensor nor a dict with 'pool'. Got: {type(v)}")
-
-    any_v = next(iter(out.values()))
-    if any_v.ndim != 2:
-        raise ValueError(f"route embeddings must be 2D [B,D]. Got {any_v.ndim}D for some route.")
-    B, D = any_v.shape
-    dev = any_v.device
-    dt  = any_v.dtype
-    missing = [r for r in routes if r not in out]
-    if missing:
-        print("[warn] missing routes from make_route_inputs_mult:", missing)
-        for r in missing:
-            out[r] = torch.zeros(B, D, device=dev, dtype=dt)
-        if route_mask is not None:
-            for r in missing:
-                j = routes.index(r)
-                route_mask[:, j] = 0.0
-    return out, route_mask
 
 def death_logit_from_logits2(logits2: torch.Tensor) -> torch.Tensor:
     """
@@ -1952,34 +1856,44 @@ def evaluate_epoch(
             logits, prim_acts, route_embs = out[0], out[1], out[2]
             rc_raw = out[3] if len(out) > 3 else None
             rc_report = None
-
             if rc_raw is not None:
-                rc_raw = normalize_rc_shape_to_brk(rc_raw, expect_routes=N_ROUTES, name=f"{split_name}.rc_raw")
+                rc_raw = normalize_rc_shape_to_brk(
+                    rc_raw, expect_routes=N_ROUTES, name="VAL.rc_raw"
+                )
 
-                assert_probs_over_dim(rc_raw, dim=2, atol=1e-2, name=f"{split_name}.rc_raw_over_classes")
-        
-                rc_report = route_given_pheno(rc_raw, prim_acts, route_mask=route_mask)
+                rc_r_given_c, rc_c_given_r, rc_mode = coerce_rc_semantics(
+                    rc_raw, atol=1e-2, name="VAL.rc_raw"
+                )
+                print(f"[debug] VAL.rc_raw semantics = {rc_mode}")
 
-                assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name=f"{split_name}.rc_report")
+                rc_report = rc_r_given_c
 
-                if bidx == 0:
-                    expect_k = int(rc_raw.shape[2])
-                    debug_routing_tensor(rc_raw,    name="VAL.rc_raw",    expect_routes=N_ROUTES, kind="raw")
-                    debug_routing_tensor(rc_report, name="VAL.rc_report", expect_routes=N_ROUTES, kind="report")
+                rc_report = normalize_rc_shape_to_brk(
+                    rc_report, expect_routes=N_ROUTES, name="VAL.rc_report"
+                )
+                assert_routing_over_routes(
+                    rc_report, routes_dim=1, atol=1e-3, name="VAL.rc_report_over_routes"
+                )
 
-            if route_debug and (rc_raw is not None) and bidx == 0:
-                quantization_check(rc_raw, name=f"{split_name}.rc_raw")
+                if bool(getattr(CFG, "route_debug", False)) and (val_epoch == start_epoch) and (val_step == 0):
 
-
-            if route_debug and bidx == 0:
-                mask_stats(mL, name=f"{split_name}.mL_batch")
-
+                    debug_routing_tensor(
+                        rc_raw,
+                        name="VAL.rc_raw",
+                        expect_routes=N_ROUTES,
+                        kind="raw",
+                    )
+                    debug_routing_tensor(
+                        rc_report,
+                        name="VAL.rc_report",
+                        expect_routes=N_ROUTES,
+                        kind="report",
+                    )
             logits    = _safe_tensor(logits.float(),    "eval.logits(fp32)")
             prim_acts = _safe_tensor(prim_acts.float(), "eval.prim_acts(fp32)")
 
             if rc_raw is not None and rc_report is not None:
                 has_routing = True
-
                 rc_raw_cpu    = rc_raw.detach().float().cpu()       # [B,R,K]
                 rc_report_cpu = rc_report.detach().float().cpu()    # [B,R,K]
                 pa_cpu = prim_acts.detach().float().cpu()                 # [B,R]
@@ -2095,7 +2009,8 @@ def load_checkpoint(path: str, behrt, bbert, imgenc, mult, route_adapter, projec
     bbert.load_state_dict(ckpt["bbert"])
     imgenc.load_state_dict(ckpt["imgenc"])
     mult.load_state_dict(ckpt["mult"])
-    route_adapter.load_state_dict(ckpt["route_adapter"])
+    if route_adapter is not None and "route_adapter" in ckpt:
+        route_adapter.load_state_dict(ckpt["route_adapter"])
 
     projector.load_state_dict(ckpt["projector"])
     cap_head.load_state_dict(ckpt["cap_head"])
@@ -2331,15 +2246,12 @@ def epoch_metrics(y_true, p, y_pred):
     out["F1_macro"]        = float(np.nanmean(f1s))    if len(f1s) > 0 else float("nan")
     out["Recall_macro"]    = float(np.nanmean(recs))   if len(recs) > 0 else float("nan")
     out["Precision_macro"] = float(np.nanmean(precs))  if len(precs) > 0 else float("nan")
-
-    # Convenient aliases
     out["AUROC"]     = out["AUROC_macro"]
     out["AUPRC"]     = out["AUPRC_macro"]
     out["F1"]        = out["F1_macro"]
     out["Recall"]    = out["Recall_macro"]
     out["Precision"] = out["Precision_macro"]
 
-    # Micro metrics
     y_flat  = y_true.reshape(-1)
     p_flat  = p.reshape(-1)
     yp_flat = y_pred.reshape(-1)
@@ -2356,7 +2268,6 @@ def epoch_metrics(y_true, p, y_pred):
     tp = np.logical_and(y_flat == 1, yp_flat == 1).sum()
     fp = np.logical_and(y_flat == 0, yp_flat == 1).sum()
     fn = np.logical_and(y_flat == 1, yp_flat == 0).sum()
-
     micro_prec = float(tp) / float(tp + fp + 1e-8)
     micro_rec  = float(tp) / float(tp + fn + 1e-8)
 
@@ -2371,7 +2282,6 @@ def epoch_metrics(y_true, p, y_pred):
     out["F1_micro"]        = micro_f1
     out["Precision_per_label"] = prec_per_label
 
-    # Example-based F1
     example_f1s = []
     for i in range(N):
         true_i = (y_true[i] == 1)
@@ -2400,7 +2310,7 @@ def print_metrics_block(tag: str, m: Dict[str, Any], cm: bool = True):
     print(
         f"[{tag}] MACRO  "
         f"AUROC={m['AUROC']:.4f} AUPRC={m['AUPRC']:.4f} "
-        f"Precision={m.get('Precision', float('nan')):.4f} "
+        f"Precision={m.get('Precision', float('nan')):.4f} "   
         f"F1={m['F1']:.4f} Recall={m['Recall']:.4f}"
     )
     print(
@@ -2435,6 +2345,19 @@ def expected_calibration_error(p, y, n_bins=10):
         bcnt.append(int(m.sum()))
     return float(ece), mids, np.array(bconf), np.array(bacc), np.array(bcnt)
 
+def save_hist(x: np.ndarray, out_path: str, title: str, bins: int = 60):
+    x = np.asarray(x, dtype=np.float32).reshape(-1)
+    x = x[np.isfinite(x)]
+    plt.figure(figsize=(6, 4))
+    plt.hist(x, bins=bins)
+    plt.title(title)
+    plt.xlabel("death_logit = logits[:,1] - logits[:,0]")
+    plt.ylabel("count")
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"[hist] saved → {out_path}  (n={x.size}, mean={x.mean():.3f}, std={x.std():.3f}, min={x.min():.3f}, max={x.max():.3f})")
 
 def reliability_plot(bin_centers, bin_conf, bin_acc, out_path):
     plt.figure(figsize=(4, 4))
@@ -2471,7 +2394,6 @@ def find_best_thresholds(y_true, p, n_steps: int = 50):
         best_t[k] = best_thr
     return best_t
 
-
 def compute_split_prevalence(
     y_true: np.ndarray,
     split_name: str = "VAL",
@@ -2500,7 +2422,6 @@ def grid_search_thresholds(
     for k in range(K):
         yk = y_true[:, k]
         pk = p[:, k]
-
         if len(np.unique(yk)) < 2:
             continue
         best = 0.0
@@ -2514,7 +2435,6 @@ def grid_search_thresholds(
         best_thr[k] = best_t
         best_f1[k] = best
     return best_thr, best_f1
-
 
 def save_split_thresholds(
     thr: np.ndarray,
@@ -2534,25 +2454,15 @@ def generate_split_heatmaps_and_tables(
     behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
     amp_ctx_enc,
     amp_ctx_caps,
-    loss_fn,  # ✅ add this
+    loss_fn, 
     label_names: List[str],
     ckpt_dir: str,
     T_cal: Optional[float] = None,
     thr_val: Optional[np.ndarray] = None,
 ):
-
-    """
-    Creates & saves (TRAIN/TEST only):
-      1) Primary activations heatmap (1xN_ROUTES)  [raw + norm saved/printed]
-      2) Effective weights heatmap (KxN_ROUTES)    [raw + norm saved/printed]
-      3) Mean routing coeff heatmap (KxN_ROUTES)   [raw + norm saved/printed]
-      4) AUROC per label heatmap (1xK)      [raw + norm saved/printed]
-      5) Prevalence per label heatmap (1xK) [raw + norm saved/printed]
-      6) AUROC+Prevalence combined heatmap (2xK) [raw + norm saved/printed]
-    """
     routes = ROUTE_NAMES
-    CLASS_NAMES  = ["alive", "death"]  # routing K=2
-    METRIC_NAMES = ["death"]          # metric K=1
+    CLASS_NAMES  = ["alive", "death"] 
+    METRIC_NAMES = ["death"]          
 
     out_dir = os.path.join(ckpt_dir, "heatmaps", split_name.lower())
     os.makedirs(out_dir, exist_ok=True)
@@ -2567,7 +2477,6 @@ def generate_split_heatmaps_and_tables(
         routing_out_dir=None,
     )
 
-    # pa_vec: [10], eff_mat: [N_ROUTES,K], rc_mat: [10,K]
     if rc_mat is None:
         raise RuntimeError(f"[{split_name}] rc_mat is None; routing_coef not returned in forward.")
 
@@ -2586,7 +2495,6 @@ def generate_split_heatmaps_and_tables(
     if T_cal is not None:
         dlogit = dlogit / float(T_cal)
     p = sigmoid_np(dlogit)                       # [N,1]
-
 
     if thr_val is not None:
         thr_val = np.asarray(thr_val, dtype=np.float32).reshape(-1)         # [1]
@@ -2611,14 +2519,12 @@ def generate_split_heatmaps_and_tables(
         out_path=os.path.join(out_dir, f"{split_name.lower()}_primary_activations.png"),
         fontsize_cell=12, fontsize_ticks=11
     )
-
     rc_norm, _, _ = save_array_with_versions(
         rc_k10, out_dir, f"{split_name.lower()}_p_route_given_pheno_kxr",
         row_names=CLASS_NAMES, col_names=routes,
         print_title=f"[{split_name}] p(route | label) [KxR] (raw + normalized)",
         norm_fn=normalize_routes_per_phenotype,
     )
-
     save_heatmap_with_numbers(
         mat_norm=rc_norm,
         mat_raw=rc_k10,
@@ -2629,7 +2535,6 @@ def generate_split_heatmaps_and_tables(
         fontsize_cell=6,
         fontsize_ticks=9
     )
-
     auroc_norm, _, _ = save_array_with_versions(
         auroc_per, out_dir, f"{split_name.lower()}_auroc_per_label",
         row_names=None, col_names=METRIC_NAMES,
@@ -2707,6 +2612,30 @@ class BinaryFocalLoss(nn.Module):
             return loss.sum()
         return loss
 
+def subgroup_report_by_chunks(y_true: np.ndarray, p: np.ndarray, chunk_counts: List[int], thr: float, tag: str):
+    cc = np.asarray(chunk_counts, dtype=int)
+    y_true = np.asarray(y_true).reshape(-1)
+    p = np.asarray(p).reshape(-1)
+
+    buckets = {
+        "0-1": (cc <= 1),
+        "2-3": (cc >= 2) & (cc <= 3),
+        "4+":  (cc >= 4),
+    }
+
+    print(f"\n[{tag}] Subgroup metrics by valid note chunks (thr={thr:.4f}):")
+    for name, m in buckets.items():
+        n = int(m.sum())
+        if n < 30:
+            print(f"  bucket {name}: n={n} (skip: too small)")
+            continue
+        yt = y_true[m].reshape(-1, 1)
+        pt = p[m].reshape(-1, 1)
+        yp = (pt >= thr).astype(int)
+        mm = epoch_metrics(yt, pt, yp)
+        print(f"  bucket {name}: n={n} AUROC={mm['AUROC']:.4f} AUPRC={mm['AUPRC']:.4f} F1={mm['F1']:.4f} Prec={mm['Precision']:.4f} Rec={mm['Recall']:.4f}")
+
+
 def main():
     import env_config as E
 
@@ -2773,10 +2702,9 @@ def main():
     scaler = GradScaler(enabled=(use_amp and precision in {"auto", "fp16"}))
     print(f"[amp] use_amp={use_amp} precision={precision} scaler_enabled={scaler.is_enabled()}")
 
-    # Datasets
     train_ds = ICUStayDataset(args.data_root, split="train")
-    CLASS_NAMES  = ["alive", "death"]   # routing/K=2
-    METRIC_NAMES = ["death"]            # metrics/K=1
+    CLASS_NAMES  = ["alive", "death"]  
+    METRIC_NAMES = ["death"]            
     num_labels   = 2
 
     CFG.structured_n_feats = int(getattr(CFG, "structured_n_feats", 76) or 76)
@@ -2798,16 +2726,12 @@ def main():
     pos_counts = train_label_df[train_ds.label_cols].sum(axis=0).values
     neg_counts = N_train - pos_counts
     pos_weight = neg_counts / (pos_counts + 1e-6)
-    # Make a mapping stay_id -> label (0/1) for TRAIN ids
     sid_to_y = dict(
         zip(
             train_label_df["stay_id"].astype(int).tolist(),
             train_label_df[train_ds.label_cols[0]].astype(float).fillna(0.0).gt(0.0).astype(int).tolist()
         )
     )
-
-    # Per-sample weights (bigger weight for positive class)
-    # Common choice: w_pos = N_neg / N_pos, w_neg = 1
     pos = float(pos_counts[0])
     neg = float(neg_counts[0])
     w_pos = (neg / (pos + 1e-6))
@@ -2821,14 +2745,12 @@ def main():
     sample_weights = torch.tensor(sample_weights, dtype=torch.double)
     train_sampler = WeightedRandomSampler(
         weights=sample_weights,
-        num_samples=len(sample_weights),   # one "epoch" ~ same size
+        num_samples=len(sample_weights),   
         replacement=True
     )
     print(f"[sampler] WeightedRandomSampler enabled: w_pos={w_pos:.3f} w_neg={w_neg:.3f}")
 
-
-    # Prevent extreme imbalance from exploding gradients
-    max_pw = float(_cfg("pos_weight_max", 20.0))
+    max_pw = float(getattr(CFG, "max_pos_weight", 20.0))
     pos_weight = np.clip(pos_weight, 1.0, max_pw)
     print(f"[loss] pos_weight: min={pos_weight.min():.3f} max={pos_weight.max():.3f} (clamped to {max_pw})")
     
@@ -2839,15 +2761,13 @@ def main():
     loss_fn_train = BinaryFocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction="mean").to(DEVICE)
     print(f"[loss] TRAIN focal: alpha={focal_alpha:.3f} gamma={focal_gamma:.2f} (train_prev={train_prev:.4f})")
 
-    # 2) Eval with BCE (for clean calibration / temperature scaling)
-    bce_eval = nn.BCEWithLogitsLoss()  # no pos_weight here; probabilities stay interpretable
+    bce_eval = nn.BCEWithLogitsLoss()  
     print("[loss] EVAL  = BCEWithLogitsLoss() (no pos_weight)")
 
     val_ds   = ICUStayDataset(args.data_root, split="val")
     test_ds  = ICUStayDataset(args.data_root, split="test")
-
-    collate_train = collate_fn_factory(tidx=TASK_MAP[args.task], img_tfms=build_image_transform("train"))
-    collate_eval  = collate_fn_factory(tidx=TASK_MAP[args.task], img_tfms=build_image_transform("val"))
+    collate_train = collate_fn_factory(img_tfms=build_image_transform("train"))
+    collate_eval  = collate_fn_factory(img_tfms=build_image_transform("val"))
     pin = use_cuda
     g_train = torch.Generator()
     g_train.manual_seed(int(CFG.seed) + 123)
@@ -2857,8 +2777,8 @@ def main():
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=False,                  # MUST be False with sampler
-        sampler=train_sampler,          # <-- add this
+        shuffle=False,                 
+        sampler=train_sampler,         
         num_workers=args.num_workers,
         pin_memory=pin,
         collate_fn=collate_train,
@@ -2868,7 +2788,6 @@ def main():
         persistent_workers=(args.num_workers > 0),
         prefetch_factor=4 if args.num_workers > 0 else None,
     )
-
 
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
@@ -2889,7 +2808,7 @@ def main():
     )
 
     train_eval_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=False,
+        train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=pin,
         collate_fn=collate_eval,
         worker_init_fn=seed_worker,
@@ -2984,7 +2903,6 @@ def main():
     )
 
     encoder_warmup_epochs = int(getattr(args, "encoder_warmup_epochs", _cfg("encoder_warmup_epochs", 2)))
-
     enc_params: List[torch.nn.Parameter] = []
     head_params: List[torch.nn.Parameter] = []
 
@@ -3032,59 +2950,39 @@ def main():
         start_epoch = load_checkpoint(args.resume, behrt, bbert, imgenc, mult, route_adapter, projector, cap_head, optimizer)
 
     printed_once = False
-
     route_dropout_p       = float(_cfg("route_dropout_p", 0.0))
     routing_warmup_epochs = int(_cfg("routing_warmup_epochs", 5))
-
     route_entropy_lambda        = float(_cfg("route_entropy_lambda", 0.0))
     route_entropy_warmup_epochs = int(_cfg("route_entropy_warmup_epochs", 0.0))
     entropy_use_rc              = bool(_cfg("entropy_use_rc", False))  # compatibility only
-
     route_uniform_lambda        = float(_cfg("route_uniform_lambda", 0.0))
     route_uniform_warmup_epochs = int(_cfg("route_uniform_warmup_epochs", 0))
-
     routing_warmup_epochs        = max(0, int(routing_warmup_epochs))
-    route_entropy_warmup_epochs  = max(0.0, float(route_entropy_warmup_epochs))
+    route_entropy_warmup_epochs = max(0, int(route_entropy_warmup_epochs))
     route_uniform_warmup_epochs = max(0, route_uniform_warmup_epochs)
-
     max_train_patients = int(os.environ.get("MIMICIV_MAX_TRAIN_PATIENTS", "-1"))
     seen_patients = 0
     stop_training = False
-
-    # Epoch-level early stopping based on VAL macro AUROC
     best_val_auroc    = -float("inf")
     best_ckpt_auroc   = -float("inf")
     epochs_no_improve = 0
-
     patience_epochs = int(_cfg("patience_epochs", 5))     
     min_delta       = float(_cfg("min_delta", 1e-4))      
     min_epochs      = int(_cfg("min_epochs", 20))         
-
     patience_epochs = max(1, patience_epochs)
     min_epochs      = max(0, min_epochs)
     min_delta       = max(0.0, min_delta)
   
-
     # Training loop
     for epoch in range(start_epoch, args.epochs):
-
         if stop_training:
             print(f"[debug] Early stop flag set → breaking before epoch {epoch + 1}.")
             break
 
         if (epoch - start_epoch) < encoder_warmup_epochs:
-            # warmup: freeze encoder lr, keep head lr at base
             optimizer.param_groups[0]["lr"] = 0.0
             optimizer.param_groups[1]["lr"] = args.lr
         else:
-            # post-warmup: DO NOT reset lrs here — scheduler will manage them
-            pass
-
-        if (epoch - start_epoch) < encoder_warmup_epochs:
-            optimizer.param_groups[0]["lr"] = 0.0
-            optimizer.param_groups[1]["lr"] = args.lr
-        else:
-            # don't override scheduler
             pass
 
         enc_lr  = float(optimizer.param_groups[0]["lr"])
@@ -3101,7 +2999,6 @@ def main():
             behrt.train()
             imgenc.train()
         else:
-            # frozen -> avoid BN/Dropout updates
             behrt.eval()
             imgenc.eval()
 
@@ -3137,7 +3034,6 @@ def main():
                 pretty_print_small_batch(xL, mL, notes, dbg, k=3)
 
             optimizer.zero_grad(set_to_none=True)
-
             dbg_once = (epoch == start_epoch) and (step == 0)
             outL, outN, outI = encode_all_modalities(
                 behrt, bbert, imgenc,
@@ -3164,8 +3060,8 @@ def main():
                         drop_idx2 = int(torch.randint(low=0, high=N_ROUTES, size=(1,), device=DEVICE))
                         route_mask[:, drop_idx2] = 0.0
 
-                
-                detach_priors_flag = (epoch - start_epoch) < routing_warmup_epochs
+                detach_priors_flag = False
+
                 temp = 2.0 if (epoch - start_epoch) < 2 else 1.0   
 
                 out = capsule_forward_from_encoded(
@@ -3180,24 +3076,24 @@ def main():
                     return_routing=True,
                 )
                 logits, prim_acts, route_embs = out[0], out[1], out[2]
-
                 rc_raw = out[3] if len(out) > 3 else None
-
                 rc_report = None
                 if rc_raw is not None:
-                    rc_raw = normalize_rc_shape_to_brk(rc_raw, expect_routes=N_ROUTES, name="TRAIN.rc_raw")
+                    rc_raw = normalize_rc_shape_to_brk(
+                        rc_raw, expect_routes=N_ROUTES, name="TRAIN.rc_raw"
+                    )
+                    rc_r_given_c, rc_c_given_r, rc_mode = coerce_rc_semantics(
+                        rc_raw, atol=1e-2, name="TRAIN.rc_raw"
+                    )
+                    print(f"[debug] TRAIN.rc_raw semantics = {rc_mode}")
 
-                    # rc_raw is per-route class distribution -> check over classes
-                    assert_probs_over_dim(rc_raw, dim=2, atol=1e-2, name="TRAIN.rc_raw_over_classes")
-
-                    rc_report = route_given_pheno(rc_raw, prim_acts, route_mask=route_mask)
-
+                    rc_report = rc_r_given_c
                     rc_report = normalize_rc_shape_to_brk(
                         rc_report, expect_routes=N_ROUTES, name="TRAIN.rc_report"
                     )
-
-                    assert_routing_over_routes(rc_report, routes_dim=1, atol=1e-3, name="TRAIN.rc_report")
-
+                    assert_routing_over_routes(
+                        rc_report, routes_dim=1, atol=1e-3, name="TRAIN.rc_report_over_routes"
+                    )
                     if bool(getattr(args, "route_debug", False)) and (epoch == start_epoch) and (step == 0):
                         debug_routing_tensor(
                             rc_raw,
@@ -3211,11 +3107,8 @@ def main():
                             expect_routes=N_ROUTES,
                             kind="report",
                         )
-
-
                 logits    = _safe_tensor(logits.float(),     "logits(fp32)")
                 prim_acts = _safe_tensor(prim_acts.float(), "prim_acts(fp32)")
-
 
                 if _has_nonfinite(logits, prim_acts):
                     print(f"[skip] non-finite capsule outputs at epoch={epoch+1} step={step+1} -> skip")
@@ -3223,7 +3116,6 @@ def main():
                     continue
 
                 y_f = y.view(-1, 1).float()
-
                 death_logit = death_logit_from_logits2(logits)     # [B,1]
                 if (epoch == start_epoch) and (step == 0):
                     print("[sanity] logits[0] =", logits[0].detach().float().cpu().tolist())
@@ -3232,25 +3124,34 @@ def main():
                     if rc_raw is not None:
                         print("[sanity] rc_raw sum over classes (mean) =", float(rc_raw.sum(dim=2).mean().detach().cpu()))
 
-
-                loss = loss_fn_train(death_logit, y_f)
-
-                cur_epoch = float(epoch + 1) 
-
-                if route_entropy_lambda > 0.0 and (route_entropy_warmup_epochs <= 0 or cur_epoch <= route_entropy_warmup_epochs):
-                    pa = prim_acts / (prim_acts.sum(dim=1, keepdim=True) + 1e-6)
+                base_loss = loss_fn_train(death_logit, y_f)   # focal BCE part (>=0 typically)
+                ent_bonus = torch.zeros((), device=DEVICE, dtype=base_loss.dtype)
+                uniform_pen = torch.zeros((), device=DEVICE, dtype=base_loss.dtype)
+                cur_epoch = float(epoch + 1)
+                if route_entropy_lambda > 0.0 and (route_entropy_warmup_epochs <= 0 or cur_epoch >= route_entropy_warmup_epochs):
+                    pa = torch.relu(prim_acts)
+                    pa = pa / (pa.sum(dim=1, keepdim=True) + 1e-6)
                     pa = torch.clamp(pa, 1e-6, 1.0)
                     H = -(pa * pa.log()).sum(dim=1).mean()
-                    loss = loss - route_entropy_lambda * H
 
-                if route_uniform_lambda > 0.0 and (route_uniform_warmup_epochs <= 0 or cur_epoch <= route_uniform_warmup_epochs):
+                    ent_bonus = route_entropy_lambda * H  
+
+                if route_uniform_lambda > 0.0 and (route_uniform_warmup_epochs <= 0 or cur_epoch >= route_uniform_warmup_epochs):
                     pa_dist = prim_acts / (prim_acts.sum(dim=1, keepdim=True) + 1e-6)
                     p_mean = pa_dist.mean(dim=0)
                     target = torch.full_like(p_mean, 1.0 / p_mean.numel())
-                    uniform_loss = ((p_mean - target) ** 2).sum()
-                    loss = loss + route_uniform_lambda * uniform_loss
+                    uniform_pen = route_uniform_lambda * ((p_mean - target) ** 2).sum()
 
+                loss = base_loss - ent_bonus + uniform_pen
 
+            if (step == 0 and epoch == start_epoch) or (args.log_every > 0 and ((step + 1) % args.log_every == 0)):
+                print(
+                    f"[loss_parts] epoch={epoch+1} step={step+1} "
+                    f"base={float(base_loss.detach().cpu()):.4f} "
+                    f"-ent={float(ent_bonus.detach().cpu()):.4f} "
+                    f"+uniform={float(uniform_pen.detach().cpu()):.4f} "
+                    f"=total={float(loss.detach().cpu()):.4f}"
+                )
 
             grad_clip = float(_cfg("grad_clip", 0.3))
             if not torch.isfinite(loss):
@@ -3267,7 +3168,6 @@ def main():
                     print(f"[skip] non-finite grads (AMP) at epoch={epoch+1} step={step+1} -> skip")
                     safe_zero_grad(optimizer)
                     continue
-
                 scaler.step(optimizer)
                 scaler.update()
             else:
@@ -3280,12 +3180,10 @@ def main():
                 optimizer.step()
             safe_zero_grad(optimizer)
             total_loss += float(loss.item()) * y.size(0)
-
             p_death = prob_death_from_death_logit(death_logit).view(-1)  # [B]
             pred = (p_death >= 0.5).long()
             total_correct += (pred == y).sum().item()
             total += y.numel()
-
             act_sum += prim_acts.detach().cpu().sum(dim=0)
             num_samples += y.size(0)
 
@@ -3304,16 +3202,11 @@ def main():
                 )
                 if (rc_raw is not None) and (rc_report is not None):
                     raw_death = rc_raw[:, :, 1].mean(dim=0)   # [R] = E_b p(death|route)
-
                     rep_death = rc_report[:, :, 1].mean(dim=0)  # [R] = E_b p(route|death)
-
                     pa_mean = prim_acts.mean(dim=0)  # [R]
-
                     msg += " | [p(death|route)] " + " | ".join(f"{r}:{raw_death[i]:.3f}" for i,r in enumerate(ROUTE_NAMES))
                     msg += " | [p(route|death)] " + " | ".join(f"{r}:{rep_death[i]:.3f}" for i,r in enumerate(ROUTE_NAMES))
                     msg += " | [prim_act mean] " + " | ".join(f"{r}:{pa_mean[i]:.3f}"   for i,r in enumerate(ROUTE_NAMES))
-
-
                 print(msg)
                 if max(avg_act) > 0.95:
                     dom_route = int(np.argmax(avg_act))
@@ -3321,17 +3214,13 @@ def main():
                         f"[alert] potential collapse → route={routes[dom_route]} "
                         f"mean={max(avg_act):.3f}"
                     )
-
-        # Epoch summary (TRAIN)
         train_loss = total_loss / max(1, num_samples)
         train_acc  = total_correct / max(1, total)
-
         train_avg_act = (act_sum / max(1, num_samples)).tolist()
         print(
             f"[epoch {epoch + 1}] TRAIN loss={train_loss:.4f} acc={train_acc:.4f} "
             f"avg_prim_act={', '.join(f'{a:.3f}' for a in train_avg_act)}"
         )
-
         # VAL metrics (BCE + 0.5 threshold / F1-based thresholds)
         val_loss, val_acc, val_act, val_rc_mat, val_pa = evaluate_epoch(
             behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
@@ -3345,19 +3234,16 @@ def main():
             routing_out_dir=os.path.join(ckpt_dir, "routing"),
         )
 
-        # Routing importance: global and per-phenotype (VAL) 
         routes = ROUTE_NAMES
         ROUTING_CLASS_NAMES = ["alive", "death"]  
         METRIC_NAMES        = ["death"]           
 
         if val_rc_mat is not None:
-            # Data-derived mean routing coefficients per route (averaged over phenotypes)
             rc_mean_val = val_rc_mat.mean(axis=1)   # [N_ROUTES]
             print("\n[epoch %d] [VAL] mean routing coefficient per route (data-derived):" % (epoch + 1))
             for i, r in enumerate(routes):
                 print(f"  rc_mean_{r} = {rc_mean_val[i]:.4f}")
 
-            # Per-route, per-phenotype routing importance (N_ROUTES x K) from routing coefficients
             K = val_rc_mat.shape[1]
             names = ROUTING_CLASS_NAMES if len(ROUTING_CLASS_NAMES) >= K else [f"class_{k}" for k in range(K)]
 
@@ -3374,11 +3260,10 @@ def main():
             detach_priors=False,
 
         )
-
         best_thr = find_best_thresholds(y_true, p1, n_steps=50)
         y_pred = (p1 >= best_thr[np.newaxis, :]).astype(int)
         m = epoch_metrics(y_true, p1, y_pred)
-
+        print(f"[epoch {epoch + 1}] VAL threshold used (F1-search on VAL) = {float(best_thr[0]):.4f}")
         print(
             f"[epoch {epoch + 1}] VAL MACRO  "
             f"AUROC={m['AUROC']:.4f} AUPRC={m['AUPRC']:.4f} Precision={m['Precision']:.4f}"
@@ -3414,8 +3299,6 @@ def main():
         
         val_macro_auroc = float(m["AUROC"])   # macro AUROC
         scheduler.step(val_macro_auroc)
-
-        # optional: log current lr
         cur_lrs = [pg["lr"] for pg in optimizer.param_groups]
         print(f"[lr] after plateau-step: {cur_lrs}")
 
@@ -3439,8 +3322,6 @@ def main():
                     f"[early-stop] No improvement but epoch {epoch + 1} < min_epochs={min_epochs} "
                     f"→ not counting patience yet."
                 )
-
-
         # Calibration
         ece, centers, bconf, bacc, bcnt = expected_calibration_error(
             p1.reshape(-1), y_true.reshape(-1), n_bins=args.calib_bins
@@ -3474,7 +3355,7 @@ def main():
         
         if is_best:
             save_checkpoint(os.path.join(ckpt_dir, "best.pt"), ckpt)
-            print(f"[epoch {epoch + 1}] Saved BEST checkpoint (VAL AUROC={val_score:.4f} | val_acc@0.5={float(val_acc):.4f})")
+            print(f"[epoch {epoch + 1}] Saved BEST checkpoint (VAL AUROC={val_score:.4f} | acc@0.5(debug)={float(val_acc):.4f})")
 
     # TEST evaluation using BEST checkpoint
     print("[main] Evaluating BEST checkpoint on TEST...")
@@ -3508,7 +3389,6 @@ def main():
         f"avg_prim_act={', '.join(f'{k}:{v:.3f}' for k, v in test_act.items())}"
     )
 
-    # Routing importance: global and per-phenotype (TEST) 
     routes = ROUTE_NAMES
 
     if test_rc_mat is not None:
@@ -3517,7 +3397,6 @@ def main():
         for i, r in enumerate(routes):
             print(f"  rc_mean_{r} = {rc_mean_test[i]:.4f}")
 
-        # mortality-only: K should be 1, label_names already comes from train_ds.label_cols
         K = int(test_rc_mat.shape[1])
         names = (label_names[:K] if label_names is not None else [f"label_{k}" for k in range(K)])
 
@@ -3526,9 +3405,7 @@ def main():
             row = " | ".join(f"{names[k]}:{test_rc_mat[i, k]:.3f}" for k in range(K))
             print(f"  {r}: {row}")
 
-        # Heatmap (labels on y-axis, routes on x-axis)
         mat_test = test_rc_mat.T  # [K, R]
-
         plt.figure(figsize=(10, max(3, 0.5 * K + 2)))
         im = plt.imshow(mat_test, aspect="auto")
         plt.colorbar(im, label="p(route | label)")
@@ -3538,26 +3415,24 @@ def main():
         plt.ylabel("Label")
         plt.title("Per-route routing importance (TEST)")
         plt.tight_layout()
-
         fname = os.path.join(ckpt_dir, "routing_test_p_route_given_label.png")
         plt.savefig(fname, dpi=300)
         plt.close()
         print(f"[routing] saved TEST per-route map → {fname}")
 
-    # Compute prevalence & thresholds on VAL
     y_true_v_log, logits_v, _ = collect_epoch_logits(
         val_loader, behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
         amp_ctx_enc, amp_ctx_caps
     )
 
-    # Fit temperature on VAL only 
     T_star = fit_temperature_scalar_bce_from_val(logits_v, y_true_v_log, max_iter=300, lr=0.05)
     print(f"[calibration] Fitted temperature on VAL only (BCE): T={T_star:.4f}")
 
-    # Convert to [N,1] for threshold utilities
     y_true_v = np.asarray(y_true_v_log).reshape(-1, 1).astype(np.float32)   # [N,1]
 
-    dlogit_v = death_logit_from_logits2_np(logits_v)               # [N,1]
+    dlogit_v = death_logit_from_logits2_np(logits_v)  # [N,1]
+    save_hist(dlogit_v, os.path.join(ckpt_dir, "hist_val_dlogit.png"), "VAL death_logit histogram (uncalibrated)")
+
     p_v      = sigmoid_np(apply_temperature_to_death_logit_np(dlogit_v, T_star))
 
     prev_val = compute_split_prevalence(y_true_v, split_name="VAL", label_names=["death"])
@@ -3568,15 +3443,19 @@ def main():
         test_loader, behrt, bbert, imgenc, mult, route_adapter, projector, cap_head, amp_ctx_enc, amp_ctx_caps
     )
 
-    # Uncalibrated + calibrated probabilities on TEST
     y_true_t = np.asarray(y_true_t_log).reshape(-1, 1).astype(np.float32)  # [N,1]
 
-    dlogit_t = death_logit_from_logits2_np(logits_t)          # [N,1]
+    dlogit_t = death_logit_from_logits2_np(logits_t)  # [N,1]
+    save_hist(dlogit_t, os.path.join(ckpt_dir, "hist_test_dlogit.png"), "TEST death_logit histogram (uncalibrated)")
+
     p_test_uncal = sigmoid_np(dlogit_t)
 
-    dlogit_t_cal = dlogit_t / float(T_star)
-    p_test_cal   = sigmoid_np(dlogit_t_cal)
+    dlogit_v_cal = dlogit_v / float(T_star)
+    save_hist(dlogit_v_cal, os.path.join(ckpt_dir, "hist_val_dlogit_cal.png"), f"VAL death_logit histogram (calibrated, T={T_star:.3f})")
 
+    dlogit_t_cal = dlogit_t / float(T_star)
+    save_hist(dlogit_t_cal, os.path.join(ckpt_dir, "hist_test_dlogit_cal.png"), f"TEST death_logit histogram (calibrated, T={T_star:.3f})")
+    p_test_cal   = sigmoid_np(dlogit_t_cal)
 
     y_pred_unc_05 = (p_test_uncal >= 0.5).astype(int)
     m_unc_05 = epoch_metrics(y_true_t, p_test_uncal, y_pred_unc_05)
@@ -3595,11 +3474,10 @@ def main():
     print(f"  Threshold (VAL): {thr_val[0]:.4f}")
     print(f"  TEST AUROC: {m_cal_valthr['AUROC']:.4f}")
     print(f"  TEST AUPRC: {m_cal_valthr['AUPRC']:.4f}")
-    print(f"  TEST F1:    {m_cal_valthr['F1']:.4f}")
-    print(f"  TEST Prec:  {m_cal_valthr['Precision']:.4f}")
-    print(f"  TEST Rec:   {m_cal_valthr['Recall']:.4f}")
+    print(f"  TEST F1: {m_cal_valthr['F1']:.4f}")
+    print(f"  TEST Precision: {m_cal_valthr.get('Precision', float('nan')):.4f}")
+    print(f"  TEST Recall: {m_cal_valthr['Recall']:.4f}")
     print("="*80 + "\n")
-
 
     y_pred_unc_valthr = (p_test_uncal >= thr_val[np.newaxis, :]).astype(int)
     m_unc_valthr = epoch_metrics(y_true_t, p_test_uncal, y_pred_unc_valthr)
@@ -3616,9 +3494,7 @@ def main():
     )   
     print(f"[TEST] ECE({args.calib_bins} bins) CALIBRATED(T from VAL) = {ece_cal:.4f}")
     reliability_plot(centers_cal, bconf_cal, bacc_cal, out_path=os.path.join(ckpt_dir, "reliability_test_cal.png"))
-
     print("\n[main] Generating FINAL normalized heatmaps (TRAIN + TEST only) from BEST checkpoint...")
-
     generate_split_heatmaps_and_tables(
         split_name="TRAIN",
         loader=train_eval_loader,
@@ -3632,7 +3508,6 @@ def main():
         T_cal=T_star,
         thr_val=thr_val,
     )
-
     generate_split_heatmaps_and_tables(
         split_name="TEST",
         loader=test_loader,
@@ -3646,7 +3521,5 @@ def main():
         T_cal=T_star,
         thr_val=thr_val,
     )
-
-
 if __name__ == "__main__":
     main()
