@@ -58,32 +58,57 @@ def grads_are_finite(param_list):
 class EMA:
     def __init__(self, model_list, decay=0.999):
         self.decay = float(decay)
-        self.shadow = []
-        for m in model_list:
-            self.shadow.append({k: v.detach().clone() for k, v in m.state_dict().items()})
+        self.model_list = list(model_list)
 
-        self.model_list = model_list
+        # one shadow dict per model
+        self.shadow = [
+            {k: v.detach().clone() for k, v in m.state_dict().items()}
+            for m in self.model_list
+        ]
+        self.backup = None
 
     @torch.no_grad()
     def update(self):
+        d = self.decay
         for m, sh in zip(self.model_list, self.shadow):
             msd = m.state_dict()
-            for k in msd.keys():
-                sh[k].mul_(self.decay).add_(msd[k].detach(), alpha=(1.0 - self.decay))
+            for k, v in msd.items():
+                if k not in sh:
+                    sh[k] = v.detach().clone()
+                    continue
+
+                # non-float buffers/params: just copy (e.g., num_batches_tracked)
+                if not torch.is_floating_point(v):
+                    sh[k].copy_(v)
+                    continue
+
+                # ensure shadow matches device/dtype
+                if sh[k].device != v.device:
+                    sh[k] = sh[k].to(device=v.device)
+                if sh[k].dtype != v.dtype:
+                    sh[k] = sh[k].to(dtype=v.dtype)
+
+                sh[k].mul_(d).add_(v.detach(), alpha=(1.0 - d))
 
     @torch.no_grad()
     def apply_to(self):
-        self.backup = []
-        for m in self.model_list:
-            self.backup.append({k: v.detach().clone() for k, v in m.state_dict().items()})
+        # backup current weights
+        self.backup = [
+            {k: v.detach().clone() for k, v in m.state_dict().items()}
+            for m in self.model_list
+        ]
+        # load EMA weights
         for m, sh in zip(self.model_list, self.shadow):
             m.load_state_dict(sh, strict=True)
 
     @torch.no_grad()
     def restore(self):
+        if self.backup is None:
+            return
         for m, bk in zip(self.model_list, self.backup):
             m.load_state_dict(bk, strict=True)
         self.backup = None
+
 
 def safe_zero_grad(optimizer):
     optimizer.zero_grad(set_to_none=True)
@@ -227,7 +252,9 @@ def encode_all_modalities(
             if pad_chunks.any():
                 notes_ids  = notes_ids.clone()
                 notes_attn = notes_attn.clone()
-                cls_id = int(getattr(TOKENIZER, "cls_token_id", 101))
+                assert TOKENIZER is not None, "TOKENIZER must be initialized in main()"
+                cls_id = int(TOKENIZER.cls_token_id)
+
                 b_idx, s_idx = pad_chunks.nonzero(as_tuple=True)
                 notes_ids[b_idx, s_idx, :] = 0
                 notes_attn[b_idx, s_idx, :] = 0
@@ -642,13 +669,11 @@ def _chunk_long_ids(ids: List[int], attn: List[int], maxlen: int, stride: int):
         i += step
     return out_ids, out_attn
 
-def prepare_notes_batch(notes_batch: List[Dict[str, Any]]):
+def prepare_notes_batch(notes_batch):
     global TOKENIZER, MAXLEN
+    MAXLEN = int(getattr(CFG, "max_text_len", 512))
     if TOKENIZER is None:
-        from transformers import AutoTokenizer
-        TOKENIZER = AutoTokenizer.from_pretrained(CFG.text_model_name)
-        MAXLEN = int(getattr(CFG, "max_text_len", 512))
-
+        raise RuntimeError("TOKENIZER is None inside collate/worker. Initialize TOKENIZER in main().")
     out = []
     pad_id = int(getattr(TOKENIZER, "pad_token_id", 0) or 0)
     L = int(_cfg("max_text_len", 512))
@@ -1048,9 +1073,15 @@ def coerce_rc_semantics(rc_raw: torch.Tensor, atol: float = 1e-2, name: str = "r
             rc_r_given_c = rc_raw / (rc_raw.sum(dim=1, keepdim=True) + 1e-6)
             mode = "class_given_route"
         elif route_norm_ok and class_norm_ok:
-            rc_r_given_c = rc_raw
-            rc_c_given_r = rc_raw / (rc_raw.sum(dim=2, keepdim=True) + 1e-6)
-            mode = "both_ok_assume_route_given_class"
+            if err_routes <= err_classes:
+                rc_r_given_c = rc_raw
+                rc_c_given_r = rc_raw / (rc_raw.sum(dim=2, keepdim=True) + 1e-6)
+                mode = "both_ok_choose_route_given_class"
+            else:
+                rc_c_given_r = rc_raw
+                rc_r_given_c = rc_raw / (rc_raw.sum(dim=1, keepdim=True) + 1e-6)
+                mode = "both_ok_choose_class_given_route"
+
         else:
             raise AssertionError(
                 f"{name}: not normalized over routes or classes.\n"
@@ -1709,9 +1740,11 @@ def capsule_forward_from_encoded(
     z = {"L": outL, "N": outN, "I": outI}
 
     route_embs_in = make_route_inputs_mult(z, mult)
-    route_embs_in, route_mask = _coerce_route_embs_strict(route_embs_in, route_mask, ROUTE_NAMES)
+
     if route_adapter is not None:
         route_embs_in = route_adapter(route_embs_in)
+    route_embs_in, route_mask = _coerce_route_embs_strict(route_embs_in, route_mask, ROUTE_NAMES)
+
 
     d_in = getattr(projector, "d_in", None)
     if d_in is not None:
@@ -1879,7 +1912,8 @@ def evaluate_epoch(
                 rc_r_given_c, rc_c_given_r, rc_mode = coerce_rc_semantics(
                     rc_raw, atol=1e-2, name="VAL.rc_raw"
                 )
-                print(f"[debug] VAL.rc_raw semantics = {rc_mode}")
+                if (epoch_idx is not None) and (int(epoch_idx) == 1) and (bidx == 0):
+                    print(f"[debug] VAL.rc_raw semantics = {rc_mode}")
 
                 rc_report = rc_r_given_c
 
@@ -2752,8 +2786,16 @@ def main():
 
     pos = float(pos_counts[0])
     neg = float(neg_counts[0])
-    w_pos = (neg / (pos + 1e-6))
+    w_pos_raw = (neg / (pos + 1e-6))
+
+        # gentler oversampling (pick ONE)
+    w_pos = np.sqrt(w_pos_raw)                 # recommended: softer than full ratio
+    # w_pos = np.log1p(w_pos_raw)              # even gentler
+
+    # clamp so it can’t explode
+    w_pos = float(np.clip(w_pos, 1.0, 5.0))    # tune 3–10; start with 5
     w_neg = 1.0
+
 
     sample_weights = []
     for sid in train_ds.ids:
@@ -2768,24 +2810,17 @@ def main():
     )
     print(f"[sampler] WeightedRandomSampler enabled: w_pos={w_pos:.3f} w_neg={w_neg:.3f}")
 
-    max_pw = float(getattr(CFG, "max_pos_weight", 20.0))
-    pos_weight = np.clip(pos_weight, 1.0, max_pw)
-    print(f"[loss] pos_weight: min={pos_weight.min():.3f} max={pos_weight.max():.3f} (clamped to {max_pw})")
-    
-    train_prev = float(pos_counts[0] / max(1.0, float(N_train)))
-    default_alpha = 0.75 if train_prev < 0.20 else 0.50
-    focal_alpha = float(np.clip(getattr(CFG, "focal_alpha", default_alpha), 0.10, 0.90))
-    focal_gamma = float(getattr(CFG, "focal_gamma", 1.5))
+    # =========================
+    # LOSS (TRAIN): plain BCEWithLogitsLoss (NO pos_weight)
+    # We are already handling imbalance via WeightedRandomSampler.
+    # =========================
+    loss_fn_train = nn.BCEWithLogitsLoss().to(DEVICE)
+    print("[loss] TRAIN = BCEWithLogitsLoss() (no pos_weight; sampler handles imbalance)")
 
-    use_pos_weight_bce = bool(getattr(CFG, "use_pos_weight_bce", True))
-    pw = torch.tensor([float(pos_weight[0])], device=DEVICE, dtype=torch.float32)
+    # Keep eval loss plain BCE too (you already do this)
+    bce_eval = nn.BCEWithLogitsLoss()
+    print("[loss] EVAL  = BCEWithLogitsLoss() (no pos_weight)")
 
-    if use_pos_weight_bce:
-        loss_fn_train = nn.BCEWithLogitsLoss(pos_weight=pw).to(DEVICE)
-        print(f"[loss] TRAIN = BCE(pos_weight) pos_weight={float(pw.item()):.3f}")
-    else:
-        loss_fn_train = BinaryFocalLoss(alpha=focal_alpha, gamma=focal_gamma).to(DEVICE)
-        print(f"[loss] TRAIN = Focal alpha={focal_alpha:.3f} gamma={focal_gamma:.2f}")
 
     bce_eval = nn.BCEWithLogitsLoss()  
     print("[loss] EVAL  = BCEWithLogitsLoss() (no pos_weight)")
@@ -2839,7 +2874,7 @@ def main():
     )
 
     train_eval_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
+        train_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=pin,
         collate_fn=collate_eval,
         worker_init_fn=seed_worker,
@@ -2959,6 +2994,10 @@ def main():
             {"params": head_params, "lr": args.lr, "weight_decay": args.weight_decay, "name": "head"},
         ]
     )
+    label_smoothing = float(getattr(CFG, "label_smoothing", 0.02))  # try 0.01–0.05
+    label_smoothing = float(np.clip(label_smoothing, 0.0, 0.10))
+    print(f"[loss] label_smoothing={label_smoothing:.3f}")
+
     use_ema = bool(getattr(CFG, "use_ema", True))
     ema_decay = float(getattr(CFG, "ema_decay", 0.999))
     ema = EMA([behrt, bbert, imgenc, mult, route_adapter, projector, cap_head], decay=ema_decay) if use_ema else None
@@ -3100,7 +3139,7 @@ def main():
 
                 detach_priors_flag = False
 
-                temp = 2.0 if (epoch - start_epoch) < 2 else 1.0   
+                temp = 1.2 if (epoch - start_epoch) < 2 else 1.0   
 
                 out = capsule_forward_from_encoded(
                     mult=mult,
@@ -3123,7 +3162,9 @@ def main():
                     rc_r_given_c, rc_c_given_r, rc_mode = coerce_rc_semantics(
                         rc_raw, atol=1e-2, name="TRAIN.rc_raw"
                     )
-                    print(f"[debug] TRAIN.rc_raw semantics = {rc_mode}")
+                    if (epoch == start_epoch) and (step == 0):
+                        print(f"[debug] TRAIN.rc_raw semantics = {rc_mode}")
+
 
                     rc_report = rc_r_given_c
                     rc_report = normalize_rc_shape_to_brk(
@@ -3153,31 +3194,42 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
                     continue
 
-                y_f = y.view(-1, 1).float()
-                death_logit = death_logit_from_logits2(logits)     # [B,1]
+                y_f = y.float().view(-1, 1)  # [B,1]
+
+                death_logit = death_logit_from_logits2(logits)  # [B,1]
                 if (epoch == start_epoch) and (step == 0):
-                    print("[sanity] logits[0] =", logits[0].detach().float().cpu().tolist())
-                    print("[sanity] death_logit[0] =", float(death_logit[0].detach().cpu()))
-                    print("[sanity] prim_acts.mean =", prim_acts.detach().float().mean().item())
-                    if rc_raw is not None:
-                        print("[sanity] rc_raw sum over classes (mean) =", float(rc_raw.sum(dim=2).mean().detach().cpu()))
+                    with torch.no_grad():
+                        print("[sanity] logits[0] =", logits[0].detach().float().cpu().tolist())
+                        print("[sanity] death_logit[0] =", float(death_logit[0].detach().float().cpu()))
+                        print("[sanity] prim_acts.mean =", float(prim_acts.detach().float().mean().cpu()))
+                        if rc_raw is not None:
+                            # expected rc_raw: [B, R, K] (sum over classes dim=2 should be ~1 if normalized)
+                            print("[sanity] rc_raw sum over classes (mean) =",
+                                  float(rc_raw.detach().float().sum(dim=2).mean().cpu()))
 
-                base_loss = loss_fn_train(death_logit, y_f)   # focal BCE part (>=0 typically)
-                ent_bonus = torch.zeros((), device=DEVICE, dtype=base_loss.dtype)
-                uniform_pen = torch.zeros((), device=DEVICE, dtype=base_loss.dtype)
-                cur_epoch = float(epoch + 1)
+                # label smoothing (binary): push targets slightly away from 0/1
+                if label_smoothing > 0.0:
+                    y_f = y_f * (1.0 - label_smoothing) + 0.5 * label_smoothing
+
+                base_loss = loss_fn_train(death_logit, y_f)
+
+                ent_bonus   = base_loss.new_zeros(())
+                uniform_pen = base_loss.new_zeros(())
+
+                
+                cur_epoch = epoch + 1  # int is fine
+                # prim_acts: [B,R] nonnegative-ish; make a proper distribution
+                pa_dist = prim_acts.clamp_min(1e-6)
+                pa_dist = pa_dist / pa_dist.sum(dim=1, keepdim=True).clamp_min(1e-6)  # [B,R]
+
                 if route_entropy_lambda > 0.0 and (route_entropy_warmup_epochs <= 0 or cur_epoch >= route_entropy_warmup_epochs):
-                    pa = torch.relu(prim_acts)
-                    pa = pa / (pa.sum(dim=1, keepdim=True) + 1e-6)
-                    H = -(pa * pa.log()).sum(dim=1).mean()
-
-                    ent_bonus = route_entropy_lambda * H  
-
+                    p = pa_dist.clamp_min(1e-12)
+                    H = -(p * p.log()).sum(dim=1).mean()  # scalar
+                    ent_bonus = H * route_entropy_lambda
                 if route_uniform_lambda > 0.0 and (route_uniform_warmup_epochs <= 0 or cur_epoch >= route_uniform_warmup_epochs):
-                    pa_dist = prim_acts / (prim_acts.sum(dim=1, keepdim=True) + 1e-6)
-                    p_mean = pa.mean(dim=0)
-                    target = torch.full_like(p_mean, 1.0 / p_mean.numel())
-                    uniform_pen = route_uniform_lambda * ((p_mean - target) ** 2).sum()
+                    p_mean = pa_dist.mean(dim=0)  # [R]
+                    target = p_mean.new_full(p_mean.shape, 1.0 / p_mean.numel())
+                    uniform_pen = ((p_mean - target).pow(2)).sum() * route_uniform_lambda
 
                 loss = base_loss - ent_bonus + uniform_pen
 
@@ -3410,10 +3462,6 @@ def main():
             save_checkpoint(os.path.join(ckpt_dir, "best_f1.pt"), ckpt)
             print(f"[epoch {epoch + 1}] Saved BEST_F1 checkpoint (VAL F1={val_f1:.4f})")
 
-
-        if is_best_f1:
-            save_checkpoint(os.path.join(ckpt_dir, "best_f1.pt"), ckpt)
-
         if is_best:
             save_checkpoint(os.path.join(ckpt_dir, "best.pt"), ckpt)
 
@@ -3458,7 +3506,7 @@ def main():
             print(f"  rc_mean_{r} = {rc_mean_test[i]:.4f}")
 
         K = int(test_rc_mat.shape[1])
-        names = (label_names[:K] if label_names is not None else [f"label_{k}" for k in range(K)])
+        names = (CLASS_NAMES[:K] if CLASS_NAMES is not None else [f"label_{k}" for k in range(K)])
 
         print("\n[TEST] per-route routing importance by label (p(route | label)):")
         for i, r in enumerate(routes):
@@ -3554,32 +3602,48 @@ def main():
     )   
     print(f"[TEST] ECE({args.calib_bins} bins) CALIBRATED(T from VAL) = {ece_cal:.4f}")
     reliability_plot(centers_cal, bconf_cal, bacc_cal, out_path=os.path.join(ckpt_dir, "reliability_test_cal.png"))
-    print("\n[main] Generating FINAL normalized heatmaps (TRAIN + TEST only) from BEST checkpoint...")
-    generate_split_heatmaps_and_tables(
+    print("\n[main] Generating split heatmaps + tables (TRAIN/VAL/TEST) ...")
+
+    summary_train = generate_split_heatmaps_and_tables(
         split_name="TRAIN",
         loader=train_eval_loader,
-        behrt=behrt, bbert=bbert, imgenc=imgenc,
-        mult=mult, route_adapter=route_adapter, projector=projector, cap_head=cap_head,
-        amp_ctx_enc=amp_ctx_enc,
-        amp_ctx_caps=amp_ctx_caps,
+        behrt=behrt, bbert=bbert, imgenc=imgenc, mult=mult,
+        route_adapter=route_adapter, projector=projector, cap_head=cap_head,
+        amp_ctx_enc=amp_ctx_enc, amp_ctx_caps=amp_ctx_caps,
         loss_fn=bce_eval,
-        label_names=["death"], 
+        label_names=["alive", "death"],
         ckpt_dir=ckpt_dir,
         T_cal=T_star,
         thr_val=thr_val,
     )
-    generate_split_heatmaps_and_tables(
+
+    summary_val = generate_split_heatmaps_and_tables(
+        split_name="VAL",
+        loader=val_loader,
+        behrt=behrt, bbert=bbert, imgenc=imgenc, mult=mult,
+        route_adapter=route_adapter, projector=projector, cap_head=cap_head,
+        amp_ctx_enc=amp_ctx_enc, amp_ctx_caps=amp_ctx_caps,
+        loss_fn=bce_eval,
+        label_names=["alive", "death"],
+        ckpt_dir=ckpt_dir,
+        T_cal=float(T_star),
+        thr_val=thr_val,
+    )
+
+    summary_test = generate_split_heatmaps_and_tables(
         split_name="TEST",
         loader=test_loader,
-        behrt=behrt, bbert=bbert, imgenc=imgenc,
-        mult=mult, route_adapter=route_adapter, projector=projector, cap_head=cap_head,
-        amp_ctx_enc=amp_ctx_enc,
-        amp_ctx_caps=amp_ctx_caps,
-        loss_fn=bce_eval, 
-        label_names=label_names,
+        behrt=behrt, bbert=bbert, imgenc=imgenc, mult=mult,
+        route_adapter=route_adapter, projector=projector, cap_head=cap_head,
+        amp_ctx_enc=amp_ctx_enc, amp_ctx_caps=amp_ctx_caps,
+        loss_fn=bce_eval,
+        label_names=["alive", "death"],
         ckpt_dir=ckpt_dir,
-        T_cal=T_star,
+        T_cal=float(T_star),
         thr_val=thr_val,
     )
+
+    print("[done] heatmaps saved under:", os.path.join(ckpt_dir, "heatmaps"))
+
 if __name__ == "__main__":
     main()
