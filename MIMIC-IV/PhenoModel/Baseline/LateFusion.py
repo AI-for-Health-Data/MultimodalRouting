@@ -1,490 +1,490 @@
 from __future__ import annotations
-import os as _os
-_os.environ.setdefault("HF_HOME", _os.path.expanduser("~/.cache/huggingface"))
-_os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-_os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-_os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-
-import os, json, argparse, random
+import os
+import time
+import json
+import math
+import random
+import argparse
+from typing import Any, Dict, Optional
 import numpy as np
-import pandas as pd
-from dataclasses import asdict
-from contextlib import nullcontext
-from typing import Any, Dict, List, Optional
-
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch import amp as torch_amp
+import main as main_mod  
+from env_config import CFG, load_cfg, apply_cli_overrides, Config, ensure_dir
+from main import epoch_metrics, find_best_thresholds
+from encoders import EncoderConfig, build_encoders, encode_unimodal_pooled
 from transformers import AutoTokenizer
 
-from env_config import CFG, DEVICE, load_cfg, ensure_dir, apply_cli_overrides, get_pheno_name
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-from encoders import EncoderConfig, build_encoders
-from encoders import encode_unimodal_pooled  
-from main import (
-    ICUStayDataset,
-    collate_fn_factory,
-    seed_worker,
-    epoch_metrics,
-    find_best_thresholds,
-    build_image_transform,
-)
+def to_device(obj: Any, device: torch.device) -> Any:
+    if torch.is_tensor(obj):
+        return obj.to(device, non_blocking=True)
+    if isinstance(obj, dict):
+        return {k: to_device(v, device) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(to_device(x, device) for x in obj)
+    return obj
+
+def get_batch_label(batch) -> torch.Tensor:
+    if isinstance(batch, (tuple, list)) and len(batch) >= 5:
+        y = batch[4]
+    elif isinstance(batch, dict):
+        y = batch.get("y", batch.get("y_pheno", None))
+        if y is None:
+            raise KeyError("Batch missing phenotype label key (expected 'y' or 'y_pheno').")
+    else:
+        raise TypeError(f"Unexpected batch type: {type(batch)}")
+
+    if not torch.is_tensor(y):
+        y = torch.tensor(y)
+
+    if y.ndim == 1:
+        y = y.unsqueeze(1)
+    return y.float()
 
 class LateFusionHead(nn.Module):
-    """
-    Late fusion = fuse only pooled embeddings at the very end.
-    """
-    def __init__(self, dL: int, dN: int, dI: int, num_labels: int, hidden: int = 256, dropout: float = 0.2):
+    def __init__(
+        self,
+        in_dim: int,
+        num_labels: int,
+        hidden_dim: int = 512,
+        dropout: float = 0.1,
+        num_layers: int = 2,
+    ):
         super().__init__()
-        d_in = int(dL + dN + dI)
-        self.net = nn.Sequential(
-            nn.LayerNorm(d_in),
-            nn.Linear(d_in, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, num_labels),
+        assert num_layers >= 1
+        layers = []
+        d = in_dim
+        for _ in range(num_layers - 1):
+            layers += [nn.Linear(d, hidden_dim), nn.GELU(), nn.Dropout(dropout)]
+            d = hidden_dim
+        layers.append(nn.Linear(d, num_labels))  # (B, K)
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)  # (B, K)
+
+
+class LateFusionModel(nn.Module):
+    def __init__(
+        self,
+        encoder_cfg: EncoderConfig,
+        num_labels: int,
+        dropout: float = 0.1,
+        head_hidden_dim: int = 512,
+        head_layers: int = 2,
+        add_presence_flags: bool = False,  
+        freeze_encoders: bool = False,
+    ):
+        super().__init__()
+
+        self.behrt, self.bbert, self.imgenc = build_encoders(encoder_cfg)
+        self.num_labels = int(num_labels)
+        self.add_presence_flags = bool(add_presence_flags)
+
+        self.head: Optional[LateFusionHead] = None
+        self._head_kwargs = dict(
+            hidden_dim=head_hidden_dim,
+            dropout=dropout,
+            num_layers=head_layers,
         )
 
-    def forward(self, zL: torch.Tensor, zN: torch.Tensor, zI: torch.Tensor) -> torch.Tensor:
-        z = torch.cat([zL, zN, zI], dim=-1)
-        return self.net(z)
+        if freeze_encoders:
+            for m in [self.behrt, self.bbert, self.imgenc]:
+                if m is None:
+                    continue
+                for p in m.parameters():
+                    p.requires_grad = False
 
+    @torch.no_grad()
+    def init_head_from_batch(self, batch, device: torch.device) -> None:
+        if self.head is not None:
+            return
 
-def parse_args():
-    ap = argparse.ArgumentParser("Late-fusion phenotype prediction")
-    ap.add_argument("--task", type=str, default=getattr(CFG, "task_name", "pheno"))
-    ap.add_argument("--data_root", type=str, default=getattr(CFG, "data_root", "./data"))
-    ap.add_argument("--ckpt_root", type=str, default=getattr(CFG, "ckpt_root", "./ckpts"))
-    ap.add_argument("--epochs", type=int, default=50)
-    ap.add_argument("--batch_size", type=int, default=getattr(CFG, "batch_size", 16))
-    ap.add_argument("--lr", type=float, default=getattr(CFG, "lr", 2e-4))
-    ap.add_argument("--weight_decay", type=float, default=getattr(CFG, "weight_decay", 1e-4))
-    ap.add_argument("--num_workers", type=int, default=getattr(CFG, "num_workers", 4))
-    ap.add_argument("--precision", type=str, default="auto", choices=["auto", "fp16", "bf16", "off"])
-    ap.add_argument("--finetune_text", action="store_true")
-    ap.add_argument("--encoder_warmup_epochs", type=int, default=int(getattr(CFG, "encoder_warmup_epochs", 2)))
-    ap.add_argument("--log_every", type=int, default=200)
-    ap.add_argument("--resume", type=str, default="")
-    return ap.parse_args()
+        if not (isinstance(batch, (tuple, list)) and len(batch) >= 4):
+            raise TypeError("Expected tuple batch from your collate_fn_factory.")
 
+        xL, mL, notes_batch, imgs = batch[0], batch[1], batch[2], batch[3]
 
-def grads_are_finite(param_list):
-    for p in param_list:
-        if p.grad is None:
-            continue
-        if not torch.isfinite(p.grad).all():
-            return False
-    return True
+        pooled = encode_unimodal_pooled(
+            behrt=self.behrt,
+            bbert=self.bbert,
+            imgenc=self.imgenc,
+            xL=xL,
+            notes_batch=notes_batch,
+            imgs=imgs,
+            mL=mL,
+        )
+        zL, zN, zI = pooled["L"], pooled["N"], pooled["I"]
+        dL, dN, dI = int(zL.shape[-1]), int(zN.shape[-1]), int(zI.shape[-1])
+
+        in_dim = dL + dN + dI + (3 if self.add_presence_flags else 0)
+        self.head = LateFusionHead(in_dim=in_dim, num_labels=self.num_labels, **self._head_kwargs).to(device)
+
+        print(f"[latefusion] inferred dL,dN,dI={dL},{dN},{dI} -> head_in={in_dim} K={self.num_labels}")
+
+    def forward(self, batch) -> torch.Tensor:
+        assert self.head is not None, "Call init_head_from_batch() once before training."
+
+        if not (isinstance(batch, (tuple, list)) and len(batch) >= 4):
+            raise TypeError("Expected tuple batch from your collate_fn_factory.")
+
+        xL, mL, notes_batch, imgs = batch[0], batch[1], batch[2], batch[3]
+        B = xL.shape[0]
+
+        pooled = encode_unimodal_pooled(
+            behrt=self.behrt,
+            bbert=self.bbert,
+            imgenc=self.imgenc,
+            xL=xL,
+            notes_batch=notes_batch,
+            imgs=imgs,
+            mL=mL,
+        )
+        zL, zN, zI = pooled["L"], pooled["N"], pooled["I"]
+
+        feats = [zL, zN, zI]
+        if self.add_presence_flags:
+            device = zL.device
+            feats += [
+                torch.ones(B, device=device).unsqueeze(-1),
+                torch.ones(B, device=device).unsqueeze(-1),
+                torch.ones(B, device=device).unsqueeze(-1),
+            ]
+
+        x = torch.cat(feats, dim=-1)
+        return self.head(x)
+
+def compute_pos_weight_per_label(
+    loader: DataLoader,
+    device: torch.device,
+    K: int,
+    max_batches: int = 200,
+) -> torch.Tensor:
+    pos = np.zeros(K, dtype=np.float64)
+    tot = 0
+    seen = 0
+
+    for batch in loader:
+        y = get_batch_label(batch).detach().cpu().numpy()  # (B,K)
+        pos += y.sum(axis=0)
+        tot += y.shape[0]
+        seen += 1
+        if seen >= max_batches:
+            break
+
+    neg = tot - pos
+    pw = neg / (pos + 1e-6)
+    max_pw = float(getattr(CFG, "pos_weight_max", 20.0))
+    pw = np.clip(pw, 1.0, max_pw)
+
+    return torch.tensor(pw, dtype=torch.float32, device=device)  # (K,)
+
+def run_one_epoch_train(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    pos_weight: Optional[torch.Tensor],
+    grad_clip: float,
+    log_every: int,
+    use_bf16: bool,
+) -> Dict[str, float]:
+    model.train()
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight) if pos_weight is not None else nn.BCEWithLogitsLoss()
+    losses = []
+    t0 = time.time()
+    for step, batch in enumerate(loader, start=1):
+        batch = to_device(batch, device)
+        y = get_batch_label(batch)
+        optimizer.zero_grad(set_to_none=True)
+
+        if use_bf16:
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                logits = model(batch)  # (B,K)
+                loss = criterion(logits, y)
+        else:
+            logits = model(batch)
+            loss = criterion(logits, y)
+
+        loss.backward()
+        if grad_clip and grad_clip > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+
+        losses.append(float(loss.detach().cpu().item()))
+
+        if log_every > 0 and step % log_every == 0:
+            dt = time.time() - t0
+            print(f"[train] step={step:6d} loss={np.mean(losses[-log_every:]):.4f} ({dt:.1f}s)")
+            t0 = time.time()
+
+    return {"loss": float(np.mean(losses)) if losses else float("nan")}
 
 
 @torch.no_grad()
-def eval_epoch_late_fusion(
-    behrt, bbert, imgenc,
-    head: nn.Module,
-    loader,
-    amp_ctx_enc,
-    loss_fn,
-    thr: Optional[np.ndarray] = None,
-):
-    behrt.eval()
-    imgenc.eval()
-    bbert.eval()
-    head.eval()
-
-    total_loss = 0.0
-    total_correct = 0
-    total = 0
-    num_samples = 0
-
+def run_eval_pheno(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    thr: Optional[np.ndarray],
+    use_bf16: bool,
+) -> Dict[str, Any]:
+    model.eval()
+    all_logits = []
     all_y = []
-    all_p = []
+    losses = []
+    criterion = nn.BCEWithLogitsLoss()
+    for batch in loader:
+        batch = to_device(batch, device)
+        y = get_batch_label(batch)
 
-    for xL, mL, notes, imgs, y, dbg in loader:
-        xL = xL.to(DEVICE, non_blocking=True)
-        mL = mL.to(DEVICE, non_blocking=True)
-        imgs = imgs.to(DEVICE, non_blocking=True)
-        y = y.to(DEVICE, non_blocking=True)
-
-        with amp_ctx_enc:
-            pooled = encode_unimodal_pooled(
-                behrt=behrt,
-                bbert=bbert,
-                imgenc=imgenc,
-                xL=xL,
-                notes_batch=notes,
-                imgs=imgs,
-                mL=mL,
-            )
-            zL, zN, zI = pooled["L"], pooled["N"], pooled["I"]
-
-            logits = head(zL.float(), zN.float(), zI.float())
-            loss = loss_fn(logits, y.float())
-
-        total_loss += float(loss.item()) * y.size(0)
-        probs = torch.sigmoid(logits)
-
-        if thr is None:
-            pred = (probs >= 0.5).float()
+        if use_bf16:
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                logits = model(batch)
+                loss = criterion(logits, y)
         else:
-            thr_t = torch.tensor(thr, device=probs.device, dtype=probs.dtype).view(1, -1)
-            pred = (probs >= thr_t).float()
+            logits = model(batch)
+            loss = criterion(logits, y)
 
-        total_correct += (pred == y.float()).sum().item()
-        total += y.numel()
-        num_samples += y.size(0)
+        all_logits.append(logits.detach().float().cpu())
+        all_y.append(y.detach().float().cpu())
+        losses.append(float(loss.detach().cpu().item()))
 
-        all_y.append(y.detach().cpu())
-        all_p.append(probs.detach().float().cpu())
+    logits = torch.cat(all_logits, dim=0).numpy()  # (N,K)
+    y_true = torch.cat(all_y, dim=0).numpy()       # (N,K)
+    p = 1.0 / (1.0 + np.exp(-logits))              # (N,K)
 
-    avg_loss = total_loss / max(1, num_samples)
-    avg_acc = total_correct / max(1, total)
-
-    y_true = torch.cat(all_y, dim=0).numpy()
-    p = torch.cat(all_p, dim=0).float().numpy()
-    return avg_loss, avg_acc, y_true, p
-
-
-def save_checkpoint(path: str, state: Dict[str, Any]):
-    ensure_dir(os.path.dirname(path))
-    torch.save(state, path)
-
-
-def main():
-    import env_config as E
-    E.load_cfg()
-    args = parse_args()
-    apply_cli_overrides(args)
-
-    global CFG, DEVICE
-    CFG = E.CFG
-    DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    print("[forced] DEVICE =", DEVICE)
-    print("[env_config] CFG:", json.dumps(asdict(CFG), indent=2))
-
-    import main as M
-    M.TOKENIZER = AutoTokenizer.from_pretrained(CFG.text_model_name, local_files_only=True)
-    TOKENIZER = M.TOKENIZER
-
-    use_cuda = (str(DEVICE).startswith("cuda") and torch.cuda.is_available())
-    precision = str(args.precision).lower()
-    use_amp = use_cuda and (precision != "off")
-    if use_amp:
-        if precision == "fp16":
-            amp_ctx_enc = torch_amp.autocast(device_type="cuda", dtype=torch.float16)
-        elif precision == "bf16":
-            amp_ctx_enc = torch_amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-        else:
-            amp_ctx_enc = torch_amp.autocast(device_type="cuda")
+    if thr is None:
+        y_pred = (p >= 0.5).astype(float)
     else:
-        amp_ctx_enc = nullcontext()
+        y_pred = (p >= thr[np.newaxis, :]).astype(float)
 
-    from torch.cuda.amp import GradScaler
-    scaler = GradScaler(enabled=(use_amp and precision in {"auto", "fp16"}))
-    print(f"[amp] use_amp={use_amp} precision={precision} scaler_enabled={scaler.is_enabled()}")
+    m = epoch_metrics(y_true, p, y_pred)
 
-    train_ds = ICUStayDataset(args.data_root, split="train")
-    val_ds   = ICUStayDataset(args.data_root, split="val")
-    test_ds  = ICUStayDataset(args.data_root, split="test")
+    return {
+        "loss": float(np.mean(losses)),
+        "y_true": y_true,
+        "p": p,
+        "y_pred": y_pred,
+        "metrics": m,
+    }
 
-    print("\n[DATA CHECK] data_root =", args.data_root)
-    expected = [
-        "splits.json",
-        "xehr_haru17_2h_76.parquet",
-        "notes_fullstay_radiology_TEXTCHUNKS_11230.parquet",
-        "images.parquet",
-        "labels_pheno.parquet",
-    ]
-    for fn in expected:
-        fp = os.path.join(args.data_root, fn)
-        print(f"[DATA CHECK] exists={os.path.isfile(fp)} -> {fp}")
+def build_loaders_from_project(data_root_override: Optional[str] = None) -> tuple[DataLoader, DataLoader, DataLoader]:
+    root = data_root_override if (data_root_override is not None and str(data_root_override).strip() != "") else CFG.data_root
+    data_root = os.path.abspath(os.path.expanduser(root))
+    print(f"[data] using data_root={data_root}")
 
-    print("\n[DATA CHECK] #ids train/val/test:", len(train_ds.ids), len(val_ds.ids), len(test_ds.ids))
-    print("[DATA CHECK] num_labels:", train_ds.num_labels)
-    print("[DATA CHECK] label_cols (first 10):", train_ds.label_cols[:10])
-    print("[DATA CHECK] label_cols count:", len(train_ds.label_cols))
+    train_ds = main_mod.ICUStayDataset(root=data_root, split="train")
+    val_ds   = main_mod.ICUStayDataset(root=data_root, split="val")
+    test_ds  = main_mod.ICUStayDataset(root=data_root, split="test")
 
-    inter_tv = set(train_ds.ids).intersection(set(val_ds.ids))
-    inter_tt = set(train_ds.ids).intersection(set(test_ds.ids))
-    inter_vt = set(val_ds.ids).intersection(set(test_ds.ids))
-    print("\n[DATA CHECK] leakage intersections sizes:")
-    print("  train∩val:", len(inter_tv))
-    print("  train∩test:", len(inter_tt))
-    print("  val∩test:", len(inter_vt))
+    train_tfms = main_mod.build_image_transform("train")
+    eval_tfms  = main_mod.build_image_transform("val")
 
-    print("\n[DATA CHECK] sampling 3 items from train_ds")
-    for i in [0, 1, 2]:
-        sample = train_ds[i]
-        if isinstance(sample, dict):
-            keys = list(sample.keys())
-            print(f"  sample[{i}] dict keys:", keys)
-            if "y" in sample:
-                print("    y shape:", np.array(sample["y"]).shape, "sum:", float(np.array(sample["y"]).sum()))
-        else:
-            try:
-                xL, mL, notes, imgs, y, dbg = sample
-                print(f"  sample[{i}] xL={getattr(xL,'shape',None)} mL={getattr(mL,'shape',None)} "
-                      f"notes_type={type(notes)} imgs={getattr(imgs,'shape',None)} y={getattr(y,'shape',None)} "
-                      f"dbg_keys={list(dbg.keys()) if isinstance(dbg, dict) else type(dbg)}")
-                if hasattr(y, "sum"):
-                    print("    y.sum:", float(y.sum().item()) if torch.is_tensor(y) else float(np.sum(y)))
-                if isinstance(dbg, dict):
-                    for k in ["stay_id", "hadm_id", "subject_id"]:
-                        if k in dbg:
-                            print(f"    dbg[{k}] =", dbg[k])
-            except Exception as e:
-                print(f"  sample[{i}] could not unpack sample format. type={type(sample)} err={e}")
+    collate_train = main_mod.collate_fn_factory(tidx=0, img_tfms=train_tfms)
+    collate_eval  = main_mod.collate_fn_factory(tidx=0, img_tfms=eval_tfms)
 
-    print("\n[DATA CHECK] one batch from train_loader (after loaders are created)")
+    bs = int(getattr(CFG, "batch_size", 16))
+    nw = int(getattr(CFG, "num_workers", 4))
 
-    num_labels = int(train_ds.num_labels)
-    print(f"[labels] num_labels={num_labels} (EXPECT 25 for your setting)")
-    if num_labels != 25:
-        print("[WARN] num_labels != 25. Late fusion will still be correct, but you should verify labels_pheno.parquet columns.")
-
-    tri_ids = set(train_ds.ids)
-    train_label_df = (
-        train_ds.labels[train_ds.labels["stay_id"].isin(tri_ids)]
-        .loc[:, ["stay_id"] + train_ds.label_cols]
-        .drop_duplicates(subset=["stay_id"], keep="first")
-    )
-    N_train = len(train_label_df)
-    pos_counts = train_label_df[train_ds.label_cols].sum(axis=0).values
-    neg_counts = N_train - pos_counts
-    pos_weight = neg_counts / (pos_counts + 1e-6)
-    max_pw = float(getattr(CFG, "pos_weight_max", 20.0))
-    pos_weight = np.clip(pos_weight, 1.0, max_pw)
-    pos_weight_tensor = torch.tensor(pos_weight, dtype=torch.float32, device=DEVICE)
-
-    bce = nn.BCEWithLogitsLoss(reduction="mean", pos_weight=pos_weight_tensor)
-
-    collate_train = collate_fn_factory(tidx=0, img_tfms=build_image_transform("train"))
-    collate_eval  = collate_fn_factory(tidx=0, img_tfms=build_image_transform("val"))
-
-    pin = use_cuda
-    g_train = torch.Generator().manual_seed(int(CFG.seed) + 123)
-    g_eval  = torch.Generator().manual_seed(int(CFG.seed) + 456)
+    pin = torch.cuda.is_available()
 
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=pin,
-        collate_fn=collate_train, drop_last=False,
-        worker_init_fn=seed_worker, generator=g_train,
-        persistent_workers=(args.num_workers > 0),
-        prefetch_factor=4 if args.num_workers > 0 else None,
+        train_ds, batch_size=bs, shuffle=True,
+        num_workers=nw, pin_memory=pin,
+        drop_last=False, collate_fn=collate_train,
+        worker_init_fn=main_mod.seed_worker,
+        persistent_workers=(nw > 0),
+        prefetch_factor=4 if nw > 0 else None,
     )
-    batch = next(iter(train_loader))
-    xL, mL, notes, imgs, y, dbg = batch
-    print("[BATCH CHECK] xL:", xL.shape, xL.dtype)
-    print("[BATCH CHECK] mL:", mL.shape, mL.dtype, "mask_sum:", int(mL.sum().item()))
-    print("[BATCH CHECK] imgs:", imgs.shape, imgs.dtype)
-    print("[BATCH CHECK] y:", y.shape, y.dtype, "pos_per_label(first 10):", y.float().mean(0)[:10].tolist())
-    print("[BATCH CHECK] notes type:", type(notes))
-    if isinstance(dbg, dict):
-        print("[BATCH CHECK] dbg keys:", list(dbg.keys()))
-
-    with torch.no_grad():
-        pooled0 = encode_unimodal_pooled(
-            behrt=behrt, bbert=bbert, imgenc=imgenc,
-            xL=xL.to(DEVICE), notes_batch=notes, imgs=imgs.to(DEVICE), mL=mL.to(DEVICE),
-        )
-        dL = int(pooled0["L"].shape[-1])
-        dN = int(pooled0["N"].shape[-1])
-        dI = int(pooled0["I"].shape[-1])
-        print("[DIM CHECK] dL,dN,dI =", dL, dN, dI)
-
-
     val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=pin,
-        collate_fn=collate_eval,
-        worker_init_fn=seed_worker, generator=g_eval,
-        persistent_workers=(args.num_workers > 0),
+        val_ds, batch_size=bs, shuffle=False,
+        num_workers=nw, pin_memory=pin,
+        drop_last=False, collate_fn=collate_eval,
+        worker_init_fn=main_mod.seed_worker,
+        persistent_workers=(nw > 0),
     )
     test_loader = DataLoader(
-        test_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=pin,
-        collate_fn=collate_eval,
-        worker_init_fn=seed_worker, generator=g_eval,
-        persistent_workers=(args.num_workers > 0),
+        test_ds, batch_size=bs, shuffle=False,
+        num_workers=nw, pin_memory=pin,
+        drop_last=False, collate_fn=collate_eval,
+        worker_init_fn=main_mod.seed_worker,
+        persistent_workers=(nw > 0),
     )
+    return train_loader, val_loader, test_loader
 
-    enc_cfg = EncoderConfig(
-        d=getattr(CFG, "d", 256),
-        structured_seq_len=getattr(CFG, "structured_seq_len", 256),
-        structured_n_feats=getattr(CFG, "structured_n_feats", 61),
-        structured_layers=getattr(CFG, "structured_layers", 2),
-        structured_heads=getattr(CFG, "structured_heads", 8),
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser()
 
-        text_model_name=getattr(CFG, "text_model_name", "emilyalsentzer/Bio_ClinicalBERT"),
-        bert_chunk_bs=getattr(CFG, "bert_chunk_bs", 8),
+    ap.add_argument("--task", type=str, default="pheno")
+    ap.add_argument("--data_root", type=str, default=None)
+    ap.add_argument("--ckpt_root", type=str, default=None)
+    ap.add_argument("--batch_size", type=int, default=None)
+    ap.add_argument("--num_workers", type=int, default=None)
+    ap.add_argument("--precision", type=str, default="bf16", choices=["bf16", "fp32"])
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-4)
+    ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--head_hidden_dim", type=int, default=512)
+    ap.add_argument("--head_layers", type=int, default=2)
+    ap.add_argument("--freeze_encoders", action="store_true")
+    ap.add_argument("--grad_clip", type=float, default=1.0)
+    ap.add_argument("--log_every", type=int, default=300)
+    ap.add_argument("--pos_weight_auto", action="store_true")
+    ap.add_argument("--save_path", type=str, default="latefusion_pheno.pt")
+    ap.add_argument("--config_json", type=str, default="")
+
+    return ap.parse_args()
+
+
+def apply_config_overrides(cfg: Config, config_json_path: str) -> Config:
+    if not config_json_path:
+        return cfg
+    with open(config_json_path, "r") as f:
+        overrides = json.load(f)
+    for k, v in overrides.items():
+        if hasattr(cfg, k):
+            setattr(cfg, k, v)
+        else:
+            print(f"[warn] Config has no attribute '{k}' (override ignored)")
+    return cfg
+
+
+def main() -> None:
+    args = parse_args()
+    load_cfg()
+    apply_cli_overrides(args)
+    if getattr(main_mod, "TOKENIZER", None) is None:
+        main_mod.TOKENIZER = AutoTokenizer.from_pretrained(CFG.text_model_name, use_fast=True)
+
+    _ = apply_config_overrides(Config(), args.config_json)
+    seed_everything(args.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[info] device={device} precision={args.precision}")
+
+    use_bf16 = (device.type == "cuda" and args.precision == "bf16")
+
+    print(f"[debug] args.data_root={args.data_root} | CFG.data_root={CFG.data_root}")
+    train_loader, val_loader, test_loader = build_loaders_from_project(args.data_root)
+
+    # infer K
+    K = int(getattr(train_loader.dataset, "num_labels", 25))
+    print(f"[info] phenotypes K={K}")
+
+    encoder_cfg = EncoderConfig(
+        d=int(getattr(CFG, "d", 256)),
+        structured_seq_len=int(getattr(CFG, "structured_seq_len", 256)),
+        structured_n_feats=int(getattr(CFG, "structured_n_feats", 61)),
+        structured_layers=int(getattr(CFG, "structured_layers", 2)),
+        structured_heads=int(getattr(CFG, "structured_heads", 8)),
+        structured_pool=str(getattr(CFG, "structured_pool", "mean")),  
+        text_model_name=str(getattr(CFG, "text_model_name", "emilyalsentzer/Bio_ClinicalBERT")),
+        bert_chunk_bs=int(getattr(CFG, "bert_chunk_bs", 8)),
         note_agg=str(getattr(CFG, "note_agg", "mean")).lower(),
-
-        vision_backbone=getattr(CFG, "image_model_name", "resnet34"),
+        vision_backbone=str(getattr(CFG, "image_model_name", "resnet34")),
         vision_pretrained=True,
     )
-    behrt, bbert, imgenc = build_encoders(enc_cfg, device=DEVICE)
 
-    finetune_text = (getattr(CFG, "finetune_text", False) or args.finetune_text)
+    model = LateFusionModel(
+        encoder_cfg=encoder_cfg,
+        num_labels=K,
+        dropout=float(args.dropout),
+        head_hidden_dim=int(args.head_hidden_dim),
+        head_layers=int(args.head_layers),
+        add_presence_flags=False,
+        freeze_encoders=bool(args.freeze_encoders),
+    ).to(device)
 
-    if not finetune_text:
-        for p in bbert.parameters():
-            p.requires_grad = False
-        bbert.eval()
-        print("[encoders] Bio_ClinicalBERT frozen (feature extractor mode)")
-    else:
-        print("[encoders] Bio_ClinicalBERT finetuning enabled")
+    first_batch = next(iter(train_loader))
+    first_batch = to_device(first_batch, device)
+    model.init_head_from_batch(first_batch, device=device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
 
-    head = LateFusionHead(dL=dL, dN=dN, dI=dI, num_labels=num_labels,
-                          hidden=int(getattr(CFG, "latefusion_hidden", 256)),
-                          dropout=float(getattr(CFG, "dropout", 0.2))).to(DEVICE)
+    # pos_weight
+    pos_weight = None
+    if args.pos_weight_auto:
+        pos_weight = compute_pos_weight_per_label(train_loader, device=device, K=K)
+        print("[info] pos_weight (first 10):", pos_weight.detach().cpu().numpy()[:10].round(3).tolist())
 
-    encoder_warmup_epochs = int(getattr(args, "encoder_warmup_epochs", 2))
-    enc_params = [p for p in behrt.parameters() if p.requires_grad] + [p for p in imgenc.parameters() if p.requires_grad]
-    finetune_text = (getattr(CFG, "finetune_text", False) or args.finetune_text)
-    if finetune_text:
-        enc_params += [p for p in bbert.parameters() if p.requires_grad]
+    # tracking
+    best_thr = np.full(K, 0.5, dtype=np.float32)
+    best_val_auroc = -1.0
+    best_state = None
 
-
-    head_params = [p for p in head.parameters() if p.requires_grad]
-    params = enc_params + head_params
-
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": enc_params, "lr": args.lr, "weight_decay": args.weight_decay, "name": "enc"},
-            {"params": head_params, "lr": args.lr, "weight_decay": args.weight_decay, "name": "head"},
-        ]
-    )
-
-    ckpt_dir = os.path.join(args.ckpt_root, "pheno_latefusion")
-    ensure_dir(ckpt_dir)
-
-    best_val_auroc = -float("inf")
-    best_thr = np.full(num_labels, 0.5, dtype=np.float32)
-
-    # TRAIN
-    for epoch in range(args.epochs):
-        # warmup encoders
-        enc_lr = 0.0 if epoch < encoder_warmup_epochs else args.lr
-        optimizer.param_groups[0]["lr"] = enc_lr
-        optimizer.param_groups[1]["lr"] = args.lr
-
-        behrt.train()
-        imgenc.train()
-        head.train()
-
-        finetune_text = (getattr(CFG, "finetune_text", False) or args.finetune_text)
-
-        if finetune_text:
-            bbert.train()
-        else:
-            bbert.eval()   
-
-
-        total_loss = 0.0
-        total = 0
-        num_samples = 0
-
-        for step, (xL, mL, notes, imgs, y, dbg) in enumerate(train_loader):
-            xL = xL.to(DEVICE, non_blocking=True)
-            mL = mL.to(DEVICE, non_blocking=True)
-            imgs = imgs.to(DEVICE, non_blocking=True)
-            y = y.to(DEVICE, non_blocking=True)
-
-            optimizer.zero_grad(set_to_none=True)
-
-            with amp_ctx_enc:
-                pooled = encode_unimodal_pooled(
-                    behrt=behrt, bbert=bbert, imgenc=imgenc,
-                    xL=xL, notes_batch=notes, imgs=imgs, mL=mL,
-                )
-                zL, zN, zI = pooled["L"], pooled["N"], pooled["I"]
-                logits = head(zL.float(), zN.float(), zI.float())
-                loss = bce(logits, y.float())
-
-            if scaler.is_enabled():
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(params, max_norm=float(getattr(CFG, "grad_clip_norm", 1.0)))
-                if not grads_are_finite(params):
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(params, max_norm=float(getattr(CFG, "grad_clip_norm", 1.0)))
-                if not grads_are_finite(params):
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
-                optimizer.step()
-
-            total_loss += float(loss.item()) * y.size(0)
-            total += y.numel()
-            num_samples += y.size(0)
-
-            if args.log_every > 0 and (step + 1) % args.log_every == 0:
-                print(f"[epoch {epoch+1} step {step+1}] train_loss={total_loss/max(1,num_samples):.4f}")
-
-        print(f"[epoch {epoch+1}] TRAIN loss={total_loss/max(1,num_samples):.4f}")
-
-        val_loss, val_acc, y_true, p = eval_epoch_late_fusion(
-            behrt, bbert, imgenc, head,
-            val_loader, amp_ctx_enc, bce,
-            thr=(best_thr if epoch > 0 else None),
+    # training
+    for epoch in range(1, int(args.epochs) + 1):
+        print(f"\n===== epoch {epoch}/{args.epochs} =====")
+        tr = run_one_epoch_train(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            pos_weight=pos_weight,
+            grad_clip=float(args.grad_clip),
+            log_every=int(args.log_every),
+            use_bf16=use_bf16,
         )
-        y_pred = (p >= 0.5).astype(float)
-        m = epoch_metrics(y_true, p, y_pred)
-        print(f"[epoch {epoch+1}] VAL loss={val_loss:.4f} acc@0.5={val_acc:.4f} AUROC_macro={m['AUROC']:.4f} AUPRC_macro={m['AUPRC']:.4f}")
 
-        best_thr = find_best_thresholds(y_true, p, n_steps=50).astype(np.float32)
+        va = run_eval_pheno(
+            model=model,
+            loader=val_loader,
+            device=device,
+            thr=(best_thr if epoch > 1 else None),
+            use_bf16=use_bf16,
+        )
+        m = va["metrics"]
 
+        print(
+            f"[epoch {epoch}] train_loss={tr['loss']:.4f} | val_loss={va['loss']:.4f} | "
+            f"AUROC={float(m['AUROC']):.4f} AUPRC={float(m['AUPRC']):.4f} "
+            f"F1={float(m['F1']):.4f} R={float(m['Recall']):.4f} P={float(m['Precision']):.4f}"
+        )
+
+        best_thr = find_best_thresholds(va["y_true"], va["p"], n_steps=50).astype(np.float32)
         if float(m["AUROC"]) > best_val_auroc:
             best_val_auroc = float(m["AUROC"])
-            ckpt = {
-                "epoch": epoch + 1,
-                "behrt": behrt.state_dict(),
-                "bbert": bbert.state_dict(),
-                "imgenc": imgenc.state_dict(),
-                "head": head.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "best_thr": torch.from_numpy(best_thr),
-                "val_auroc": best_val_auroc,
-            }
-            save_checkpoint(os.path.join(ckpt_dir, "best.pt"), ckpt)
-            print(f"[epoch {epoch+1}] Saved BEST (AUROC={best_val_auroc:.4f})")
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            print(f"[best] new best val AUROC={best_val_auroc:.4f}")
 
-        # always save last
-        save_checkpoint(os.path.join(ckpt_dir, "last.pt"), {
-            "epoch": epoch + 1,
-            "behrt": behrt.state_dict(),
-            "bbert": bbert.state_dict(),
-            "imgenc": imgenc.state_dict(),
-            "head": head.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "best_thr": torch.from_numpy(best_thr),
-            "val_auroc": float(m["AUROC"]),
-        })
+    # load best
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
-    # TEST best
-    print("[main] Loading BEST and evaluating on TEST...")
-    best_path = os.path.join(ckpt_dir, "best.pt")
-    if os.path.isfile(best_path):
-        ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
-        behrt.load_state_dict(ckpt["behrt"])
-        bbert.load_state_dict(ckpt["bbert"])
-        imgenc.load_state_dict(ckpt["imgenc"])
-        head.load_state_dict(ckpt["head"])
-        best_thr = ckpt["best_thr"].detach().cpu().numpy().astype(np.float32)
-
-    test_loss, test_acc, y_true_t, p_t = eval_epoch_late_fusion(
-        behrt, bbert, imgenc, head,
-        test_loader, amp_ctx_enc, bce,
-        thr=best_thr,
+    # test
+    te = run_eval_pheno(model=model, loader=test_loader, device=device, thr=best_thr, use_bf16=use_bf16)
+    mt = te["metrics"]
+    print(
+        f"\n[final test] loss={te['loss']:.4f} | "
+        f"AUROC={float(mt['AUROC']):.4f} AUPRC={float(mt['AUPRC']):.4f} "
+        f"F1={float(mt['F1']):.4f} R={float(mt['Recall']):.4f} P={float(mt['Precision']):.4f}"
     )
-    y_pred_t = (p_t >= best_thr[np.newaxis, :]).astype(float)
-    mt = epoch_metrics(y_true_t, p_t, y_pred_t)
-    print(f"[TEST] loss={test_loss:.4f} acc={test_acc:.4f} AUROC_macro={mt['AUROC']:.4f} AUPRC_macro={mt['AUPRC']:.4f} F1_macro={mt['F1']:.4f}")
+
+    # save
+    ensure_dir(os.path.dirname(args.save_path) or ".")
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "args": vars(args),
+            "best_val_auroc": best_val_auroc,
+            "best_thr": best_thr,
+        },
+        args.save_path,
+    )
+    print(f"[saved] {args.save_path}")
+
 
 if __name__ == "__main__":
     main()
