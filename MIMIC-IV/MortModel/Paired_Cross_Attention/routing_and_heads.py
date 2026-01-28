@@ -205,8 +205,7 @@ class CapsuleMortalityHead(nn.Module):
         prim_pose: torch.Tensor,   # [B, len(ROUTES), pc_dim]
         prim_act: torch.Tensor,    # [B, len(ROUTES)] or [B, len(ROUTES), 1]
         uniform_routing: bool = False,
-        route_mask: Optional[torch.Tensor] = None,   # <--- ADD THIS
-
+        route_mask: Optional[torch.Tensor] = None,  
     ):
         if prim_act.dim() == 2:
             prim_act = prim_act.unsqueeze(-1)
@@ -215,20 +214,21 @@ class CapsuleMortalityHead(nn.Module):
         else:
             raise ValueError(f"prim_act must be [B,len(ROUTES)] or [B,len(ROUTES),1], got {prim_act.shape}")
 
+        prim_act_for_routing = torch.ones_like(prim_act)
 
-        # ---- APPLY ROUTE MASK EARLY (before routing) ----
         if route_mask is not None:
             rm = route_mask
             if rm.ndim == 1:
-                rm = rm.view(1, -1, 1).expand(prim_pose.size(0), -1, 1)   # [B,R,1]
+                rm = rm.view(1, -1, 1).expand(prim_pose.size(0), -1, 1)  # [B,R,1]
             elif rm.ndim == 2:
-                rm = rm.unsqueeze(-1)                                     # [B,R,1]
+                rm = rm.unsqueeze(-1)                                    # [B,R,1]
             else:
                 raise ValueError(f"route_mask must be [R] or [B,R], got {tuple(rm.shape)}")
-
             rm = rm.to(device=prim_pose.device, dtype=prim_pose.dtype)
-            prim_pose = prim_pose * rm
-            prim_act  = prim_act  * rm
+            prim_pose = prim_pose * rm                    # <-- IMPORTANT (mask poses)
+            prim_act_for_routing = prim_act_for_routing * rm
+            prim_act = prim_act * rm                      # <-- optional but good: alpha logging respects mask
+
 
         decision_pose = None
         decision_act = None
@@ -256,7 +256,7 @@ class CapsuleMortalityHead(nn.Module):
                         raise ValueError(f"next_act must be [B,M], got {tuple(next_act.shape)}")
             decision_pose, decision_act, routing_coef = self.capsule(
                 input=prim_pose,
-                current_act=prim_act,
+                current_act=prim_act_for_routing,
                 num_iter=it,
                 next_capsule_value=next_pose,
                 next_act=next_act,                 
@@ -274,16 +274,11 @@ class CapsuleMortalityHead(nn.Module):
 
         # Convert to paper routing coefficients R = p(r|k), normalized over routes
         R_brk = route_given_pheno(q_brk, route_mask=route_mask)  # [B,R,K]
-        alpha = prim_act.squeeze(-1)                              # [B,R]  (after mask! see next section)
-        d_bkp = torch.einsum("brk, br, brp -> bkp", R_brk, alpha, prim_pose)
+        d_bkp = torch.einsum("brk, brp -> bkp", R_brk, prim_pose)  # [B,K,pc_dim]
 
-        # Score
         d_bkm = self.pose_to_mc(d_bkp)  # [B,K,mc_caps_dim]
         logits = torch.einsum("bkm, km -> bk", d_bkm, self.embedding) + self.bias
-
-        prim_act_out = alpha  # [B,R]
         return logits, alpha, R_brk
-
 
 
 def forward_capsule_from_route_dict(
@@ -378,7 +373,7 @@ def forward_capsule_from_route_dict(
         uniform_routing=False,
         route_mask=route_mask,
     )
-    q_brk = None  # (optional) keep a placeholder if your debug code expects it
+    q_brk = None 
 
 
     prim_acts = prim_act_out.detach()
