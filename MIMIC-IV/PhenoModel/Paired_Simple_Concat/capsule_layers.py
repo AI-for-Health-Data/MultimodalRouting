@@ -34,6 +34,8 @@ class CapsuleFC(nn.Module):
             self.nonlinear_act = nn.Sequential()
         else:
             self.nonlinear_act = nn.Sequential()
+
+
         self.drop = nn.Dropout(self.dropout_rate)
         self.scale = 1.0 / (out_d_capsules ** 0.5)
 
@@ -74,8 +76,10 @@ class CapsuleFC(nn.Module):
         uniform_routing: bool = False,
     ):
         current_act = current_act.view(current_act.shape[0], -1)  # [B, N_in]
+
         B = input.shape[0]
         w = self.w  # [N_in, A, N_out, D]
+
         if next_capsule_value is None:
             query_key = torch.zeros(B, self.in_n_capsules, self.out_n_capsules).type_as(input)  # [B,N_in,N_out]
             query_key = F.softmax(query_key, dim=2)  # over N_out
@@ -89,6 +93,7 @@ class CapsuleFC(nn.Module):
             else:
                 _query_key = torch.einsum("bna, namd, bmd->bnm", input, w, next_capsule_value)  # [B,N_in,N_out]
                 _query_key.mul_(self.scale)
+
                 query_key = F.softmax(_query_key, dim=2)
 
                 if next_act is None:
@@ -103,10 +108,9 @@ class CapsuleFC(nn.Module):
             next_act = torch.ones(next_capsule_value.shape[0:2]).type_as(next_capsule_value)
 
         if next_act is None:
-            next_act = torch.ones(next_capsule_value.shape[0:2]).type_as(next_capsule_value)
+            next_act = torch.ones(next_capsule_value.shape[0:2]).type_as(next_capsule_value
 
         next_capsule_value = self.drop(next_capsule_value)
         if next_capsule_value.shape[-1] != 1:
             next_capsule_value = self.nonlinear_act(next_capsule_value)
-
         return next_capsule_value, next_act, query_key
