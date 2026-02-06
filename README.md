@@ -180,27 +180,108 @@ The repository is organized by **prediction task**, with parallel pipelines for 
 ```text
 MultimodalRouting/
 ├── Data/                         # (Local only) processed data placeholders
-├── INSPECT/                      
+│
+├── INSPECT/                      # Inspection / debugging utilities (experimental; not used in final results)
 │
 ├── MIMIC-IV/
-│   ├── Data/                     # Task-specific data handling
-│   ├── Model/                    # Shared model utilities
+│   ├── Data/                     # Task-specific data loading, pairing, and preprocessing
+│   ├── Model/                    # Shared utilities (training loops, losses, evaluation, helpers)
 │   │
-│   ├── MortModel/                # ICU mortality prediction
-│   │   ├── Baseline/
+│   ├── MortModel/                # Binary ICU mortality prediction (first 48 hours)
+│   │   ├── Baseline/             # Unimodal and standard fusion baselines
+│   │   │
 │   │   ├── Paired_Cross_Attention/
-│   │   ├── Paired_Simple_Concat/
-│   │   └── Partial/
+│   │   │   ├── encoders.py       # Modality-specific encoders (L, N, I)
+│   │   │   ├── mult_model.py     # Multimodal routing backbone with explicit route construction
+│   │   │   ├── routing_and_heads.py
+│   │   │   │   # Route activations (α) and routing coefficients (R)
+│   │   │   │   # Binary mortality prediction head
+│   │   │   ├── capsule_layers.py # Capsule-style route aggregation and normalization
+│   │   │   ├── transformer.py    # Cross-attention modules for directional routes
+│   │   │   ├── env_config.py     # Experiment configuration and hyperparameters
+│   │   │   └── main.py           # Training / evaluation entry point
+│   │   │
+│   │   ├── Paired_Simple_Concat/ # Undirected fusion ablation (no routing, no directionality)
+│   │   └── Partial/              # Inference-time missing-modality and route-masking experiments
 │   │
-│   └── PhenoModel/               # Multi-label phenotype prediction
-│       ├── Baseline/
+│   └── PhenoModel/               # Multi-label phenotype prediction (full ICU stay)
+│       ├── Baseline/             # Unimodal and late/joint fusion baselines
+│       │
 │       ├── Paired_Cross_Attention/
-│       ├── Paired_Simple_Concat/
-│       └── Partial/
+│       │   ├── encoders.py       # Modality-specific encoders (L, N, I)
+│       │   ├── mult_model.py     # Multimodal routing backbone (same routes as mortality)
+│       │   ├── routing_and_heads.py
+│       │   │   # Route activations (α) and routing coefficients (R)
+│       │   │   # Multi-label phenotype prediction heads (25 phenotypes)
+│       │   ├── capsule_layers.py # Capsule routing and aggregation logic
+│       │   ├── multhead_attention.py
+│       │   │   # Directional cross-attention for paired routes
+│       │   ├── position_embedding.py
+│       │   │   # Positional encoding for longitudinal and text sequences
+│       │   ├── transformer.py    # Transformer blocks for cross-modal interactions
+│       │   ├── env_config.py     # Phenotype-specific configuration and hyperparameters
+│       │   └── main.py           # Training/evaluation entry point
+│       │
+│       ├── Paired_Simple_Concat/ # Undirected bimodal fusion ablation
+│       └── Partial/              # Missing-modality robustness and auditing experiments
 │
 ├── figures/
-│   ├── model_architecture.png
-│   └── model_architecture.pdf
+│   ├── model_architecture.png    # Architecture figure (rendered in README)
 │
 └── README.md
+---
+
+## Core Routing Implementations (Clickable)
+
+The following links provide direct navigation to the **core multimodal routing implementations**
+used for ICU mortality and phenotype prediction.
+
+---
+
+### Mortality · Paired_Cross_Attention  
+**Binary ICU mortality prediction (first 48 hours)**  
+
+📁 **Folder:**  
+[`MIMIC-IV/MortModel/Paired_Cross_Attention/`](MIMIC-IV/MortModel/Paired_Cross_Attention/)
+
+**Key files:**
+- [`main.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/main.py) — training & evaluation entry point  
+- [`env_config.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/env_config.py) — experiment configuration & hyperparameters  
+- [`encoders.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/encoders.py) — modality-specific encoders (L, N, I)  
+- [`mult_model.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/mult_model.py) — multimodal routing backbone and route construction  
+- [`routing_and_heads.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/routing_and_heads.py) — route activations (α), routing coefficients (R), mortality head  
+- [`capsule_layers.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/capsule_layers.py) — capsule-style route aggregation and normalization  
+- [`transformer.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/transformer.py) — directional cross-attention modules  
+
+---
+
+### Phenotype · Paired_Cross_Attention  
+**Multi-label phenotype prediction (25 phenotypes, full ICU stay)**  
+
+📁 **Folder:**  
+[`MIMIC-IV/PhenoModel/Paired_Cross_Attention/`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/)
+
+**Key files:**
+- [`main.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/main.py) — training & evaluation entry point  
+- [`env_config.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/env_config.py) — phenotype-specific configuration  
+- [`encoders.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/encoders.py) — modality-specific encoders (L, N, I)  
+- [`mult_model.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/mult_model.py) — multimodal routing backbone (shared route logic)  
+- [`routing_and_heads.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/routing_and_heads.py) — route activations (α), routing coefficients (R), phenotype heads  
+- [`capsule_layers.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/capsule_layers.py) — capsule routing and aggregation  
+- [`multhead_attention.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/multhead_attention.py) — directional multi-head cross-attention  
+- [`position_embedding.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/position_embedding.py) — temporal & positional embeddings  
+- [`transformer.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/transformer.py) — transformer blocks for cross-modal interactions  
+
+---
+
+### Design Notes
+
+- **MortModel** and **PhenoModel** share the same routing architecture but differ in:
+  - prediction head (binary vs. multi-label)
+  - observation window (48h vs. full ICU stay)
+- **Paired_Cross_Attention** implements the full multimodal routing framework:
+  - unimodal, directional bimodal, and trimodal routes  
+  - route activations (α) and routing coefficients (R)
+- **Paired_Simple_Concat** removes directionality and routing (ablation)
+- **Partial** evaluates inference-time missing-modality robustness via route masking
 
