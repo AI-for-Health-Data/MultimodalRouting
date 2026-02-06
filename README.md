@@ -3,12 +3,6 @@ Multimodal Routing · Interpretable, Robust, and Auditable Clinical Prediction
 </h1>
 
 <p align="center">
-  <i>
-  “Multimodal Routing for Interpretable, Robust, and Auditable Clinical Prediction”
-  </i>
-</p>
-
-<p align="center">
   <!-- Update arXiv link when available -->
   <!--
   <a href="https://arxiv.org/abs/XXXX.XXXXX">
