@@ -21,12 +21,6 @@ Multimodal Routing · Interpretable, Robust, and Auditable Clinical Prediction
        src="figures/model_architecture.png" />
 </p>
 
-<p align="center">
-  📄 <a href="figures/model_architecture.pdf">
-  View high-resolution architecture diagram (PDF)
-  </a>
-</p>
-
 ---
 
 ## Table of Contents
