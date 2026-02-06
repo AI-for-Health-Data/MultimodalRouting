@@ -117,24 +117,31 @@ Each route \( r \in \mathcal{R} \) produces a route-specific embedding \( e_r \)
 
 ### Decision Mechanism
 
-For a patient **b** and prediction target (label) **c**, the final decision representation is computed as:
+For patient <b>b</b> and prediction target (label) <b>c</b>, the decision representation is:
 
-d_{b,c} = Σ_{r ∈ R} R_{b,r,c} · α_{b,r} · ẽ_r
+<p align="center">
+  <b>d</b><sub>b,c</sub> = &sum;<sub>r &isin; &#8475;</sub> R<sub>b,r,c</sub> &middot; &alpha;<sub>b,r</sub> &middot; <b>&#7869;</b><sub>r</sub>
+</p>
 
 where:
 
-- **α<sub>b,r</sub>** — *Route activation (patient-specific)*  
-  Indicates how strongly route *r* is expressed for patient *b*.
+- <b>&alpha;</b><sub>b,r</sub> — route activation (patient-specific)  
+- <b>R</b><sub>b,r,c</sub> — routing coefficient (patient- and label-specific), with  
+  <p align="center">&sum;<sub>r &isin; &#8475;</sub> R<sub>b,r,c</sub> = 1</p>
+- <b>&#7869;</b><sub>r</sub> — primary route representation (content vector)
 
-- **R<sub>b,r,c</sub>** — *Routing coefficient (patient- and label-specific)*  
-  Indicates how much route *r* contributes to label *c*, normalized across routes.
+The effective route contribution is:
 
-- **ẽ<sub>r</sub>** — *Primary route representation*  
-  Content vector carrying predictive information from route *r*.
+<p align="center">
+  <b>W</b><sub>b,r,c</sub> = &alpha;<sub>b,r</sub> &middot; R<sub>b,r,c</sub>
+</p>
+
 
 The **effective route contribution** is defined as:
 
-W_{b,r,c} = α_{b,r} · R_{b,r,c}
+<p align="center">
+  <b>W</b><sub>b,r,c</sub> = <b>α</b><sub>b,r</sub> · <b>R</b><sub>b,r,c</sub>
+</p>
 
 This formulation enforces **structured, selective, and interpretable multimodal aggregation**, ensuring predictions are driven only by routes that are both strongly expressed for a patient and relevant to the target outcome.
 
@@ -164,17 +171,6 @@ This project uses the following PhysioNet datasets:
 - **MIMIC-IV**
 - **MIMIC-IV-Note**
 - **MIMIC-CXR-JPG**
-
-To use this code, you must:
-
-1. Complete PhysioNet credentialing  
-2. Agree to all applicable Data Use Agreements (DUAs)  
-3. Download the data locally  
-
-⚠️ **Important**  
-This repository does **not** include any patient data.  
-Do **not** upload derived tables, features, or outputs containing patient information.
-
 ---
 
 ## Repository Structure
@@ -184,7 +180,7 @@ The repository is organized by **prediction task**, with parallel pipelines for 
 ```text
 MultimodalRouting/
 ├── Data/                         # (Local only) processed data placeholders
-├── INSPECT/                      # Inspection / debugging utilities
+├── INSPECT/                      
 │
 ├── MIMIC-IV/
 │   ├── Data/                     # Task-specific data handling
