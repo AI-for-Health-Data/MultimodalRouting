@@ -1,23 +1,9 @@
-<h1 align="center">
-Multimodal Routing for Interpretable, Robust, and Auditable Clinical Prediction
-</h1>
-
 <p align="center">
-  <i>
-  Official PyTorch implementation of our CHASE&nbsp;2026 submission<br>
-  “Multimodal Routing for Interpretable, Robust, and Auditable Clinical Prediction”
-  </i>
+  <img src="figures/model_architecture.png" width="900" />
 </p>
 
 <p align="center">
-  <a href="https://pytorch.org">
-    <img src="https://img.shields.io/badge/PyTorch-2.1%20%2B-ee4c2c.svg" alt="PyTorch ≥ 2.1">
-  </a>
-</p>
-
-<p align="center">
-  📄 <a href="figures/model_architecture.png">
-  </a>
+  <a href="figures/model_architecture.pdf">📄 View the PDF (high-res)</a>
 </p>
 
 ---
