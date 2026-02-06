@@ -56,121 +56,144 @@ By explicitly modeling multimodal routes and dynamically weighting them at infer
 - auditing of model decision pathways in realistic clinical settings  
 
 ---
+## Architecture
 
-## Key Contributions
+*See the architecture figure above.*
 
-- **Explicit modeling of 10 multimodal routes**
-  - **3 unimodal routes**
-  - **6 directional bimodal routes**  
-    (e.g., `N ← L` vs. `L ← N`)
-  - **1 trimodal route**
+The **Multimodal Routing** framework explicitly decomposes multimodal reasoning into
+**unimodal**, **directional bimodal**, and **trimodal** evidence pathways, enabling
+transparent, robust, and auditable clinical prediction.
 
-- **Route activations (patient-specific)**  
-  Quantify how strongly each unimodal or cross-modal route is expressed for an individual patient.
-
-- **Routing coefficients (patient- and label-specific)**  
-  Quantify how much each route contributes to each prediction target.
-
-- **Inference-time route masking**  
-  Simulates missing-modality scenarios without retraining by disabling routes involving unavailable modalities and renormalizing routing weights.
-
-- **Auditable multimodal reasoning**  
-  Routing weight redistribution under missing-modality settings enables systematic auditing of modality reliance, robustness, and potential shortcut learning.
+The implementation is shared across tasks, with task-specific prediction heads for
+mortality and phenotype prediction.
 
 ---
 
-## Clinical Prediction Tasks
+### Modality Encoders
 
-This codebase supports two ICU prediction tasks using paired **tri-modal** EHR data.
+Each clinical modality is encoded independently before any fusion:
 
-### Binary ICU Mortality Prediction
-- Observation window: **first 48 hours** of the ICU stay
+- **L — Structured longitudinal data**  
+  Time-ordered vitals, laboratory values, and medications are encoded using a
+  transformer-based sequence model.
 
-### Multi-label Phenotype Prediction
-- **25 phenotypes**
-- Observation window: **full ICU stay**
-- **Discharge summaries are excluded** to avoid information leakage
+  - Encoder implementation:  
+    - Mortality:  
+      [`MIMIC-IV/MortModel/Paired_Cross_Attention/encoders.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/encoders.py)  
+    - Phenotypes:  
+      [`MIMIC-IV/PhenoModel/Paired_Cross_Attention/encoders.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/encoders.py)
 
----
+- **N — Clinical notes**  
+  Free-text notes are encoded using **BioClinicalBERT**, followed by chunk-level pooling.
 
-## Method Overview
+  - Encoder implementation:  
+    - Mortality:  
+      [`MIMIC-IV/MortModel/Paired_Cross_Attention/encoders.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/encoders.py)  
+    - Phenotypes:  
+      [`MIMIC-IV/PhenoModel/Paired_Cross_Attention/encoders.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/encoders.py)
 
-### Multimodal Routes
+- **I — Chest X-ray images**  
+  Radiographs are encoded using a convolutional backbone to produce spatial feature tokens.
 
-The model explicitly constructs a set of **interpretable multimodal routes**.
+  - Encoder implementation:  
+    - Mortality:  
+      [`MIMIC-IV/MortModel/Paired_Cross_Attention/encoders.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/encoders.py)  
+    - Phenotypes:  
+      [`MIMIC-IV/PhenoModel/Paired_Cross_Attention/encoders.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/encoders.py)
 
-#### Unimodal routes
-{ L, N, I }
-
-#### Directional bimodal routes
-{ L ← N, N ← L, L ← I, I ← L, N ← I, I ← N }
-
-#### Trimodal route
-{ LNI }
-
-
-The trimodal route is constructed **hierarchically from paired directional interactions**.
-
-Each route \( r \in \mathcal{R} \) produces a route-specific embedding \( e_r \) representing a distinct unimodal or cross-modal evidence pathway.
-
----
-
-### Decision Mechanism
-
-For patient <b>b</b> and prediction target (label) <b>c</b>, the decision representation is:
-
-<p align="center">
-  <b>d</b><sub>b,c</sub> = &sum;<sub>r &isin; &#8475;</sub> R<sub>b,r,c</sub> &middot; &alpha;<sub>b,r</sub> &middot; <b>&#7869;</b><sub>r</sub>
-</p>
-
-where:
-
-- <b>&alpha;</b><sub>b,r</sub> — route activation (patient-specific)  
-- <b>R</b><sub>b,r,c</sub> — routing coefficient (patient- and label-specific), with  
-  <p align="center">&sum;<sub>r &isin; &#8475;</sub> R<sub>b,r,c</sub> = 1</p>
-- <b>&#7869;</b><sub>r</sub> — primary route representation (content vector)
-
-The effective route contribution is:
-
-<p align="center">
-  <b>W</b><sub>b,r,c</sub> = &alpha;<sub>b,r</sub> &middot; R<sub>b,r,c</sub>
-</p>
-
-
-The **effective route contribution** is defined as:
-
-<p align="center">
-  <b>W</b><sub>b,r,c</sub> = <b>α</b><sub>b,r</sub> · <b>R</b><sub>b,r,c</sub>
-</p>
-
-This formulation enforces **structured, selective, and interpretable multimodal aggregation**, ensuring predictions are driven only by routes that are both strongly expressed for a patient and relevant to the target outcome.
+Encoders are trained jointly, but **no implicit fusion** occurs at this stage.
 
 ---
 
-## Missing-Modality Robustness and Auditing
+### Multimodal Route Construction
 
-Robustness is evaluated using **inference-time route masking**.
+From the unimodal embeddings, the model constructs **10 explicit routes**:
 
-When a modality is missing:
-- all routes involving that modality are disabled  
-- remaining routing coefficients are renormalized  
-- inference proceeds **without retraining or imputation**
+- **Unimodal routes:**  
+  `L`, `N`, `I`
 
-Changes in routing weights and predictive performance under missing-modality scenarios provide an **audit signal** that reveals:
+- **Directional bimodal routes:**  
+  `L ← N`, `N ← L`,  
+  `L ← I`, `I ← L`,  
+  `N ← I`, `I ← N`
 
-- modality essentiality  
-- reliance on narrow vs. complementary evidence  
-- potential shortcut learning  
+- **Trimodal route:**  
+  `LNI`, constructed hierarchically from paired directional interactions
+
+Directional bimodal routes are implemented using **cross-attention**, where one modality
+acts as the query and another as the key/value, preserving **directionality and asymmetry**
+in cross-modal influence.
+
+- Cross-attention backbone:
+  - Mortality:  
+    [`MIMIC-IV/MortModel/Paired_Cross_Attention/mult_model.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/mult_model.py)
+  - Phenotypes:  
+    [`MIMIC-IV/PhenoModel/Paired_Cross_Attention/mult_model.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/mult_model.py)
+
+- Directional attention modules:
+  - Mortality:  
+    [`MIMIC-IV/MortModel/Paired_Cross_Attention/transformer.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/transformer.py)
+  - Phenotypes:  
+    [`MIMIC-IV/PhenoModel/Paired_Cross_Attention/multhead_attention.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/multhead_attention.py)
+
+Each route produces a **route-specific embedding** representing a distinct unimodal or
+cross-modal evidence pathway.
 
 ---
 
-## Data Sources (Credentialed Access Required)
+### Routing, Activations, and Aggregation
 
-This project uses the following PhysioNet datasets:
+Each route embedding is passed through a capsule-style routing mechanism that learns:
 
-- **MIMIC-IV**
-- **MIMIC-IV-Note**
-- **MIMIC-CXR-JPG**
+- **Route activations (α):**  
+  Patient-specific scalars indicating how strongly each route is expressed.
+
+- **Routing coefficients (R):**  
+  Patient- and label-specific weights determining how much each route contributes
+  to a given prediction target.
+
+The routing logic and prediction heads are implemented in:
+
+- Mortality:
+  - [`MIMIC-IV/MortModel/Paired_Cross_Attention/routing_and_heads.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/routing_and_heads.py)
+- Phenotypes:
+  - [`MIMIC-IV/PhenoModel/Paired_Cross_Attention/routing_and_heads.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/routing_and_heads.py)
+
+Capsule-style normalization and aggregation:
+- [`capsule_layers.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/capsule_layers.py)
+
+Only routes that are **both strongly expressed for a patient** and **relevant to the
+target label** meaningfully contribute to the final prediction.
+
+---
+
+### Task-Specific Prediction Heads
+
+The routing backbone is shared across tasks, with task-specific heads:
+
+- **Binary ICU mortality prediction** (first 48 hours):
+  - Entry point:  
+    [`MIMIC-IV/MortModel/Paired_Cross_Attention/main.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/main.py)
+
+- **Multi-label phenotype prediction** (25 phenotypes, full ICU stay):
+  - Entry point:  
+    [`MIMIC-IV/PhenoModel/Paired_Cross_Attention/main.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/main.py)
+
+---
+
+### Architectural Properties
+
+- **Interpretability:**  
+  Predictions decompose into explicit unimodal and cross-modal route contributions.
+
+- **Robustness:**  
+  Missing modalities are handled at inference time by disabling affected routes
+  (see [`Partial/`](MIMIC-IV/MortModel/Partial/)).
+
+- **Auditability:**  
+  Routing weight redistribution under missing-modality scenarios reveals modality
+  reliance, redundancy, and potential shortcut learning.
+
 ---
 
 ## Repository Structure
@@ -229,59 +252,3 @@ MultimodalRouting/
 │   ├── model_architecture.png    # Architecture figure (rendered in README)
 │
 └── README.md
----
-
-## Core Routing Implementations (Clickable)
-
-The following links provide direct navigation to the **core multimodal routing implementations**
-used for ICU mortality and phenotype prediction.
-
----
-
-### Mortality · Paired_Cross_Attention  
-**Binary ICU mortality prediction (first 48 hours)**  
-
-📁 **Folder:**  
-[`MIMIC-IV/MortModel/Paired_Cross_Attention/`](MIMIC-IV/MortModel/Paired_Cross_Attention/)
-
-**Key files:**
-- [`main.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/main.py) — training & evaluation entry point  
-- [`env_config.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/env_config.py) — experiment configuration & hyperparameters  
-- [`encoders.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/encoders.py) — modality-specific encoders (L, N, I)  
-- [`mult_model.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/mult_model.py) — multimodal routing backbone and route construction  
-- [`routing_and_heads.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/routing_and_heads.py) — route activations (α), routing coefficients (R), mortality head  
-- [`capsule_layers.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/capsule_layers.py) — capsule-style route aggregation and normalization  
-- [`transformer.py`](MIMIC-IV/MortModel/Paired_Cross_Attention/transformer.py) — directional cross-attention modules  
-
----
-
-### Phenotype · Paired_Cross_Attention  
-**Multi-label phenotype prediction (25 phenotypes, full ICU stay)**  
-
-📁 **Folder:**  
-[`MIMIC-IV/PhenoModel/Paired_Cross_Attention/`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/)
-
-**Key files:**
-- [`main.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/main.py) — training & evaluation entry point  
-- [`env_config.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/env_config.py) — phenotype-specific configuration  
-- [`encoders.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/encoders.py) — modality-specific encoders (L, N, I)  
-- [`mult_model.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/mult_model.py) — multimodal routing backbone (shared route logic)  
-- [`routing_and_heads.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/routing_and_heads.py) — route activations (α), routing coefficients (R), phenotype heads  
-- [`capsule_layers.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/capsule_layers.py) — capsule routing and aggregation  
-- [`multhead_attention.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/multhead_attention.py) — directional multi-head cross-attention  
-- [`position_embedding.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/position_embedding.py) — temporal & positional embeddings  
-- [`transformer.py`](MIMIC-IV/PhenoModel/Paired_Cross_Attention/transformer.py) — transformer blocks for cross-modal interactions  
-
----
-
-### Design Notes
-
-- **MortModel** and **PhenoModel** share the same routing architecture but differ in:
-  - prediction head (binary vs. multi-label)
-  - observation window (48h vs. full ICU stay)
-- **Paired_Cross_Attention** implements the full multimodal routing framework:
-  - unimodal, directional bimodal, and trimodal routes  
-  - route activations (α) and routing coefficients (R)
-- **Paired_Simple_Concat** removes directionality and routing (ablation)
-- **Partial** evaluates inference-time missing-modality robustness via route masking
-
