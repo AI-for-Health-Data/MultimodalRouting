@@ -4,7 +4,6 @@ Multimodal Routing · Interpretable, Robust, and Auditable Clinical Prediction
 
 <p align="center">
   <i>
-  Official PyTorch implementation of our CHASE&nbsp;2026 submission<br>
   “Multimodal Routing for Interpretable, Robust, and Auditable Clinical Prediction”
   </i>
 </p>
