@@ -5,7 +5,7 @@
 The figure below illustrates the overall architecture of the proposed **multimodal routing framework**, including modality-specific encoders, explicit unimodal and cross-modal routes, routing activations, and label-specific routing coefficients.
 
 <p align="center">
-  <img src="figures/model_architecture.png" width="900">
+  <img src="/Users/nikkiehooman/Downloads/model_architecture.png" width="900">
 </p>
 
 <p align="center">
