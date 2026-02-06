@@ -1,11 +1,6 @@
 <p align="center">
   <img src="figures/model_architecture.png" width="900" />
 </p>
-
-<p align="center">
-  <a href="figures/model_architecture.pdf">📄 View the PDF (high-res)</a>
-</p>
-
 ---
 
 ## Overview
