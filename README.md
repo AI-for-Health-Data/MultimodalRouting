@@ -202,53 +202,45 @@ The repository is organized by **prediction task**, with parallel pipelines for 
 
 ```text
 MultimodalRouting/
-├── Data/                         # (Local only) processed data placeholders
-│
-├── INSPECT/                      # Inspection / debugging utilities (experimental; not used in final results)
+├── Data/                         
 │
 ├── MIMIC-IV/
-│   ├── Data/                     # Task-specific data loading, pairing, and preprocessing
-│   ├── Model/                    # Shared utilities (training loops, losses, evaluation, helpers)
+│   ├── Data/                    
+│   ├── Model/                   
 │   │
-│   ├── MortModel/                # Binary ICU mortality prediction (first 48 hours)
-│   │   ├── Baseline/             # Unimodal and standard fusion baselines
+│   ├── MortModel/                
+│   │   ├── Baseline/            
 │   │   │
 │   │   ├── Paired_Cross_Attention/
-│   │   │   ├── encoders.py       # Modality-specific encoders (L, N, I)
-│   │   │   ├── mult_model.py     # Multimodal routing backbone with explicit route construction
+│   │   │   ├── encoders.py       
+│   │   │   ├── mult_model.py     
 │   │   │   ├── routing_and_heads.py
-│   │   │   │   # Route activations (α) and routing coefficients (R)
-│   │   │   │   # Binary mortality prediction head
-│   │   │   ├── capsule_layers.py # Capsule-style route aggregation and normalization
-│   │   │   ├── transformer.py    # Cross-attention modules for directional routes
-│   │   │   ├── env_config.py     # Experiment configuration and hyperparameters
-│   │   │   └── main.py           # Training / evaluation entry point
+│   │   │   ├── capsule_layers.py 
+│   │   │   ├── transformer.py    
+│   │   │   ├── env_config.py     
+│   │   │   └── main.py           
 │   │   │
-│   │   ├── Paired_Simple_Concat/ # Undirected fusion ablation (no routing, no directionality)
-│   │   └── Partial/              # Inference-time missing-modality and route-masking experiments
+│   │   ├── Paired_Simple_Concat/ 
+│   │   └── Partial/              
 │   │
-│   └── PhenoModel/               # Multi-label phenotype prediction (full ICU stay)
-│       ├── Baseline/             # Unimodal and late/joint fusion baselines
+│   └── PhenoModel/              
+│       ├── Baseline/             
 │       │
 │       ├── Paired_Cross_Attention/
-│       │   ├── encoders.py       # Modality-specific encoders (L, N, I)
-│       │   ├── mult_model.py     # Multimodal routing backbone (same routes as mortality)
+│       │   ├── encoders.py       
+│       │   ├── mult_model.py    
 │       │   ├── routing_and_heads.py
-│       │   │   # Route activations (α) and routing coefficients (R)
-│       │   │   # Multi-label phenotype prediction heads (25 phenotypes)
-│       │   ├── capsule_layers.py # Capsule routing and aggregation logic
+│       │   ├── capsule_layers.py 
 │       │   ├── multhead_attention.py
-│       │   │   # Directional cross-attention for paired routes
 │       │   ├── position_embedding.py
-│       │   │   # Positional encoding for longitudinal and text sequences
-│       │   ├── transformer.py    # Transformer blocks for cross-modal interactions
-│       │   ├── env_config.py     # Phenotype-specific configuration and hyperparameters
-│       │   └── main.py           # Training/evaluation entry point
+│       │   ├── transformer.py    
+│       │   ├── env_config.py     
+│       │   └── main.py          
 │       │
-│       ├── Paired_Simple_Concat/ # Undirected bimodal fusion ablation
-│       └── Partial/              # Missing-modality robustness and auditing experiments
+│       ├── Paired_Simple_Concat/ 
+│       └── Partial/             
 │
 ├── figures/
-│   ├── model_architecture.png    # Architecture figure (rendered in README)
+│   ├── model_architecture.png    
 │
 └── README.md
