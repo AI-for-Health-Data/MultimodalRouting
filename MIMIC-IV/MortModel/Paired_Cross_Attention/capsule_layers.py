@@ -27,7 +27,6 @@ class CapsuleFC(nn.Module):
         self.out_d_capsules = out_d_capsules
         self.n_rank = n_rank
 
-        # same init as reference
         self.weight_init_const = np.sqrt(out_n_capsules / (in_d_capsules * in_n_capsules))
         self.w = nn.Parameter(
             self.weight_init_const
@@ -82,19 +81,11 @@ class CapsuleFC(nn.Module):
         next_act: torch.Tensor = None,            # [B, N_out]
         uniform_routing: bool = False,
     ):
-        # reference flattens current_act exactly like this
         current_act = current_act.view(current_act.shape[0], -1)  # [B, N_in]
 
         B = input.shape[0]
         w = self.w  # [N_in, A, N_out, D]
 
-        # ----------------------------
-        # IMPORTANT FIX:
-        # If next_capsule_value is None (first iteration), make query_key batched:
-        #   query_key: [B, N_in, N_out]
-        # so even when num_iter == 1, routing_coef is 3D (consistent everywhere).
-        # Also: softmax should be over N_out -> dim=2 for [B,N_in,N_out].
-        # ----------------------------
         if next_capsule_value is None:
             query_key = torch.zeros(B, self.in_n_capsules, self.out_n_capsules).type_as(input)  # [B,N_in,N_out]
             query_key = F.softmax(query_key, dim=2)  # over N_out
@@ -104,21 +95,16 @@ class CapsuleFC(nn.Module):
             if uniform_routing:
                 query_key = torch.zeros(B, self.in_n_capsules, self.out_n_capsules).type_as(input)  # [B,N_in,N_out]
                 _query_key = torch.zeros_like(query_key)
-                # IMPORTANT FIX: uniform routing over N_out -> dim=2 (not dim=1)
                 query_key = F.softmax(query_key, dim=2)
             else:
-                # reference agreement: against next_capsule_value
                 _query_key = torch.einsum("bna, namd, bmd->bnm", input, w, next_capsule_value)  # [B,N_in,N_out]
                 _query_key.mul_(self.scale)
 
-                # reference routing: softmax over N_out
                 query_key = F.softmax(_query_key, dim=2)
 
-                # gate by next_act then renormalize over N_out
                 query_key = torch.einsum("bnm, bm->bnm", query_key, next_act)
                 query_key = query_key / (torch.sum(query_key, dim=2, keepdim=True) + 1e-10)
 
-            # reference aggregation uses W and outputs [B, N_out, D]
             next_capsule_value = torch.einsum("bnm, bna, namd, bn->bmd", query_key, input, w, current_act)
 
         if self.act_type == "ONES":
@@ -128,5 +114,4 @@ class CapsuleFC(nn.Module):
         if next_capsule_value.shape[-1] != 1:
             next_capsule_value = self.nonlinear_act(next_capsule_value)
 
-        # query_key is now ALWAYS [B, N_in, N_out]
         return next_capsule_value, next_act, query_key
