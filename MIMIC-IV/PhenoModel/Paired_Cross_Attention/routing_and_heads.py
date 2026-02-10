@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 from typing import Dict, Tuple, Optional
 import torch
@@ -81,14 +80,6 @@ def _normalize_routing_coef(
     raise ValueError(f"Unknown routing_coef_mode={mode!r}")
 
 def make_route_inputs_mult(z, multmodel: MULTModel):
-    """
-    z is the output of encode_unimodal_pooled(...) in your pipeline:
-      z["L"]["seq"]  : [B,TL,Dl]
-      z["N"]["seq"]  : [B,TN,Dn]
-      z["I"]["seq"]  : [B,TI,Di]
-      z["*"]["mask"] : [B,T*] (optional)
-      z["*"]["pool"] : [B,D*] (ignored by MULTModel.forward)
-    """
     Ls, Ns, Is = z["L"]["seq"], z["N"]["seq"], z["I"]["seq"]
     Lm, Nm, Im = z["L"].get("mask", None), z["N"].get("mask", None), z["I"].get("mask", None)
 
@@ -215,8 +206,6 @@ class CapsuleMortalityHead(nn.Module):
         else:
             raise ValueError(f"prim_act must be [B,len(ROUTES)] or [B,len(ROUTES),1], got {prim_act.shape}")
 
-
-        # ---- APPLY ROUTE MASK EARLY (before routing) ----
         if route_mask is not None:
             rm = route_mask
             if rm.ndim == 1:
@@ -265,14 +254,12 @@ class CapsuleMortalityHead(nn.Module):
         # alpha: [B,R]
         alpha = prim_act.squeeze(-1)  # [B,R]
 
-        # CapsuleFC output is q = p(k|r): [B,R,K]
         q_brk = _normalize_routing_coef(
             routing_coef,
             mode="none",
             expect_routes=self.in_n_capsules,
         )  # [B,R,K]
 
-        # Convert to paper routing coefficients R = p(r|k), normalized over routes
         R_brk = route_given_pheno(q_brk, route_mask=route_mask)  # [B,R,K]
         alpha = prim_act.squeeze(-1)                              # [B,R]  (after mask! see next section)
         d_bkp = torch.einsum("brk, br, brp -> bkp", R_brk, alpha, prim_pose)
@@ -287,13 +274,13 @@ class CapsuleMortalityHead(nn.Module):
 
 
 def forward_capsule_from_route_dict(
-    route_embs_in: Dict[str, torch.Tensor],            # {"L","N","I","LN","NL","LI","IL","NI","IN","LNI"} each [B,d]
-    projector: RoutePrimaryProjector,                  # d -> (pc_dim+1) per route
-    capsule_head: CapsuleMortalityHead,                # -> [B,K] logits
+    route_embs_in: Dict[str, torch.Tensor],            
+    projector: RoutePrimaryProjector,                  
+    capsule_head: CapsuleMortalityHead,                
     *,
-    acts_override: Optional[torch.Tensor] = None,      # [B,len(ROUTES),1] optional external priors
-    route_mask: Optional[torch.Tensor] = None,         # [B,len(ROUTES)]  (1=keep, 0=mask)
-    act_temperature: float = 1.0,                      # >1 softer, <1 sharper
+    acts_override: Optional[torch.Tensor] = None,  
+    route_mask: Optional[torch.Tensor] = None,         
+    act_temperature: float = 1.0,                      
     detach_priors: bool = False,
     return_routing: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor]]:
@@ -349,8 +336,6 @@ def forward_capsule_from_route_dict(
 
     if act_temperature != 1.0 and keep is not None:
         T = float(act_temperature)
-
-        # do the logit/temperature math in fp32 (stable + avoids bf16 assignment issues)
         x32 = acts_prior[keep].to(torch.float32)
         x32 = torch.clamp(x32, 1e-6, 1.0 - 1e-6)
         logits32 = torch.log(x32) - torch.log1p(-x32)
@@ -378,7 +363,7 @@ def forward_capsule_from_route_dict(
         uniform_routing=False,
         route_mask=route_mask,
     )
-    q_brk = None  # (optional) keep a placeholder if your debug code expects it
+    q_brk = None  
 
 
     prim_acts = prim_act_out.detach()
@@ -392,7 +377,7 @@ def forward_capsule_from_route_dict(
 
 def forward_capsule_from_multmodel(
     multmodel: nn.Module,                                  # MULTModel
-    x_l: torch.Tensor, x_n: torch.Tensor, x_i: torch.Tensor,# each [B,T,D]
+    x_l: torch.Tensor, x_n: torch.Tensor, x_i: torch.Tensor,
     projector: RoutePrimaryProjector,
     capsule_head: CapsuleMortalityHead,
     *,
