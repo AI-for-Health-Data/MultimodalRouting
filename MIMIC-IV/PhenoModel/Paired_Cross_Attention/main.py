@@ -84,38 +84,6 @@ def make_sample_weights_from_multilabel(label_df: pd.DataFrame, label_cols: List
     w = w / (w.mean() + 1e-8)
     return w
 
-class AsymmetricFocalLoss(torch.nn.Module):
-    """
-    Multi-label Asymmetric Focal Loss (good for imbalance).
-    gamma_pos: focus on hard positives
-    gamma_neg: focus on hard negatives (usually larger)
-    clip: optional probability clip for negatives to reduce easy-neg dominance
-    """
-    def __init__(self, gamma_pos=0.0, gamma_neg=2.0, clip=0.05, eps=1e-8):
-        super().__init__()
-        self.gp = gamma_pos
-        self.gn = gamma_neg
-        self.clip = clip
-        self.eps = eps
-
-    def forward(self, logits, targets):
-        # targets: float {0,1}, logits: raw
-        prob = torch.sigmoid(logits)
-        pt = prob * targets + (1 - prob) * (1 - targets)
-
-        # optional clip for negative probs (reduce easy negatives)
-        if self.clip is not None and self.clip > 0:
-            prob = torch.clamp(prob + self.clip * (1 - targets), max=1.0)
-
-        # focal weights
-        w = torch.pow(1 - pt, self.gp * targets + self.gn * (1 - targets))
-
-        # standard BCE (stable)
-        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-
-        loss = (w * bce).mean()
-        return loss
-
 def _standardize_id_column(df: pd.DataFrame, name="stay_id") -> pd.DataFrame:
     candidates = [name, "icustay_id", "stay", "sample_id"]
     found = next((c for c in candidates if c in df.columns), None)
@@ -1474,17 +1442,6 @@ def capsule_forward_from_encoded(
         return_routing=return_routing,
     )
 
-def _clamp_norm(x: torch.Tensor, max_norm: float = 20.0) -> torch.Tensor:
-    if x.ndim == 2:
-        n = x.norm(dim=1, keepdim=True) + 1e-6
-        scale = torch.clamp(max_norm / n, max=1.0)
-        return x * scale
-    elif x.ndim == 3:
-        n = x.norm(dim=2, keepdim=True) + 1e-6
-        scale = torch.clamp(max_norm / n, max=1.0)
-        return x * scale
-    return x
-
 def _safe_tensor(x: torch.Tensor, name: str = "") -> torch.Tensor:
     if not torch.isfinite(x).all():
         n_nan = (~torch.isfinite(x)).sum().item()
@@ -2801,7 +2758,7 @@ def main():
                 routing_coef = out[3] if len(out) > 3 else None
 
                 if routing_coef is not None:
-                    rc_raw = routing_coef  # [B,R,K]
+                    rc_raw = routing_coef  
                     assert rc_raw.ndim == 3, f"routing_coef must be [B,R,K], got {tuple(rc_raw.shape)}"
                     assert int(rc_raw.shape[1]) == int(N_ROUTES), f"Expected R={N_ROUTES}, got {tuple(rc_raw.shape)}"
 
@@ -2842,15 +2799,15 @@ def main():
 
                     if route_entropy_lambda > 0.0 and (route_entropy_warmup_epochs <= 0 or cur_epoch > route_entropy_warmup_epochs):
                         rc_bmean = rc.mean(dim=0)                       # [R,K]
-                        Hk = -(rc_bmean * rc_bmean.log()).sum(dim=0)    # [K]
-                        H = Hk.mean()                                   # scalar
+                        Hk = -(rc_bmean * rc_bmean.log()).sum(dim=0)    
+                        H = Hk.mean()                                   
                         loss = loss - route_entropy_lambda * H
 
                     if route_uniform_lambda > 0.0 and (route_uniform_warmup_epochs <= 0 or cur_epoch > route_uniform_warmup_epochs):
-                        rc_bmean = rc.mean(dim=0)  # [R,K]
-                        target = torch.full((R,), 1.0 / R, device=rc.device, dtype=rc.dtype)  # [R]
+                        rc_bmean = rc.mean(dim=0) 
+                        target = torch.full((R,), 1.0 / R, device=rc.device, dtype=rc.dtype)  
                         # sum over routes deviation, then mean across K
-                        uniform_loss_k = ((rc_bmean.transpose(0, 1) - target) ** 2).sum(dim=1)  # [K]
+                        uniform_loss_k = ((rc_bmean.transpose(0, 1) - target) ** 2).sum(dim=1)  
                         uniform_loss = uniform_loss_k.mean()
                         loss = loss + route_uniform_lambda * uniform_loss
 
@@ -2870,7 +2827,7 @@ def main():
                 if not grads_are_finite(trainable_params):
                     print(f"[skip] non-finite grads (AMP) at epoch={epoch+1} step={step+1} -> skip")
                     safe_zero_grad(optimizer)
-                    scaler.update()   # <-- IMPORTANT: resets "unscale called" state
+                    scaler.update()   
                     continue
 
                 scaler.step(optimizer)
@@ -3008,10 +2965,8 @@ def main():
         print("[debug] mean(p)=", float(p1.mean()), "std(p)=", float(p1.std()),
               "min(p)=", float(p1.min()), "max(p)=", float(p1.max()))
 
-
         print(f"[thr] updated thresholds by max F{beta_thr:g} on VAL (mean best Fbeta={np.nanmean(best_fbeta):.4f})")
         print("[debug] mean predicted positive rate:", float(y_pred.mean()))
-
 
         print(
             f"[epoch {epoch + 1}] VAL MACRO  "
@@ -3035,15 +2990,15 @@ def main():
         au_per  = m["AUROC_per_label"]
         ap_per  = m["AUPRC_per_label"]
         # prevalence on VAL
-        prev_val = y_true.mean(axis=0)  # [K]
+        prev_val = y_true.mean(axis=0)  
 
         # routing sanity (only if routing matrix exists)
         if val_rc_mat is not None:
             routing_sanity_report(
-                rc_mat=val_rc_mat,            # [R,K]
-                prevalence=prev_val,          # [K]
-                auroc_per=au_per,             # [K]
-                auprc_per=ap_per,             # [K]
+                rc_mat=val_rc_mat,            
+                prevalence=prev_val,          
+                auroc_per=au_per,           
+                auprc_per=ap_per,             
                 routes=ROUTE_NAMES[:N_ROUTES],
                 label_names=label_names,
                 top_n=12,
@@ -3183,7 +3138,7 @@ def main():
 
     T_star = fit_temperature_scalar_from_val(logits_v, y_true_v_log, max_iter=300, lr=0.05)
     print(f"[calibration] Fitted temperature on VAL only: T={T_star:.4f}")
-    p_v = sigmoid_np(apply_temperature(logits_v, T_star))  # use calibrated probs for threshold search
+    p_v = sigmoid_np(apply_temperature(logits_v, T_star))  
     prev_val = compute_split_prevalence(y_true_v_log, split_name="VAL", label_names=label_names)
     beta_thr = float(_cfg("threshold_beta", 2.0))
     thr_val, fbeta_val = find_best_thresholds_fbeta(y_true_v_log, p_v, beta=beta_thr, n_steps=101)
