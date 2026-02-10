@@ -59,8 +59,6 @@ class EMA:
     def __init__(self, model_list, decay=0.999):
         self.decay = float(decay)
         self.model_list = list(model_list)
-
-        # one shadow dict per model
         self.shadow = [
             {k: v.detach().clone() for k, v in m.state_dict().items()}
             for m in self.model_list
@@ -302,19 +300,17 @@ def debug_routing_tensor(rc: torch.Tensor, name="rc", expect_routes=10, kind="ra
     with torch.no_grad():
         print(f"\n[debug] {name}.shape={tuple(rc.shape)} dtype={rc.dtype} device={rc.device}")
         assert rc.ndim == 3, f"{name}: expected [B,R,K]"
-
-        # coerce to [B,R,K] if needed
         rc = normalize_rc_shape_to_brk(rc, expect_routes=expect_routes, name=name)
 
         if kind == "raw":
-            s = rc.sum(dim=2)  # sum over classes
+            s = rc.sum(dim=2) 
             print(f"[debug] {name}: sum_over_classes(dim=2): mean={s.float().mean().item():.6f} "
                   f"min={s.float().min().item():.6f} max={s.float().max().item():.6f}")
             print("[debug] example rc[0, route0, :]= ", rc[0, 0, :].detach().float().cpu().tolist(),
                   " sum=", float(rc[0, 0, :].sum().detach().cpu()))
             print("[debug] example p(death|route) rc[0,:,1] = ", rc[0, :, 1].detach().float().cpu().tolist())
         else:
-            s = rc.sum(dim=1)  # sum over routes
+            s = rc.sum(dim=1)  
             print(f"[debug] {name}: sum_over_routes(dim=1): mean={s.float().mean().item():.6f} "
                   f"min={s.float().min().item():.6f} max={s.float().max().item():.6f}")
             print("[debug] example rc[0, :, class0]= ", rc[0, :, 0].detach().float().cpu().tolist(),
@@ -962,16 +958,6 @@ def resolve_image_path(p: str, dataset_root: str) -> str:
     return os.path.join(dataset_root, p)
 
 
-def assert_probs_over_dim(p: torch.Tensor, dim: int, atol: float = 1e-2, name: str = "p"):
-    s = p.sum(dim=dim)
-    err = (s - 1.0).abs()
-    if not torch.isfinite(err).all() or err.mean().item() > atol:
-        raise AssertionError(
-            f"{name}: NOT normalized over dim={dim}. "
-            f"sum -> min={s.min().item():.6f} max={s.max().item():.6f} "
-            f"abs_err mean={err.mean().item():.3e} max={err.max().item():.3e}"
-        )
-
 def is_probably_image_file(p: str) -> bool:
     ext = os.path.splitext(str(p).lower())[1]
     return ext in VALID_IMG_EXTS
@@ -1354,17 +1340,13 @@ class ICUStayDataset(Dataset):
 
         img_ids = set(img_map.keys()) & ids_set
         print(f"[dataset:{split}] img_ids={len(img_ids)} (precomputed)")
-
-
         print(f"[dataset:{split}] ids_set={len(ids_set)}")
         print(f"[dataset:{split}] struct_ids={len(struct_ids)}")
         print(f"[dataset:{split}] label_ids={len(label_ids)}")
         print(f"[dataset:{split}] note_ids={len(note_ids)}")
         print(f"[dataset:{split}] img_ids={len(img_ids)}")
 
-
         keep_ids = ids_set & struct_ids & label_ids & img_ids & note_ids
-
         dropped_total = len(ids_set) - len(keep_ids)
         dropped_no_notes = len(ids_set & struct_ids & label_ids & img_ids) - len(keep_ids)
         self.ids = sorted(list(keep_ids))
@@ -1769,21 +1751,12 @@ def capsule_forward_from_encoded(
     )
 
 def death_logit_from_logits2(logits2: torch.Tensor) -> torch.Tensor:
-    """
-    logits2: [B,2] (alive, death)
-    returns: [B,1] logit for death suitable for BCEWithLogitsLoss
-    Using (death - alive) makes it consistent with softmax odds.
-    """
     assert logits2.ndim == 2 and logits2.size(1) == 2, f"expected [B,2], got {tuple(logits2.shape)}"
     return (logits2[:, 1] - logits2[:, 0]).unsqueeze(1)
 
 def prob_death_from_death_logit(death_logit: torch.Tensor) -> torch.Tensor:
     return torch.sigmoid(death_logit)
 
-def sigmoid_death_from_logits2_np(logits_2: np.ndarray) -> np.ndarray:
-    logits_2 = np.asarray(logits_2, dtype=np.float32)
-    dlogit = (logits_2[:, 1] - logits_2[:, 0]).reshape(-1, 1)
-    return 1.0 / (1.0 + np.exp(-dlogit))
 
 def death_logit_from_logits2_np(logits2: np.ndarray) -> np.ndarray:
     x = np.asarray(logits2, dtype=np.float32)
@@ -1858,7 +1831,7 @@ def evaluate_epoch(
 
 
     total_loss, total_correct, total = 0.0, 0, 0
-    act_sum = torch.zeros(N_ROUTES, dtype=torch.float32)  # N_ROUTES=10
+    act_sum = torch.zeros(N_ROUTES, dtype=torch.float32)  
     route_names = ROUTE_NAMES
 
     num_samples = 0
@@ -1942,13 +1915,13 @@ def evaluate_epoch(
 
             if rc_raw is not None and rc_report is not None:
                 has_routing = True
-                rc_raw_cpu    = rc_raw.detach().float().cpu()       # [B,R,K]
-                rc_report_cpu = rc_report.detach().float().cpu()    # [B,R,K]
-                pa_cpu = prim_acts.detach().float().cpu()                 # [B,R]
-                eff_b  = rc_raw_cpu * pa_cpu.unsqueeze(-1)                # [B,R,K]
-                raw_sum = rc_raw_cpu.sum(dim=0)                           # [R,K]
-                rep_sum = rc_report_cpu.sum(dim=0)                        # [R,K]
-                eff_sum = eff_b.sum(dim=0)                                # [R,K]
+                rc_raw_cpu    = rc_raw.detach().float().cpu()      
+                rc_report_cpu = rc_report.detach().float().cpu()    
+                pa_cpu = prim_acts.detach().float().cpu()                 
+                eff_b  = rc_raw_cpu * pa_cpu.unsqueeze(-1)                
+                raw_sum = rc_raw_cpu.sum(dim=0)                           
+                rep_sum = rc_report_cpu.sum(dim=0)                        
+                eff_sum = eff_b.sum(dim=0)                                
 
                 if rc_raw_sum_mat is None:
                     rc_raw_sum_mat = torch.zeros_like(raw_sum)
@@ -2016,7 +1989,7 @@ def evaluate_epoch(
                     route_cosine_report(route_embs)
             y_f = y.view(-1, 1).float()
             death_logit = death_logit_from_logits2(logits)  # [B,1]
-            dev = death_logit.device   # or logits.device (anything already on GPU)
+            dev = death_logit.device  
 
             y = y.to(dev, non_blocking=True)
             y_f = y_f.to(dev, non_blocking=True)
@@ -2034,14 +2007,11 @@ def evaluate_epoch(
 
     avg_loss = total_loss / max(1, num_samples)
     avg_acc  = total_correct / max(1, total)
-    avg_pa = (act_sum / max(1, num_samples)).numpy()  # [R]
+    avg_pa = (act_sum / max(1, num_samples)).numpy()  
     avg_act_dict = {r: float(avg_pa[i]) for i, r in enumerate(route_names)}
-
-    # default when routing wasn't returned
     avg_rc_rep_mat = None
-
     if has_routing and (rep_sum_mat is not None):
-        avg_rc_rep_mat = (rep_sum_mat / max(1, num_samples)).numpy()  # [R,K]
+        avg_rc_rep_mat = (rep_sum_mat / max(1, num_samples)).numpy()  
 
     return avg_loss, avg_acc, avg_act_dict, avg_rc_rep_mat, avg_pa
 
@@ -2076,13 +2046,6 @@ def collect_epoch_logits(
     act_temperature: float = 1.0,
     detach_priors: bool = False,
 ):
-    """
-    Collect raw logits (NOT sigmoid) and y_true for temperature scaling & calibration.
-    Returns:
-      y_true: [N,K] float numpy
-      logits: [N,K] float numpy
-      ids: list
-    """
     behrt.eval()
     imgenc.eval()
     if getattr(bbert, "bert", None) is not None:
@@ -2135,12 +2098,11 @@ def fit_temperature_scalar_bce_from_val(
 ):
     import torch.nn.functional as F
 
-    logits2 = torch.tensor(val_logits2, dtype=torch.float32, device=DEVICE)  # [N,2]
+    logits2 = torch.tensor(val_logits2, dtype=torch.float32, device=DEVICE)  
     y = np.asarray(val_y_true).reshape(-1).astype(np.float32)
-    y_t = torch.tensor(y, dtype=torch.float32, device=DEVICE).view(-1, 1)    # [N,1]
+    y_t = torch.tensor(y, dtype=torch.float32, device=DEVICE).view(-1, 1)    
 
-    dlogit = (logits2[:, 1] - logits2[:, 0]).unsqueeze(1)                    # [N,1]
-
+    dlogit = (logits2[:, 1] - logits2[:, 0]).unsqueeze(1)                    
     logT = torch.zeros((), device=DEVICE, requires_grad=True)
     opt = torch.optim.Adam([logT], lr=lr)
 
@@ -2160,12 +2122,6 @@ def fit_temperature_scalar_bce_from_val(
             best_T = float(torch.exp(logT).detach().cpu().item())
 
     return float(np.clip(best_T, 0.05, 50.0))
-
-
-def apply_temperature(logits: np.ndarray, T: float) -> np.ndarray:
-    logits = np.asarray(logits, dtype=np.float32)
-    return logits / float(T)
-
 
 @torch.no_grad()
 def collect_epoch_outputs(
@@ -2210,10 +2166,10 @@ def collect_epoch_outputs(
             logits = _safe_tensor(out[0].float(), "collect.logits(fp32)")
 
         # logits: [B,2] (alive, death)
-        death_logit = death_logit_from_logits2(logits)      # [B,1]
-        p_death = torch.sigmoid(death_logit)                # [B,1]
-        y_true.append(y.detach().cpu().view(-1, 1).float())  # [B,1]
-        p1.append(p_death.detach().cpu())                    # [B,1]
+        death_logit = death_logit_from_logits2(logits)      
+        p_death = torch.sigmoid(death_logit)                
+        y_true.append(y.detach().cpu().view(-1, 1).float())  
+        p1.append(p_death.detach().cpu())                    
 
         ids += dbg.get("stay_ids", [])
 
@@ -2529,29 +2485,29 @@ def generate_split_heatmaps_and_tables(
         raise RuntimeError(f"[{split_name}] rc_mat is None; routing_coef not returned in forward.")
 
     K = rc_mat.shape[1]
-    rc_k10  = rc_mat.T       # [K,N_ROUTES]
+    rc_k10  = rc_mat.T       
 
     y_true_log, logits, _ = collect_epoch_logits(
         loader, behrt, bbert, imgenc, mult, route_adapter, projector, cap_head,
         amp_ctx_enc, amp_ctx_caps
     )
 
-    y_true_bin = np.asarray(y_true_log).reshape(-1, 1).astype(np.float32)  # [N,1]
-    prev = y_true_bin.mean(axis=0)                                         # [1]
+    y_true_bin = np.asarray(y_true_log).reshape(-1, 1).astype(np.float32)  
+    prev = y_true_bin.mean(axis=0)                                        
 
-    dlogit = death_logit_from_logits2_np(logits)  # [N,1]
+    dlogit = death_logit_from_logits2_np(logits)  
     if T_cal is not None:
         dlogit = dlogit / float(T_cal)
-    p = sigmoid_np(dlogit)                       # [N,1]
+    p = sigmoid_np(dlogit)                      
 
     if thr_val is not None:
-        thr_val = np.asarray(thr_val, dtype=np.float32).reshape(-1)         # [1]
-        y_pred = (p >= thr_val[np.newaxis, :]).astype(int)                # [N,1]
+        thr_val = np.asarray(thr_val, dtype=np.float32).reshape(-1)         
+        y_pred = (p >= thr_val[np.newaxis, :]).astype(int)                
     else:
         y_pred = (p >= 0.5).astype(int)
 
     m = epoch_metrics(y_true_bin, p, y_pred)
-    auroc_per = m["AUROC_per_label"]  # [1]
+    auroc_per = m["AUROC_per_label"]  
 
     auroc_vis = np.nan_to_num(auroc_per, nan=0.0).astype(np.float32)
     prev_vis  = np.nan_to_num(prev,      nan=0.0).astype(np.float32)
@@ -2638,52 +2594,6 @@ def generate_split_heatmaps_and_tables(
     }
 
 import torch.nn.functional as F
-
-class BinaryFocalLoss(nn.Module):
-    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, reduction: str = "mean"):
-        super().__init__()
-        self.alpha = float(alpha)
-        self.gamma = float(gamma)
-        self.reduction = str(reduction)
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # logits: [B,1], targets: [B,1] float in {0,1}
-        p = torch.sigmoid(logits)
-        ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-        p_t = p * targets + (1.0 - p) * (1.0 - targets)
-        alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
-        loss = alpha_t * ((1.0 - p_t) ** self.gamma) * ce
-
-        if self.reduction == "mean":
-            return loss.mean()
-        if self.reduction == "sum":
-            return loss.sum()
-        return loss
-
-def subgroup_report_by_chunks(y_true: np.ndarray, p: np.ndarray, chunk_counts: List[int], thr: float, tag: str):
-    cc = np.asarray(chunk_counts, dtype=int)
-    y_true = np.asarray(y_true).reshape(-1)
-    p = np.asarray(p).reshape(-1)
-
-    buckets = {
-        "0-1": (cc <= 1),
-        "2-3": (cc >= 2) & (cc <= 3),
-        "4+":  (cc >= 4),
-    }
-
-    print(f"\n[{tag}] Subgroup metrics by valid note chunks (thr={thr:.4f}):")
-    for name, m in buckets.items():
-        n = int(m.sum())
-        if n < 30:
-            print(f"  bucket {name}: n={n} (skip: too small)")
-            continue
-        yt = y_true[m].reshape(-1, 1)
-        pt = p[m].reshape(-1, 1)
-        yp = (pt >= thr).astype(int)
-        mm = epoch_metrics(yt, pt, yp)
-        print(f"  bucket {name}: n={n} AUROC={mm['AUROC']:.4f} AUPRC={mm['AUPRC']:.4f} F1={mm['F1']:.4f} Prec={mm['Precision']:.4f} Rec={mm['Recall']:.4f}")
-
-
 def main():
     import env_config as E
 
@@ -2724,14 +2634,12 @@ def main():
     precision = str(args.precision).lower()
     use_amp = use_cuda and (precision != "off")
 
-    # Encoder autocast only 
     if use_amp:
         if precision == "fp16":
             amp_ctx_enc = torch_amp.autocast(device_type="cuda", dtype=torch.float16)
         elif precision == "bf16":
             amp_ctx_enc = torch_amp.autocast(device_type="cuda", dtype=torch.bfloat16)
         else:
-            # "auto" -> let PyTorch decide (often bf16 on A100/H100, fp16 otherwise)
             amp_ctx_enc = torch_amp.autocast(device_type="cuda")
     else:
         amp_ctx_enc = nullcontext()
@@ -2788,12 +2696,8 @@ def main():
     neg = float(neg_counts[0])
     w_pos_raw = (neg / (pos + 1e-6))
 
-        # gentler oversampling (pick ONE)
-    w_pos = np.sqrt(w_pos_raw)                 # recommended: softer than full ratio
-    # w_pos = np.log1p(w_pos_raw)              # even gentler
-
-    # clamp so it can’t explode
-    w_pos = float(np.clip(w_pos, 1.0, 5.0))    # tune 3–10; start with 5
+    w_pos = np.sqrt(w_pos_raw)                 
+    w_pos = float(np.clip(w_pos, 1.0, 5.0))    
     w_neg = 1.0
 
 
@@ -2810,19 +2714,10 @@ def main():
     )
     print(f"[sampler] WeightedRandomSampler enabled: w_pos={w_pos:.3f} w_neg={w_neg:.3f}")
 
-    # =========================
-    # LOSS (TRAIN): plain BCEWithLogitsLoss (NO pos_weight)
-    # We are already handling imbalance via WeightedRandomSampler.
-    # =========================
     loss_fn_train = nn.BCEWithLogitsLoss().to(DEVICE)
     print("[loss] TRAIN = BCEWithLogitsLoss() (no pos_weight; sampler handles imbalance)")
 
-    # Keep eval loss plain BCE too (you already do this)
     bce_eval = nn.BCEWithLogitsLoss()
-    print("[loss] EVAL  = BCEWithLogitsLoss() (no pos_weight)")
-
-
-    bce_eval = nn.BCEWithLogitsLoss()  
     print("[loss] EVAL  = BCEWithLogitsLoss() (no pos_weight)")
 
     val_ds   = ICUStayDataset(args.data_root, split="val")
@@ -2994,7 +2889,7 @@ def main():
             {"params": head_params, "lr": args.lr, "weight_decay": args.weight_decay, "name": "head"},
         ]
     )
-    label_smoothing = float(getattr(CFG, "label_smoothing", 0.02))  # try 0.01–0.05
+    label_smoothing = float(getattr(CFG, "label_smoothing", 0.02))  
     label_smoothing = float(np.clip(label_smoothing, 0.0, 0.10))
     print(f"[loss] label_smoothing={label_smoothing:.3f}")
 
@@ -3203,11 +3098,9 @@ def main():
                         print("[sanity] death_logit[0] =", float(death_logit[0].detach().float().cpu()))
                         print("[sanity] prim_acts.mean =", float(prim_acts.detach().float().mean().cpu()))
                         if rc_raw is not None:
-                            # expected rc_raw: [B, R, K] (sum over classes dim=2 should be ~1 if normalized)
                             print("[sanity] rc_raw sum over classes (mean) =",
                                   float(rc_raw.detach().float().sum(dim=2).mean().cpu()))
 
-                # label smoothing (binary): push targets slightly away from 0/1
                 if label_smoothing > 0.0:
                     y_f = y_f * (1.0 - label_smoothing) + 0.5 * label_smoothing
 
@@ -3218,7 +3111,6 @@ def main():
 
                 
                 cur_epoch = epoch + 1  # int is fine
-                # prim_acts: [B,R] nonnegative-ish; make a proper distribution
                 pa_dist = prim_acts.clamp_min(1e-6)
                 pa_dist = pa_dist / pa_dist.sum(dim=1, keepdim=True).clamp_min(1e-6)  # [B,R]
 
@@ -3436,7 +3328,7 @@ def main():
         print(f"[epoch {epoch + 1}] Saved reliability diagram → {rel_path}")
 
         # Save checkpoints based on VAL macro AUROC
-        val_score = float(m["AUROC"])  # macro AUROC
+        val_score = float(m["AUROC"])  
         is_best = val_score > best_ckpt_auroc
         if is_best:
             best_ckpt_auroc = val_score
